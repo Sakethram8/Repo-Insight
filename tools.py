@@ -1,0 +1,241 @@
+# tools.py
+"""
+Deterministic, testable query functions over FalkorDB.
+No LLM calls. These are the functions the agent will invoke.
+"""
+
+import json
+import math
+from pathlib import Path
+from config import IMPACT_RADIUS_MAX_DEPTH, IMPACT_RADIUS_WARN_THRESHOLD
+import falkordb
+from embedder import embed_text, cosine_similarity
+
+
+def get_function_context(fqn: str, graph: falkordb.Graph) -> dict:
+    # Try exact FQN match first, then fallback to name match
+    result = graph.query(
+        """MATCH (f:Function)
+           WHERE f.fqn = $query OR f.name = $query
+           OPTIONAL MATCH (f)-[:DEFINED_IN]->(m)
+           RETURN f.fqn, f.name, f.file_path, f.start_line, f.end_line,
+                  f.summary, f.is_method, f.class_name, m.name
+           LIMIT 1""",
+        {"query": fqn},
+    )
+
+    if len(result.result_set) == 0:
+        return {"found": False, "query": fqn}
+
+    row = result.result_set[0]
+    summary = row[5] if row[5] else None
+    class_name = row[7] if row[7] else None
+
+    return {
+        "found": True,
+        "fqn": row[0],
+        "name": row[1],
+        "file_path": row[2],
+        "start_line": row[3],
+        "end_line": row[4],
+        "summary": summary,
+        "is_method": bool(row[6]),
+        "class_name": class_name,
+        "defined_in_module": row[8] or "",
+    }
+
+
+def get_callers(fqn: str, graph: falkordb.Graph) -> dict:
+    result = graph.query(
+        """MATCH (caller:Function)-[:CALLS]->(target:Function {fqn: $fqn})
+           RETURN caller.fqn, caller.file_path, caller.start_line""",
+        {"fqn": fqn},
+    )
+    callers = [{"fqn": r[0], "file_path": r[1], "start_line": r[2]} for r in result.result_set]
+    return {"target_fqn": fqn, "caller_count": len(callers), "callers": callers}
+
+
+def get_callees(fqn: str, graph: falkordb.Graph) -> dict:
+    result = graph.query(
+        """MATCH (src:Function {fqn: $fqn})-[:CALLS]->(callee:Function)
+           RETURN callee.fqn, callee.file_path, callee.start_line""",
+        {"fqn": fqn},
+    )
+    callees = [{"fqn": r[0], "file_path": r[1], "start_line": r[2]} for r in result.result_set]
+    return {"target_fqn": fqn, "callee_count": len(callees), "callees": callees}
+
+
+def get_impact_radius(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT_RADIUS_MAX_DEPTH) -> dict:
+    max_depth = int(max_depth)
+    cypher = (
+        f"MATCH p = (src:Function {{fqn: $fqn}})-[:CALLS*1..{max_depth}]->(impacted:Function) "
+        f"RETURN DISTINCT impacted.fqn, impacted.file_path, length(p) "
+        f"ORDER BY length(p) ASC LIMIT 50"
+    )
+    result = graph.query(cypher, {"fqn": fqn})
+    impacted = [{"fqn": r[0], "file_path": r[1], "distance": r[2]} for r in result.result_set]
+    return {
+        "source_fqn": fqn,
+        "direction": "downstream",
+        "depth": max_depth,
+        "impacted_count": len(impacted),
+        "warning": len(impacted) > IMPACT_RADIUS_WARN_THRESHOLD,
+        "impacted": impacted,
+    }
+
+
+def get_blast_radius(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT_RADIUS_MAX_DEPTH) -> dict:
+    max_depth = int(max_depth)
+    cypher = (
+        f"MATCH p = (affected:Function)-[:CALLS*1..{max_depth}]->(target:Function {{fqn: $fqn}}) "
+        f"RETURN DISTINCT affected.fqn, affected.file_path, length(p) "
+        f"ORDER BY length(p) ASC LIMIT 50"
+    )
+    result = graph.query(cypher, {"fqn": fqn})
+    affected = [{"fqn": r[0], "file_path": r[1], "distance": r[2]} for r in result.result_set]
+    return {
+        "target_fqn": fqn,
+        "direction": "upstream",
+        "depth": max_depth,
+        "affected_count": len(affected),
+        "warning": len(affected) > IMPACT_RADIUS_WARN_THRESHOLD,
+        "affected": affected,
+    }
+
+
+def get_macro_architecture(graph: falkordb.Graph) -> dict:
+    # Sums CALLS, INHERITS_FROM, and IMPORTS edges between modules to generate Thick Edges
+    query = """
+    MATCH (f1:Function)-[c:CALLS]->(f2:Function)
+    WHERE f1.module_name <> f2.module_name
+    WITH f1.module_name AS src, f2.module_name AS tgt, count(c) AS weight
+    RETURN src, tgt, weight, 'CALLS' as type
+    UNION ALL
+    MATCH (c1:Class)-[i:INHERITS_FROM]->(c2:Class)
+    MATCH (c1)-[:DEFINED_IN]->(m1:Module)
+    MATCH (c2)-[:DEFINED_IN]->(m2:Module)
+    WHERE m1.name <> m2.name
+    RETURN m1.name AS src, m2.name AS tgt, 10 AS weight, 'INHERITS_FROM' as type
+    UNION ALL
+    MATCH (m1:Module)-[i:IMPORTS]->(m2:Module)
+    WHERE m1.name <> m2.name
+    RETURN m1.name AS src, m2.name AS tgt, 5 AS weight, 'IMPORTS' as type
+    """
+    result = graph.query(query)
+    edges = {}
+    for row in result.result_set:
+        src, tgt, weight, etype = row[0], row[1], row[2], row[3]
+        key = (src, tgt)
+        if key not in edges:
+            edges[key] = {"source": src, "target": tgt, "weight": 0, "types": set()}
+        edges[key]["weight"] += weight
+        edges[key]["types"].add(etype)
+        
+    for k in edges:
+        edges[k]["types"] = list(edges[k]["types"])
+        
+    return {"modules": list(edges.values())}
+
+
+def get_class_architecture(module_name: str, graph: falkordb.Graph) -> dict:
+    query = """
+    MATCH (f1:Function)-[c:CALLS]->(f2:Function)
+    WHERE f1.module_name = $module AND f1.class_name <> '' AND f2.class_name <> ''
+    WITH f1.class_name AS src, f2.class_name AS tgt, count(c) AS weight
+    RETURN src, tgt, weight, 'CALLS' as type
+    UNION ALL
+    MATCH (c1:Class)-[i:INHERITS_FROM]->(c2:Class)
+    MATCH (c1)-[:DEFINED_IN]->(m1:Module) WHERE m1.name = $module
+    RETURN c1.name AS src, c2.name AS tgt, 10 AS weight, 'INHERITS_FROM' as type
+    """
+    result = graph.query(query, {"module": module_name})
+    edges = {}
+    for row in result.result_set:
+        src, tgt, weight, etype = row[0], row[1], row[2], row[3]
+        if src == tgt:
+            continue
+        key = (src, tgt)
+        if key not in edges:
+            edges[key] = {"source": src, "target": tgt, "weight": 0, "types": set()}
+        edges[key]["weight"] += weight
+        edges[key]["types"].add(etype)
+        
+    for k in edges:
+        edges[k]["types"] = list(edges[k]["types"])
+        
+    return {"module": module_name, "class_edges": list(edges.values())}
+
+
+def get_source_code(fqn: str, graph: falkordb.Graph) -> dict:
+    result = graph.query(
+        "MATCH (n) WHERE n.fqn = $fqn RETURN n.file_path, n.start_line, n.end_line LIMIT 1",
+        {"fqn": fqn},
+    )
+    if len(result.result_set) == 0:
+        return {"found": False, "fqn": fqn}
+    
+    row = result.result_set[0]
+    file_path, start_line, end_line = row[0], row[1], row[2]
+
+    meta_result = graph.query("MATCH (m:Meta {key: 'repo_root'}) RETURN m.value LIMIT 1")
+    repo_root = meta_result.result_set[0][0] if meta_result.result_set else None
+
+    source = "<file not readable>"
+    candidates = []
+    if repo_root:
+        candidates.append(Path(repo_root) / file_path)
+    candidates.append(Path(file_path))
+    candidates.append(Path(".") / file_path)
+
+    for candidate in candidates:
+        try:
+            lines = candidate.read_text(encoding="utf-8").splitlines()
+            source = "\n".join(lines[max(0, start_line - 1):end_line])
+            break
+        except (OSError, UnicodeDecodeError):
+            continue
+
+    return {"found": True, "fqn": fqn, "file_path": file_path, "source": source}
+
+
+def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
+    query_embedding = embed_text(query)
+    
+    # Calculate in-degree to rank core utilities higher
+    func_query = """
+    MATCH (f:Function) WHERE f.embedding IS NOT NULL
+    OPTIONAL MATCH ()-[c:CALLS]->(f)
+    RETURN 'Function', f.fqn, f.file_path, f.summary, f.embedding, count(c) as in_degree
+    """
+    func_results = graph.query(func_query)
+
+    class_query = """
+    MATCH (c:Class) WHERE c.embedding IS NOT NULL
+    OPTIONAL MATCH ()-[i:INHERITS_FROM]->(c)
+    RETURN 'Class', c.fqn, c.file_path, c.summary, c.embedding, count(i) as in_degree
+    """
+    class_results = graph.query(class_query)
+
+    all_rows = list(func_results.result_set) + list(class_results.result_set)
+    scored = []
+    for row in all_rows:
+        label, fqn, file_path, summary, embedding_str, in_degree = row
+        if not embedding_str:
+            continue
+        try:
+            node_embedding = json.loads(embedding_str)
+        except (json.JSONDecodeError, TypeError):
+            continue
+
+        base_score = cosine_similarity(query_embedding, node_embedding)
+        # Combine cosine_similarity with log(in_degree)
+        weight = 0.05
+        final_score = base_score + (math.log(in_degree + 1) * weight)
+        
+        scored.append({
+            "label": label, "fqn": fqn, "file_path": file_path,
+            "summary": summary, "in_degree": in_degree, "score": round(final_score, 4),
+        })
+
+    scored.sort(key=lambda x: x["score"], reverse=True)
+    return {"query": query, "results": scored[:top_k]}
