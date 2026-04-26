@@ -4,11 +4,13 @@ Generate and cache embeddings for functions and classes.
 Embeddings are stored as node properties in FalkorDB as JSON-serialised float arrays.
 """
 
+import logging
 from sentence_transformers import SentenceTransformer
 from config import EMBEDDING_MODEL
 import json
-import math
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 _model: SentenceTransformer | None = None
 

@@ -5,11 +5,19 @@ No LLM calls. These are the functions the agent will invoke.
 """
 
 import json
+import logging
 import math
+import time
 from pathlib import Path
 from config import IMPACT_RADIUS_MAX_DEPTH, IMPACT_RADIUS_WARN_THRESHOLD
 import falkordb
 from embedder import embed_text, cosine_similarity
+
+logger = logging.getLogger(__name__)
+
+# Cache for deserialized embeddings: {fqn: (embedding_list, timestamp)}
+_embedding_cache: dict[str, tuple[list[float], float]] = {}
+_EMBEDDING_CACHE_TTL = 300  # seconds
 
 
 def get_function_context(fqn: str, graph: falkordb.Graph) -> dict:
@@ -195,12 +203,16 @@ def get_source_code(fqn: str, graph: falkordb.Graph) -> dict:
         except (OSError, UnicodeDecodeError):
             continue
 
-    return {"found": True, "fqn": fqn, "file_path": file_path, "source": source}
+    return {
+        "found": True, "fqn": fqn, "file_path": file_path,
+        "start_line": start_line, "end_line": end_line, "source": source,
+    }
 
 
 def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
     query_embedding = embed_text(query)
-    
+    now = time.time()
+
     # Calculate in-degree to rank core utilities higher
     func_query = """
     MATCH (f:Function) WHERE f.embedding IS NOT NULL
@@ -222,16 +234,24 @@ def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
         label, fqn, file_path, summary, embedding_str, in_degree = row
         if not embedding_str:
             continue
-        try:
-            node_embedding = json.loads(embedding_str)
-        except (json.JSONDecodeError, TypeError):
-            continue
+
+        # Use cached deserialized embedding if available and fresh
+        cached = _embedding_cache.get(fqn)
+        if cached and (now - cached[1]) < _EMBEDDING_CACHE_TTL:
+            node_embedding = cached[0]
+        else:
+            try:
+                node_embedding = json.loads(embedding_str)
+                _embedding_cache[fqn] = (node_embedding, now)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Failed to parse embedding for %s", fqn)
+                continue
 
         base_score = cosine_similarity(query_embedding, node_embedding)
         # Combine cosine_similarity with log(in_degree)
         weight = 0.05
         final_score = base_score + (math.log(in_degree + 1) * weight)
-        
+
         scored.append({
             "label": label, "fqn": fqn, "file_path": file_path,
             "summary": summary, "in_degree": in_degree, "score": round(final_score, 4),

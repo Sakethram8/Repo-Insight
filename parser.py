@@ -1,18 +1,50 @@
 # parser.py
 """
-Parse Python files using Tree-Sitter and return structured AST entities.
+Parse source files using Tree-Sitter and return structured AST entities.
+Supports Python, JavaScript, and TypeScript.
 Does NOT touch FalkorDB.
 """
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 import tree_sitter_python as tspython
 from tree_sitter import Language, Parser
 
+logger = logging.getLogger(__name__)
+
 PY_LANGUAGE = Language(tspython.language())
 
-SKIP_DIRS = {"__pycache__", ".git", ".venv", "node_modules"}
+# Optional JS/TS support — graceful degradation if not installed
+try:
+    import tree_sitter_javascript as tsjavascript
+    JS_LANGUAGE = Language(tsjavascript.language())
+except ImportError:
+    JS_LANGUAGE = None
+    logger.info("tree-sitter-javascript not installed; JS parsing disabled")
+
+try:
+    import tree_sitter_typescript as tstypescript
+    TS_LANGUAGE = Language(tstypescript.language_typescript())
+    TSX_LANGUAGE = Language(tstypescript.language_tsx())
+except ImportError:
+    TS_LANGUAGE = None
+    TSX_LANGUAGE = None
+    logger.info("tree-sitter-typescript not installed; TS parsing disabled")
+
+# Map file extensions to languages
+_EXTENSION_MAP: dict[str, Language | None] = {
+    ".py": PY_LANGUAGE,
+    ".js": JS_LANGUAGE,
+    ".jsx": JS_LANGUAGE,
+    ".ts": TS_LANGUAGE,
+    ".tsx": TSX_LANGUAGE,
+}
+
+SUPPORTED_EXTENSIONS = {ext for ext, lang in _EXTENSION_MAP.items() if lang is not None}
+
+SKIP_DIRS = {"__pycache__", ".git", ".venv", "node_modules", "dist", "build"}
 
 
 @dataclass
@@ -276,66 +308,226 @@ def _walk_tree(node, result: ParsedFile, source_bytes: bytes, rel_path: str) -> 
     for child in node.children:
         _walk_tree(child, result, source_bytes, rel_path)
 
+# ---------------------------------------------------------------------------
+# JavaScript / TypeScript AST walking
+# ---------------------------------------------------------------------------
+
+def _extract_js_docstring(node) -> Optional[str]:
+    """Extract a JSDoc comment from immediately before a function/class node."""
+    prev = node.prev_sibling
+    if prev and prev.type == "comment":
+        text = prev.text.decode("utf-8").strip()
+        # Strip /** ... */ delimiters
+        if text.startswith("/**") and text.endswith("*/"):
+            text = text[3:-2].strip()
+        elif text.startswith("//"):
+            text = text[2:].strip()
+        return text
+    return None
+
+
+def _walk_js_tree(node, result: ParsedFile, source_bytes: bytes, rel_path: str,
+                  enclosing_class: Optional[str] = None) -> None:
+    """Recursively walk a JS/TS AST and extract entities."""
+
+    if node.type in ("class_declaration", "class"):
+        name_node = node.child_by_field_name("name")
+        if name_node:
+            class_name = name_node.text.decode("utf-8")
+            docstring = _extract_js_docstring(node)
+            # Extract superclass
+            bases = []
+            heritage = node.child_by_field_name("heritage")
+            if heritage is None:
+                # Try to find class_heritage child
+                for child in node.children:
+                    if child.type == "class_heritage":
+                        heritage = child
+                        break
+            if heritage:
+                for child in heritage.children:
+                    if child.type == "identifier":
+                        bases.append(child.text.decode("utf-8"))
+
+            result.classes.append(ClassDef(
+                name=class_name,
+                file_path=rel_path,
+                start_line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+                docstring=docstring,
+                bases=bases,
+            ))
+            # Recurse into class body with class context
+            body = node.child_by_field_name("body")
+            if body:
+                for child in body.children:
+                    _walk_js_tree(child, result, source_bytes, rel_path, enclosing_class=class_name)
+            return  # Don't recurse again below
+
+    elif node.type in ("function_declaration", "method_definition",
+                       "arrow_function", "function"):
+        name_node = node.child_by_field_name("name")
+        func_name = None
+        if name_node:
+            func_name = name_node.text.decode("utf-8")
+        elif node.type == "arrow_function" and node.parent:
+            # Check if assigned to a variable: const foo = () => ...
+            if node.parent.type == "variable_declarator":
+                var_name = node.parent.child_by_field_name("name")
+                if var_name:
+                    func_name = var_name.text.decode("utf-8")
+
+        if func_name:
+            docstring = _extract_js_docstring(node)
+            is_method = enclosing_class is not None or node.type == "method_definition"
+            result.functions.append(FunctionDef(
+                name=func_name,
+                file_path=rel_path,
+                start_line=node.start_point[0] + 1,
+                end_line=node.end_point[0] + 1,
+                docstring=docstring,
+                is_method=is_method,
+                class_name=enclosing_class,
+            ))
+
+    elif node.type in ("import_statement", "import_declaration"):
+        # Extract module from: import ... from 'module'
+        source_node = node.child_by_field_name("source")
+        if source_node:
+            module = source_node.text.decode("utf-8").strip("'\"")
+            result.imports.append(ImportRef(
+                file_path=rel_path,
+                module=module,
+                alias=None,
+            ))
+
+    elif node.type == "call_expression":
+        func = node.child_by_field_name("function")
+        callee_name = None
+        if func:
+            if func.type == "identifier":
+                callee_name = func.text.decode("utf-8")
+            elif func.type == "member_expression":
+                prop = func.child_by_field_name("property")
+                if prop:
+                    callee_name = prop.text.decode("utf-8")
+
+        if callee_name:
+            # Determine caller context
+            caller_name = _find_js_enclosing_function(node) or "<module>"
+            if enclosing_class and caller_name != "<module>":
+                caller_name = f"{enclosing_class}.{caller_name}"
+
+            if caller_name != "<module>":
+                result.calls.append(CallEdge(
+                    caller_name=caller_name,
+                    callee_name=callee_name,
+                    file_path=rel_path,
+                    line=node.start_point[0] + 1,
+                ))
+
+    # Recurse into children (skip if we already recursed for class body)
+    for child in node.children:
+        _walk_js_tree(child, result, source_bytes, rel_path, enclosing_class)
+
+
+def _find_js_enclosing_function(node) -> Optional[str]:
+    """Walk up parent chain to find enclosing function in JS/TS."""
+    current = node.parent
+    while current is not None:
+        if current.type in ("function_declaration", "method_definition",
+                            "arrow_function", "function"):
+            name_node = current.child_by_field_name("name")
+            if name_node:
+                return name_node.text.decode("utf-8")
+            # Arrow function assigned to variable
+            if current.type == "arrow_function" and current.parent:
+                if current.parent.type == "variable_declarator":
+                    var_name = current.parent.child_by_field_name("name")
+                    if var_name:
+                        return var_name.text.decode("utf-8")
+        if current.type in ("program", "module"):
+            break
+        current = current.parent
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 def parse_file(file_path: Path, repo_root: Path) -> ParsedFile:
     """
-    Parse a single Python file and return all extracted entities.
+    Parse a single source file and return all extracted entities.
+
+    Supports: .py, .js, .jsx, .ts, .tsx
 
     Args:
-        file_path: Absolute path to the .py file.
+        file_path: Absolute path to the source file.
         repo_root: Absolute path to the repo root (used to compute relative paths).
 
     Returns:
         ParsedFile with all functions, classes, imports, and call edges found.
 
     Raises:
-        ValueError: If file_path does not end in .py.
+        ValueError: If file extension is not supported.
         OSError: If the file cannot be read.
     """
     file_path = Path(file_path)
     repo_root = Path(repo_root)
 
-    if not str(file_path).endswith(".py"):
-        raise ValueError(f"Expected a .py file, got: {file_path}")
+    ext = file_path.suffix
+    language = _EXTENSION_MAP.get(ext)
+
+    if language is None:
+        raise ValueError(f"Unsupported file extension '{ext}' for: {file_path}")
 
     source_bytes = file_path.read_bytes()
-
     rel_path = str(file_path.relative_to(repo_root))
 
-    parser = Parser(PY_LANGUAGE)
+    parser = Parser(language)
     tree = parser.parse(source_bytes)
 
     result = ParsedFile(file_path=rel_path)
-    _walk_tree(tree.root_node, result, source_bytes, rel_path)
+
+    if ext == ".py":
+        _walk_tree(tree.root_node, result, source_bytes, rel_path)
+    else:
+        _walk_js_tree(tree.root_node, result, source_bytes, rel_path)
 
     return result
 
 
 def parse_directory(repo_root: Path) -> list[ParsedFile]:
     """
-    Walk repo_root recursively, parse all .py files, and return results.
-    Skips files inside __pycache__, .git, .venv, and node_modules directories.
+    Walk repo_root recursively, parse all supported files, and return results.
+    Skips files inside __pycache__, .git, .venv, node_modules, dist, build.
 
     Args:
-        repo_root: Absolute path to the root of the Python project.
+        repo_root: Absolute path to the root of the project.
 
     Returns:
-        List of ParsedFile, one per .py file found.
+        List of ParsedFile, one per supported file found.
     """
     repo_root = Path(repo_root).resolve()
     results = []
 
-    for py_file in sorted(repo_root.rglob("*.py")):
+    # Collect all files matching supported extensions
+    all_files = []
+    for ext in SUPPORTED_EXTENSIONS:
+        all_files.extend(repo_root.rglob(f"*{ext}"))
+
+    for source_file in sorted(set(all_files)):
         # Check if any parent directory is in SKIP_DIRS
-        parts = py_file.relative_to(repo_root).parts
+        parts = source_file.relative_to(repo_root).parts
         if any(part in SKIP_DIRS for part in parts):
             continue
 
         try:
-            parsed = parse_file(py_file, repo_root)
+            parsed = parse_file(source_file, repo_root)
             results.append(parsed)
-        except (ValueError, OSError):
-            # Skip files that can't be parsed
+        except (ValueError, OSError) as e:
+            logger.debug("Skipping %s: %s", source_file, e)
             continue
 
     return results

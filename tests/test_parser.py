@@ -146,5 +146,5 @@ class MyClass:
             parse_file(Path("/nonexistent/file.py"), Path("/nonexistent"))
 
     def test_non_python_file_raises_valueerror(self):
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError, match="Unsupported file extension"):
             parse_file(Path("/some/file.txt"), Path("/some"))

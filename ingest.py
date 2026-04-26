@@ -6,7 +6,9 @@ Optionally flushes graph before run based on config.FLUSH_GRAPH_ON_INGEST.
 """
 
 import json
+import logging
 import os
+import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import falkordb
@@ -17,14 +19,61 @@ from config import (FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
 from parser import ParsedFile, parse_file, SKIP_DIRS
 from embedder import embed_text, embed_texts, build_embedding_text
 
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _file_to_module(file_path: str) -> str:
+    """Convert a relative file path like 'foo/bar.py' to module name 'foo.bar'."""
+    mod = file_path.replace("/", ".").replace("\\", ".")
+    return mod[:-3] if mod.endswith(".py") else mod
+
+
+# Singleton OpenAI client for summary generation (avoids hundreds of TCP connections)
+_summary_client: openai.OpenAI | None = None
+
+
+def _get_summary_client() -> openai.OpenAI:
+    """Lazy-initialise a single OpenAI client for the summary generator."""
+    global _summary_client
+    if _summary_client is None:
+        _summary_client = openai.OpenAI(base_url=SGLANG_BASE_URL, api_key=SGLANG_API_KEY)
+    return _summary_client
+
+
+# ---------------------------------------------------------------------------
+# Connection with retry
+# ---------------------------------------------------------------------------
+
+_MAX_CONNECT_RETRIES = 3
+_CONNECT_BACKOFF_BASE = 1.0  # seconds
+
+
 def get_connection() -> falkordb.Graph:
-    try:
-        db = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT)
-        return db.select_graph(GRAPH_NAME)
-    except Exception as e:
-        raise ConnectionError(f"Failed to connect to FalkorDB at {FALKORDB_HOST}:{FALKORDB_PORT}: {e}")
+    """Connect to FalkorDB with exponential-backoff retry."""
+    last_err: Exception | None = None
+    for attempt in range(_MAX_CONNECT_RETRIES):
+        try:
+            db = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT)
+            return db.select_graph(GRAPH_NAME)
+        except Exception as e:
+            last_err = e
+            wait = _CONNECT_BACKOFF_BASE * (2 ** attempt)
+            logger.warning(
+                "FalkorDB connection attempt %d/%d failed: %s  — retrying in %.1fs",
+                attempt + 1, _MAX_CONNECT_RETRIES, e, wait,
+            )
+            time.sleep(wait)
+    raise ConnectionError(
+        f"Failed to connect to FalkorDB at {FALKORDB_HOST}:{FALKORDB_PORT} "
+        f"after {_MAX_CONNECT_RETRIES} attempts: {last_err}"
+    )
+
 
 def create_indices(graph: falkordb.Graph) -> None:
+    """Create FalkorDB indices for fast lookups. Idempotent."""
     index_queries = [
         "CREATE INDEX FOR (f:Function) ON (f.fqn)",
         "CREATE INDEX FOR (c:Class) ON (c.fqn)",
@@ -40,36 +89,55 @@ def create_indices(graph: falkordb.Graph) -> None:
                 continue
             raise
 
+
 def generate_summary(name: str, code: str) -> str:
+    """Generate a 1-2 sentence AI summary for a function or class.
+
+    Returns an empty string on any error (errors are logged, not stored).
+    """
     if not code.strip():
         return ""
     try:
-        client = openai.OpenAI(base_url=SGLANG_BASE_URL, api_key=SGLANG_API_KEY)
-        prompt = f"Summarize what this Python function/class does in 1-2 sentences. Name: {name}\nCode:\n{code}"
+        client = _get_summary_client()
+        prompt = (
+            f"Summarize what this Python function/class does in 1-2 sentences. "
+            f"Name: {name}\nCode:\n{code}"
+        )
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=100
+            max_tokens=100,
         )
         return response.choices[0].message.content.strip()
     except Exception as e:
-        return f"Summary unavailable: {e}"
+        logger.error("Summary generation failed for '%s': %s", name, e)
+        return ""
+
 
 def extract_source_code(file_path: Path, start_line: int, end_line: int) -> str:
+    """Read source lines from a file. Returns empty string on failure."""
     try:
         lines = file_path.read_text(encoding="utf-8").splitlines()
         return "\n".join(lines[start_line - 1 : end_line])
     except Exception:
         return ""
 
-def ingest_parsed_files(parsed_files: list[ParsedFile], graph: falkordb.Graph, repo_root: Path) -> None:
+
+# ---------------------------------------------------------------------------
+# Core ingestion
+# ---------------------------------------------------------------------------
+
+def ingest_parsed_files(
+    parsed_files: list[ParsedFile],
+    graph: falkordb.Graph,
+    repo_root: Path,
+) -> None:
+    """Write parsed AST entities into FalkorDB as nodes and edges."""
     file_modules: dict[str, str] = {}
     import_modules: set[str] = set()
 
     for pf in parsed_files:
-        mod_name = pf.file_path.replace("/", ".").replace("\\", ".")
-        if mod_name.endswith(".py"):
-            mod_name = mod_name[:-3]
+        mod_name = _file_to_module(pf.file_path)
         file_modules[mod_name] = pf.file_path
 
         for imp in pf.imports:
@@ -92,9 +160,7 @@ def ingest_parsed_files(parsed_files: list[ParsedFile], graph: falkordb.Graph, r
     # Prepare for AI summaries
     items_to_summarize = []
     for pf in parsed_files:
-        mod_name = pf.file_path.replace("/", ".").replace("\\", ".")
-        if mod_name.endswith(".py"):
-            mod_name = mod_name[:-3]
+        mod_name = _file_to_module(pf.file_path)
             
         abs_path = repo_root / pf.file_path
         for cls in pf.classes:
@@ -106,7 +172,7 @@ def ingest_parsed_files(parsed_files: list[ParsedFile], graph: falkordb.Graph, r
 
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
     
-    summaries = {}
+    summaries: dict[int, str] = {}
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -124,13 +190,14 @@ def ingest_parsed_files(parsed_files: list[ParsedFile], graph: falkordb.Graph, r
                 item = future_to_item[future]
                 try:
                     summaries[id(item[1])] = future.result()
-                except Exception:
+                except Exception as e:
+                    logger.error("Summary thread failed for '%s': %s", item[1].name, e)
                     summaries[id(item[1])] = ""
                 progress.advance(task_id)
 
     # Step 2: Upsert Class nodes
-    class_nodes = []
-    class_emb_texts = []
+    class_nodes: list[dict] = []
+    class_emb_texts: list[str] = []
     for item in items_to_summarize:
         if item[0] != "class": continue
         cls, file_path, mod_name, code = item[1], item[2], item[3], item[4]
@@ -164,8 +231,8 @@ def ingest_parsed_files(parsed_files: list[ParsedFile], graph: falkordb.Graph, r
         )
 
     # Step 3: Upsert Function nodes
-    func_nodes = []
-    func_emb_texts = []
+    func_nodes: list[dict] = []
+    func_emb_texts: list[str] = []
     for item in items_to_summarize:
         if item[0] != "function": continue
         func, file_path, mod_name, code = item[1], item[2], item[3], item[4]
@@ -204,15 +271,13 @@ def ingest_parsed_files(parsed_files: list[ParsedFile], graph: falkordb.Graph, r
         )
 
     # Step 4: Create DEFINED_IN and INHERITS_FROM edges
-    func_to_class = []
-    func_to_mod = []
-    class_to_mod = []
-    inherits_edges = []
+    func_to_class: list[dict] = []
+    func_to_mod: list[dict] = []
+    class_to_mod: list[dict] = []
+    inherits_edges: list[dict] = []
     
     for pf in parsed_files:
-        mod_name = pf.file_path.replace("/", ".").replace("\\", ".")
-        if mod_name.endswith(".py"):
-            mod_name = mod_name[:-3]
+        mod_name = _file_to_module(pf.file_path)
 
         for func in pf.functions:
             fqn = f"{mod_name}.{func.class_name}.{func.name}" if func.is_method else f"{mod_name}.{func.name}"
@@ -262,11 +327,9 @@ def ingest_parsed_files(parsed_files: list[ParsedFile], graph: falkordb.Graph, r
         )
 
     # Step 5: Create IMPORTS edges
-    import_edges = []
+    import_edges: list[dict] = []
     for pf in parsed_files:
-        src_mod = pf.file_path.replace("/", ".").replace("\\", ".")
-        if src_mod.endswith(".py"):
-            src_mod = src_mod[:-3]
+        src_mod = _file_to_module(pf.file_path)
 
         for imp in pf.imports:
             import_edges.append({
@@ -286,11 +349,15 @@ def ingest_parsed_files(parsed_files: list[ParsedFile], graph: falkordb.Graph, r
         )
 
     # Step 6: Create CALLS edges
-    call_edges = []
+    # Build a set of known imported modules per source module for scoped matching
+    module_imports: dict[str, set[str]] = {}
     for pf in parsed_files:
-        mod_name = pf.file_path.replace("/", ".").replace("\\", ".")
-        if mod_name.endswith(".py"):
-            mod_name = mod_name[:-3]
+        src_mod = _file_to_module(pf.file_path)
+        module_imports[src_mod] = {imp.module for imp in pf.imports}
+
+    call_edges: list[dict] = []
+    for pf in parsed_files:
+        mod_name = _file_to_module(pf.file_path)
             
         for call in pf.calls:
             if call.caller_name == "__classbody__" or call.caller_name == "<module>":
@@ -299,10 +366,14 @@ def ingest_parsed_files(parsed_files: list[ParsedFile], graph: falkordb.Graph, r
             caller_fqn = f"{mod_name}.{call.caller_name}"
             callee_simple = call.callee_name.split(".")[-1] if "." in call.callee_name else call.callee_name
             
+            # Build scoped module list: same module + imported modules
+            scope_modules = [mod_name] + list(module_imports.get(mod_name, set()))
+
             call_edges.append({
                 "caller_fqn": caller_fqn,
                 "callee_name": "." + callee_simple,
                 "callee_exact": callee_simple,
+                "scope_modules": scope_modules,
                 "line": call.line,
                 "file_path": call.file_path,
             })
@@ -311,13 +382,20 @@ def ingest_parsed_files(parsed_files: list[ParsedFile], graph: falkordb.Graph, r
         graph.query(
             """UNWIND $edges AS e
                MATCH (caller:Function {fqn: e.caller_fqn})
-               MATCH (callee:Function) WHERE callee.fqn ENDS WITH e.callee_name OR callee.fqn = e.callee_exact
+               MATCH (callee:Function)
+               WHERE (callee.fqn ENDS WITH e.callee_name OR callee.fqn = e.callee_exact)
+                 AND callee.module_name IN e.scope_modules
                MERGE (caller)-[c:CALLS]->(callee)
                SET c.line = e.line, c.file_path = e.file_path""",
             {"edges": call_edges},
         )
 
+
 def run_ingestion(directory_path: str) -> dict:
+    """Run full ingestion pipeline: parse, summarise, embed, and write to graph.
+
+    Returns a summary dict with counts of all entities ingested.
+    """
     dir_path = Path(directory_path).resolve()
     if not dir_path.exists():
         raise FileNotFoundError(f"Directory not found: {directory_path}")
@@ -343,8 +421,8 @@ def run_ingestion(directory_path: str) -> dict:
     except Exception:
         existing_states = {}
 
-    files_to_parse = []
-    current_files = set()
+    files_to_parse: list[tuple[Path, str, float]] = []
+    current_files: set[str] = set()
     for py_file in sorted(dir_path.rglob("*.py")):
         parts = py_file.relative_to(dir_path).parts
         if any(part in SKIP_DIRS for part in parts):
@@ -362,18 +440,25 @@ def run_ingestion(directory_path: str) -> dict:
     changed_files = [f[1] for f in files_to_parse]
     files_to_delete = changed_files + list(deleted_files)
 
+    # Batch delete instead of per-file loop (2.4)
     if files_to_delete:
-        for f in files_to_delete:
-            graph.query("MATCH (n {file_path: $fp}) DETACH DELETE n", {"fp": f})
-            graph.query("MATCH (s:FileState {file_path: $fp}) DELETE s", {"fp": f})
+        graph.query(
+            "UNWIND $fps AS fp MATCH (n {file_path: fp}) DETACH DELETE n",
+            {"fps": files_to_delete},
+        )
+        graph.query(
+            "UNWIND $fps AS fp MATCH (s:FileState {file_path: fp}) DELETE s",
+            {"fps": files_to_delete},
+        )
 
-    parsed_files = []
+    parsed_files: list[ParsedFile] = []
     for py_file, rel_path, mtime in files_to_parse:
         try:
             parsed = parse_file(py_file, dir_path)
             parsed_files.append(parsed)
             graph.query("MERGE (s:FileState {file_path: $fp}) SET s.mtime = $mtime", {"fp": rel_path, "mtime": mtime})
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to parse %s: %s", rel_path, e)
             continue
 
     if parsed_files:
@@ -396,4 +481,123 @@ def run_ingestion(directory_path: str) -> dict:
         "call_edges": all_calls,
         "import_edges": all_imports,
         "files_parsed": len(parsed_files),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Jedi-based call resolution (Layer 3 precision)
+# ---------------------------------------------------------------------------
+
+try:
+    import jedi as _jedi
+    _JEDI_AVAILABLE = True
+except ImportError:
+    _JEDI_AVAILABLE = False
+    logger.info("Jedi not installed; using tree-sitter fallback for call resolution")
+
+
+def resolve_calls_with_jedi(
+    parsed_file: "ParsedFile",
+    repo_root: Path,
+) -> list[dict]:
+    """Upgrade fuzzy call edges to precise ones using Jedi type inference.
+
+    Returns a list of dicts with caller_fqn, callee_fqn, resolution method, etc.
+    Falls back to tree-sitter name matching if Jedi can't resolve.
+    """
+    if not _JEDI_AVAILABLE:
+        return []
+
+    file_path = repo_root / parsed_file.file_path
+    if not file_path.exists() or file_path.suffix != ".py":
+        return []
+
+    try:
+        source = file_path.read_text(encoding="utf-8")
+        project = _jedi.Project(path=str(repo_root))
+        script = _jedi.Script(source, path=str(file_path), project=project)
+    except Exception as e:
+        logger.debug("Jedi init failed for %s: %s", parsed_file.file_path, e)
+        return []
+
+    mod_name = _file_to_module(parsed_file.file_path)
+    precise_edges = []
+
+    for call in parsed_file.calls:
+        if call.caller_name in ("__classbody__", "<module>"):
+            continue
+
+        caller_fqn = f"{mod_name}.{call.caller_name}"
+        resolution = "tree-sitter"
+        callee_fqn = call.callee_name
+
+        try:
+            # Jedi goto resolves to the definition
+            defs = script.goto(line=call.line, column=0)
+            if defs:
+                target = defs[0]
+                if target.full_name:
+                    callee_fqn = target.full_name
+                    resolution = "jedi"
+        except Exception:
+            pass  # Fall through to tree-sitter
+
+        precise_edges.append({
+            "caller_fqn": caller_fqn,
+            "callee_fqn": callee_fqn,
+            "resolution": resolution,
+            "line": call.line,
+            "file_path": call.file_path,
+        })
+
+    return precise_edges
+
+
+# ---------------------------------------------------------------------------
+# Incremental re-ingestion (for post-edit graph refresh)
+# ---------------------------------------------------------------------------
+
+def reingest_files(
+    file_paths: list[str],
+    graph: falkordb.Graph,
+    repo_root: Path,
+) -> dict:
+    """Re-ingest specific files into the graph after edits.
+
+    Used by Phase 5 of the change engine to update the graph after
+    applying changes, so blast radius can be re-checked.
+
+    Args:
+        file_paths: Relative file paths to re-ingest.
+        graph: FalkorDB graph connection.
+        repo_root: Absolute path to the repository root.
+
+    Returns:
+        Dict with counts of re-ingested entities.
+    """
+    # Delete old nodes for these files
+    if file_paths:
+        graph.query(
+            "UNWIND $fps AS fp MATCH (n {file_path: fp}) DETACH DELETE n",
+            {"fps": file_paths},
+        )
+
+    # Re-parse and ingest
+    parsed_files: list[ParsedFile] = []
+    for rel_path in file_paths:
+        abs_path = repo_root / rel_path
+        if not abs_path.exists():
+            continue
+        try:
+            parsed = parse_file(abs_path, repo_root)
+            parsed_files.append(parsed)
+        except Exception as e:
+            logger.warning("Re-ingest parse failed for %s: %s", rel_path, e)
+
+    if parsed_files:
+        ingest_parsed_files(parsed_files, graph, repo_root)
+
+    return {
+        "files_reingested": len(parsed_files),
+        "file_paths": file_paths,
     }

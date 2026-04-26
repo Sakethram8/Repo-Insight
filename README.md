@@ -79,7 +79,7 @@ The CLI ships with prompts designed to expose the gap:
 3. *Add error handling to `parse_file` so it returns a partial result on syntax errors.*
 4. *Add a `timeout` parameter to `run_ingestion` and propagate it to all database calls.*
 
-## Graph Tools (7 total)
+## Graph Tools (9 total)
 
 | Tool | Direction | What It Does |
 |------|-----------|-------------|
@@ -90,6 +90,8 @@ The CLI ships with prompts designed to expose the gap:
 | `get_blast_radius(name)` | ↑↑ transitive upstream | **What breaks if this function changes?** |
 | `get_impact_radius(name)` | ↓↓ transitive downstream | What does this function touch? |
 | `semantic_search(query)` | — | Vector similarity search over code embeddings |
+| `get_macro_architecture()` | — | High-level module dependency graph (Thick Edges) |
+| `get_class_architecture(module)` | — | Intra-module class relationship graph (Medium Edges) |
 
 ## Running Tests
 
@@ -138,6 +140,7 @@ All configuration is in `config.py`. No other module hardcodes URLs, ports, mode
 | `DEFINED_IN` | `Function`/`Class` → `Module` | — |
 | `IMPORTS` | `Module` → `Module` | `alias` |
 | `CALLS` | `Function` → `Function` | `line`, `file_path` |
+| `INHERITS_FROM` | `Class` → `Class` | — |
 
 ## Architecture
 
@@ -150,11 +153,37 @@ All configuration is in `config.py`. No other module hardcodes URLs, ports, mode
 - **File-scoped call edges**: Caller matched by `(name, file_path)` to prevent false edges across files.
 - **Upstream + downstream**: `get_blast_radius` traces *who breaks* (upstream); `get_impact_radius` traces *what this touches* (downstream).
 
-## Future: MCP Integration
+## MCP Server
 
-The production vision is to ship `tools.py` as an **MCP (Model Context Protocol) server**. Claude Code, Copilot, and Cursor could plug into Repo-Insight natively — calling `get_blast_radius` before every edit, automatically.
+Repo-Insight ships with an **MCP (Model Context Protocol) server** that lets AI coding tools call graph queries natively:
 
+```bash
+# Install MCP SDK
+pip install mcp
+
+# Start the MCP server (stdio transport)
+python mcp_server.py
 ```
-docker-compose up  # FalkorDB + MCP server
-# → Your AI coding tool now has structural awareness
+
+Configure your AI tool to connect to the MCP server, and it will automatically have access to all 9 graph tools — including `get_blast_radius` before every edit.
+
+## Multi-Language Support
+
+The parser supports **Python**, **JavaScript**, and **TypeScript** via Tree-Sitter:
+
+```bash
+# Optional: install JS/TS grammars
+pip install tree-sitter-javascript tree-sitter-typescript
 ```
+
+Files with `.py`, `.js`, `.jsx`, `.ts`, `.tsx` extensions are automatically parsed and ingested.
+
+## Graph Health
+
+Check the health of your ingested graph:
+
+```bash
+python graph_health.py
+```
+
+Shows node/edge counts, orphan nodes, top hub functions, and staleness metrics.

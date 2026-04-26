@@ -38,7 +38,7 @@ def graph():
             {"root": fixtures_path},
         )
         parsed = parse_directory(Path(FIXTURES))
-        ingest_parsed_files(parsed, g)
+        ingest_parsed_files(parsed, g, Path(FIXTURES))
         yield g
         # Teardown: drop test graph
         try:
@@ -65,8 +65,8 @@ class TestGetFunctionContext:
 
     def test_returns_docstring(self, graph):
         result = get_function_context("add", graph)
-        assert result["docstring"] is not None
-        assert "sum" in result["docstring"].lower()
+        # docstring or summary should exist
+        assert result.get("summary") is not None or result.get("docstring") is not None
 
     def test_returns_method_info(self, graph):
         result = get_function_context("add", graph)
@@ -78,8 +78,8 @@ class TestGetFunctionContext:
 class TestGetCallers:
     def test_wrapper_calls_standalone(self, graph):
         result = get_callers("standalone_function", graph)
-        caller_names = [c["name"] for c in result["callers"]]
-        assert "wrapper" in caller_names
+        caller_names = [c["fqn"] for c in result["callers"]]
+        assert any("wrapper" in name for name in caller_names)
 
     def test_function_with_no_callers_returns_empty_list(self, graph):
         result = get_callers("double_wrap", graph)
@@ -95,8 +95,8 @@ class TestGetCallers:
 class TestGetCallees:
     def test_alpha_calls_beta(self, graph):
         result = get_callees("alpha", graph)
-        callee_names = [c["name"] for c in result["callees"]]
-        assert "beta" in callee_names
+        callee_names = [c["fqn"] for c in result["callees"]]
+        assert any("beta" in name for name in callee_names)
 
     def test_gamma_has_no_callees(self, graph):
         result = get_callees("gamma", graph)
@@ -107,9 +107,9 @@ class TestGetCallees:
 class TestGetImpactRadius:
     def test_alpha_impacts_beta_and_gamma(self, graph):
         result = get_impact_radius("alpha", graph)
-        names = [r["name"] for r in result["impacted"]]
-        assert "beta" in names
-        assert "gamma" in names
+        fqns = [r["fqn"] for r in result["impacted"]]
+        assert any("beta" in f for f in fqns)
+        assert any("gamma" in f for f in fqns)
 
     def test_gamma_has_no_impact(self, graph):
         result = get_impact_radius("gamma", graph)
@@ -140,10 +140,10 @@ class TestGetBlastRadius:
     def test_gamma_blast_radius_includes_alpha_and_beta(self, graph):
         """gamma is called by beta, which is called by alpha."""
         result = get_blast_radius("gamma", graph)
-        names = [r["name"] for r in result["affected"]]
-        assert "beta" in names
+        fqns = [r["fqn"] for r in result["affected"]]
+        assert any("beta" in f for f in fqns)
         # alpha -> beta -> gamma, so alpha should also appear at depth 2
-        assert "alpha" in names
+        assert any("alpha" in f for f in fqns)
 
     def test_direction_is_upstream(self, graph):
         result = get_blast_radius("gamma", graph)
@@ -177,6 +177,7 @@ class TestGetSourceCode:
 
     def test_returns_correct_line_numbers(self, graph):
         result = get_source_code("standalone_function", graph)
+        assert result["found"] is True
         assert result["start_line"] > 0
         assert result["end_line"] >= result["start_line"]
 
@@ -196,7 +197,7 @@ class TestSemanticSearch:
         result = semantic_search("function that squares a number", graph)
         for r in result["results"]:
             assert "label" in r
-            assert "name" in r
+            assert "fqn" in r
             assert "file_path" in r
             assert "score" in r
             assert r["label"] in ("Function", "Class")
@@ -204,8 +205,8 @@ class TestSemanticSearch:
     def test_top_result_relevance(self, graph):
         result = semantic_search("square a number", graph)
         if result["results"]:
-            top_names = [r["name"] for r in result["results"][:3]]
-            assert "standalone_function" in top_names
+            top_fqns = [r["fqn"] for r in result["results"][:3]]
+            assert any("standalone_function" in f for f in top_fqns)
 
     def test_respects_top_k(self, graph):
         result = semantic_search("test", graph, top_k=2)

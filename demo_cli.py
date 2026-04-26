@@ -1,8 +1,9 @@
 # demo_cli.py
 """
-Rich terminal demo. Two modes:
+Rich terminal demo. Three modes:
   Mode A — Baseline: LLM answers with no tools (shows what AI coding agents do today)
   Mode B — Graph-Grounded: LLM uses graph tools (shows what Repo-Insight enables)
+  Mode C — Graph-Driven: 6-phase pipeline with validation gate + auto-apply
 """
 
 import sys
@@ -17,10 +18,12 @@ from rich.table import Table
 from rich.prompt import Prompt
 from rich.syntax import Syntax
 from rich import print as rprint
+from contextlib import contextmanager
 from config import (SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
                     FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME)
 from agent import run_repo_agent
 from ingest import run_ingestion, get_connection
+from pathlib import Path
 
 
 # Demo prompts designed to expose the A/B gap — these are CODE CHANGE requests,
@@ -31,6 +34,12 @@ DEMO_PROMPTS = [
     "Add error handling to `parse_file` so it returns a partial result on syntax errors. What other functions need to handle this new behavior?",
     "Add a `timeout` parameter to `run_ingestion` and propagate it to all database calls it makes.",
 ]
+
+
+@contextmanager
+def _noop_context():
+    """No-op context manager used when diff output is short enough to not need paging."""
+    yield
 
 
 def _summarize_tool_result(res: dict) -> str:
@@ -123,10 +132,12 @@ def run_mode_a(query: str, console: Console) -> dict:
 
 def run_mode_b(query: str, graph: falkordb.Graph, console: Console) -> dict:
     """
-    Fire query through run_repo_agent.
-    Print tool calls as a Rich Table, then final answer in a green panel.
+    Fire query through run_repo_agent with live streaming of tool calls.
+    Print tool calls as they happen via Rich Live, then final answer in a green panel.
     Returns timing and metadata for comparison.
     """
+    from rich.live import Live
+
     console.print()
     console.print("[bold green]━━━ MODE B: Graph-Grounded (Repo-Insight) ━━━[/bold green]")
     console.print()
@@ -134,10 +145,34 @@ def run_mode_b(query: str, graph: falkordb.Graph, console: Console) -> dict:
     mode_b_data = {"time": 0, "answer": "", "tool_count": 0, "files_traced": 0,
                    "functions_found": 0, "error": None}
 
+    # Build streaming table for live display
+    tool_table = Table(
+        title="[bold cyan]Graph Queries (Live)[/bold cyan]",
+        show_header=True,
+        header_style="bold magenta",
+    )
+    tool_table.add_column("Iter", style="dim", width=4)
+    tool_table.add_column("Tool", style="cyan", width=22)
+    tool_table.add_column("Args", style="yellow", width=28)
+    tool_table.add_column("Result", style="green", max_width=45)
+
     try:
         start = time.time()
-        with console.status("[bold cyan]Running ReAct agent loop...[/bold cyan]"):
-            result = run_repo_agent(query, graph)
+
+        def _on_tool_call(entry: dict) -> None:
+            """Callback invoked after each tool call — updates the live table."""
+            args_str = json.dumps(entry["args"], indent=None)
+            summary = _summarize_tool_result(entry["result"])
+            tool_table.add_row(
+                str(entry["iteration"]),
+                entry["tool"],
+                args_str,
+                summary,
+            )
+
+        with Live(tool_table, console=console, refresh_per_second=4) as live:
+            result = run_repo_agent(query, graph, on_tool_call=_on_tool_call)
+
         elapsed = time.time() - start
 
         mode_b_data["time"] = round(elapsed, 1)
@@ -158,36 +193,12 @@ def run_mode_b(query: str, graph: falkordb.Graph, console: Console) -> dict:
                             if isinstance(item, dict):
                                 if item.get("file_path"):
                                     files_seen.add(item["file_path"])
-                                if item.get("name"):
-                                    funcs_seen.add(item["name"])
+                                if item.get("fqn"):
+                                    funcs_seen.add(item["fqn"])
         mode_b_data["files_traced"] = len(files_seen)
         mode_b_data["functions_found"] = len(funcs_seen)
 
-        # Display tool call log
-        if result["tool_calls_log"]:
-            tool_table = Table(
-                title="[bold cyan]Graph Queries Executed[/bold cyan]",
-                show_header=True,
-                header_style="bold magenta",
-            )
-            tool_table.add_column("Iter", style="dim", width=4)
-            tool_table.add_column("Tool", style="cyan", width=22)
-            tool_table.add_column("Args", style="yellow", width=28)
-            tool_table.add_column("Result", style="green", max_width=45)
-
-            for entry in result["tool_calls_log"]:
-                args_str = json.dumps(entry["args"], indent=None)
-                summary = _summarize_tool_result(entry["result"])
-
-                tool_table.add_row(
-                    str(entry["iteration"]),
-                    entry["tool"],
-                    args_str,
-                    summary,
-                )
-
-            console.print(tool_table)
-            console.print()
+        console.print()
 
         # Display status info
         status_parts = [
@@ -210,6 +221,16 @@ def run_mode_b(query: str, graph: falkordb.Graph, console: Console) -> dict:
             padding=(1, 2),
         ))
 
+        # Display diff output if available (4.7)
+        if result.get("diff"):
+            with console.pager() if len(result["diff"]) > 2000 else _noop_context():
+                console.print(Panel(
+                    Syntax(result["diff"], "diff", theme="monokai", line_numbers=False),
+                    title="[bold yellow]Change Set (Diff Format)[/bold yellow]",
+                    border_style="yellow",
+                    padding=(1, 2),
+                ))
+
     except ConnectionError as e:
         mode_b_data["error"] = str(e)
         console.print(Panel(
@@ -228,55 +249,162 @@ def run_mode_b(query: str, graph: falkordb.Graph, console: Console) -> dict:
     return mode_b_data
 
 
-def _show_comparison(mode_a_data: dict, mode_b_data: dict, console: Console) -> None:
-    """Show a quantitative comparison table between Mode A and Mode B."""
+def run_mode_c(query: str, repo_path: str, graph: falkordb.Graph, console: Console) -> dict:
+    """Run Mode C: 6-phase graph-driven pipeline with live phase display."""
+    from change_engine import GraphDrivenEngine
+
+    console.print()
+    console.print("[bold bright_magenta]━━━ MODE C: Graph-Driven Engine (6-Phase Pipeline) ━━━[/bold bright_magenta]")
     console.print()
 
+    mode_c_data = {"time": 0, "answer": "", "error": None, "phases": [],
+                   "edits": 0, "tests_passed": False, "validated": False}
+
+    # Phase status display
+    phase_table = Table(
+        title="[bold cyan]Pipeline Phases (Live)[/bold cyan]",
+        show_header=True, header_style="bold magenta",
+    )
+    phase_table.add_column("Phase", style="cyan", width=40)
+    phase_table.add_column("Status", style="green", width=15)
+    phase_table.add_column("Details", style="yellow", max_width=40)
+
+    def _on_phase(phase: str, data: dict) -> None:
+        labels = {
+            "phase_0": "Phase 0: Graph Construction",
+            "phase_1": "Phase 1: Seed Localization",
+            "phase_2": "Phase 2: Structural Expansion",
+            "phase_3": "Phase 3: Graph-Constrained Planning",
+            "phase_4": "Phase 4: Surgical Editing",
+            "phase_5": "Phase 5: Verified Apply",
+            "phase_5_test": "Phase 5: Test Run",
+        }
+        label = labels.get(phase, phase)
+        detail = ""
+        if phase == "phase_0":
+            detail = f"{data.get('functions', '?')} functions, {data.get('call_edges', '?')} edges"
+        elif phase == "phase_1":
+            seeds = data.get('seeds', [])
+            detail = f"{len(seeds)} seeds: {', '.join(seeds[:3])}"
+        elif phase == "phase_2":
+            detail = f"{data.get('blast_radius_count', '?')} blast nodes, {data.get('files_affected', '?')} files"
+        elif phase == "phase_3":
+            detail = f"validated={data.get('is_validated')}, missing={data.get('missing_files', 0)}"
+            mode_c_data["validated"] = data.get("is_validated", False)
+        elif phase == "phase_4":
+            detail = f"{data.get('edit_blocks', 0)} SEARCH/REPLACE blocks"
+            mode_c_data["edits"] = data.get("edit_blocks", 0)
+        elif phase == "phase_5":
+            detail = f"apply={data.get('apply_success')}, tests={data.get('tests_passed')}"
+            mode_c_data["tests_passed"] = data.get("tests_passed", False)
+        elif phase == "phase_5_test":
+            detail = f"attempt {data.get('attempt')}: {data.get('passed', 0)} passed, {data.get('failed', 0)} failed"
+
+        phase_table.add_row(label, "✓ Done", detail)
+
+    try:
+        from rich.live import Live
+        engine = GraphDrivenEngine(Path(repo_path).resolve(), graph)
+        start = time.time()
+
+        with Live(phase_table, console=console, refresh_per_second=4):
+            result = engine.run(query, on_phase=_on_phase)
+
+        elapsed = time.time() - start
+        mode_c_data["time"] = round(elapsed, 1)
+        mode_c_data["answer"] = result.answer
+        mode_c_data["phases"] = result.phases_completed
+
+        console.print()
+
+        # Show timing breakdown
+        if result.timings:
+            timing_parts = [f"{k.replace('phase_', 'P')}: {v:.1f}s" for k, v in result.timings.items()]
+            console.print(f"[dim]Timing: {' | '.join(timing_parts)}[/dim]")
+
+        # Show answer
+        console.print(Panel(
+            result.answer if result.answer else "(no answer generated)",
+            title="[bold bright_magenta]MODE C: Graph-Driven Engine[/bold bright_magenta]",
+            subtitle=f"[dim]{elapsed:.1f}s | {len(result.edits)} edits | validated={mode_c_data['validated']}[/dim]",
+            border_style="bright_magenta",
+            padding=(1, 2),
+        ))
+
+        # Show edit blocks if generated
+        if result.edits:
+            edit_text = "\n\n".join(
+                f"FILE: {eb.file_path}\n<<<<<<< SEARCH\n{eb.search_text[:200]}...\n=======\n{eb.replace_text[:200]}...\n>>>>>>> REPLACE"
+                for eb in result.edits[:5]
+            )
+            console.print(Panel(
+                Syntax(edit_text, "diff", theme="monokai", line_numbers=False),
+                title="[bold yellow]Generated Edit Blocks[/bold yellow]",
+                border_style="yellow",
+                padding=(1, 2),
+            ))
+
+        # Show test results if available
+        if result.test_result:
+            status = "[green]✓ ALL PASSED[/green]" if result.test_result.all_passed else "[red]✗ FAILURES[/red]"
+            console.print(Panel(
+                f"Tests: {result.test_result.passed} passed, {result.test_result.failed} failed, "
+                f"{result.test_result.errors} errors\nStatus: {status}",
+                title="[bold]Test Results[/bold]",
+                border_style="green" if result.test_result.all_passed else "red",
+            ))
+
+        if result.error:
+            console.print(f"[red]Pipeline error: {result.error}[/red]")
+
+    except Exception as e:
+        mode_c_data["error"] = str(e)
+        console.print(Panel(f"[red]Error in Mode C: {e}[/red]", title="MODE C: Error", border_style="red"))
+
+    return mode_c_data
+
+
+def _show_comparison(mode_a_data: dict, mode_b_data: dict, console: Console,
+                     mode_c_data: dict = None) -> None:
+    """Show a quantitative comparison table between modes."""
+    console.print()
+
+    has_c = mode_c_data is not None and mode_c_data
+
     comp_table = Table(
-        title="[bold bright_blue]A/B Comparison[/bold bright_blue]",
-        show_header=True,
-        header_style="bold",
+        title="[bold bright_blue]Mode Comparison[/bold bright_blue]",
+        show_header=True, header_style="bold",
     )
     comp_table.add_column("Metric", style="white", width=25)
-    comp_table.add_column("Mode A (Blind)", style="red", justify="center", width=20)
-    comp_table.add_column("Mode B (Graph)", style="green", justify="center", width=20)
+    comp_table.add_column("Mode A (Blind)", style="red", justify="center", width=18)
+    comp_table.add_column("Mode B (Tool-Call)", style="green", justify="center", width=18)
+    if has_c:
+        comp_table.add_column("Mode C (Graph-Driven)", style="bright_magenta", justify="center", width=20)
 
-    comp_table.add_row(
-        "Response Time",
-        f"{mode_a_data['time']}s",
-        f"{mode_b_data['time']}s",
-    )
-    comp_table.add_row(
-        "Graph Queries",
-        "0",
-        str(mode_b_data["tool_count"]),
-    )
-    comp_table.add_row(
-        "Files Traced",
-        "0",
-        str(mode_b_data["files_traced"]),
-    )
-    comp_table.add_row(
-        "Functions Found",
-        "0",
-        str(mode_b_data["functions_found"]),
-    )
-    comp_table.add_row(
-        "Grounded in Code Graph",
-        "[red]✗ No[/red]",
-        "[green]✓ Yes[/green]",
-    )
+    row = lambda m, a, b, c=None: comp_table.add_row(m, a, b, *([c] if has_c and c else []))
+
+    row("Response Time", f"{mode_a_data.get('time', '?')}s", f"{mode_b_data.get('time', '?')}s",
+        f"{mode_c_data.get('time', '?')}s" if has_c else None)
+    row("Graph Queries", "0", str(mode_b_data.get("tool_count", 0)),
+        "exhaustive" if has_c else None)
+    row("Files Traced", "0", str(mode_b_data.get("files_traced", 0)),
+        "all in blast radius" if has_c else None)
+    row("Validation Gate", "[red]✗ No[/red]", "[red]✗ No[/red]",
+        "[green]✓ Yes[/green]" if has_c and mode_c_data.get("validated") else "[red]✗ No[/red]" if has_c else None)
+    row("Auto-Apply + Test", "[red]✗ No[/red]", "[red]✗ No[/red]",
+        "[green]✓ Yes[/green]" if has_c and mode_c_data.get("tests_passed") else "[yellow]attempted[/yellow]" if has_c else None)
+    row("Structural Coverage", "[red]✗ None[/red]", "[yellow]~ Partial[/yellow]",
+        "[green]✓ Guaranteed[/green]" if has_c else None)
 
     console.print(comp_table)
-
     console.print()
     console.print(Panel(
         "[bold]Key Insight:[/bold]\n\n"
-        "• [red]Mode A[/red] proposes changes from the LLM's training data — "
-        "it will miss files, invent function names, and ignore dependency chains.\n\n"
-        "• [green]Mode B[/green] queries the actual codebase graph before proposing changes — "
-        "every file and function reference is verified against the real code structure.\n\n"
-        "[dim]The graph doesn't just improve accuracy. It makes the AI's changes complete.[/dim]",
+        "• [red]Mode A[/red] guesses from training data — misses files, invents names.\n"
+        "• [green]Mode B[/green] queries the graph — finds more files, but coverage is non-deterministic.\n"
+        + ("• [bright_magenta]Mode C[/bright_magenta] uses the graph as the control plane — "
+           "exhaustive traversal, validated plan, auto-applied and tested.\n" if has_c else "") +
+        "\n[dim]The graph doesn't just improve accuracy. It guarantees structural completeness.[/dim]",
         title="[bold bright_blue]Why This Matters[/bold bright_blue]",
         border_style="bright_blue",
         padding=(1, 2),
@@ -291,15 +419,17 @@ def main() -> None:
         --path PATH     : Path to repo to ingest. Default: ./target_repo
         --ingest        : Flag. If set, run ingestion before demo.
         --prompt TEXT   : Run a specific prompt directly (skip interactive selection).
-        --mode {a,b,ab} : Which mode to run. Default: ab (runs both).
+        --mode {a,b,c,ab,abc} : Which mode to run. Default: ab.
+        --score         : Run quantitative scoring suite.
     """
     parser = argparse.ArgumentParser(
-        description="Repo-Insight: Graph-RAG for Codebases",
+        description="Repo-Insight: Graph-Driven Coding Agent",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
             "Examples:\n"
-            "  python demo_cli.py --ingest --path ./ --mode ab\n"
-            "  python demo_cli.py --prompt 'Rename get_connection everywhere' --mode b\n"
+            "  python demo_cli.py --ingest --path ./ --mode abc\n"
+            "  python demo_cli.py --prompt 'Rename get_connection everywhere' --mode c\n"
+            "  python demo_cli.py --score --path ./\n"
         ),
     )
     parser.add_argument(
@@ -321,9 +451,14 @@ def main() -> None:
     )
     parser.add_argument(
         "--mode",
-        choices=["a", "b", "ab"],
+        type=str,
         default="ab",
-        help="Which mode to run: a (baseline), b (graph), ab (both). Default: ab",
+        help="Which mode(s) to run: a, b, c, ab, abc. Default: ab",
+    )
+    parser.add_argument(
+        "--score",
+        action="store_true",
+        help="Run quantitative scoring suite (precision/recall/F1)",
     )
 
     args = parser.parse_args()
@@ -387,20 +522,33 @@ def main() -> None:
     console.print(f"\n[bold]Prompt:[/bold] {selected_prompt}")
     console.print("─" * 60)
 
+    # Scoring mode
+    if args.score:
+        from scoring import run_scoring_suite, print_scoring_report
+        console.print("\n[bold cyan]📊 Running Scoring Suite...[/bold cyan]")
+        try:
+            graph = get_connection()
+            report = run_scoring_suite(graph, Path(args.path).resolve())
+            print_scoring_report(report)
+        except Exception as e:
+            console.print(f"[red]Scoring failed: {e}[/red]")
+        return
+
     # Step 3: Run the selected mode(s)
     graph = None
-    if "b" in args.mode:
+    if "b" in args.mode or "c" in args.mode:
         try:
             graph = get_connection()
         except ConnectionError as e:
             console.print(f"[red]Cannot connect to FalkorDB: {e}[/red]")
-            if args.mode == "b":
+            if args.mode in ("b", "c"):
                 sys.exit(1)
             else:
-                console.print("[yellow]Skipping Mode B due to connection error.[/yellow]")
+                console.print("[yellow]Skipping graph modes due to connection error.[/yellow]")
 
     mode_a_data = {}
     mode_b_data = {}
+    mode_c_data = {}
 
     if "a" in args.mode:
         mode_a_data = run_mode_a(selected_prompt, console)
@@ -408,9 +556,17 @@ def main() -> None:
     if "b" in args.mode and graph is not None:
         mode_b_data = run_mode_b(selected_prompt, graph, console)
 
-    # Step 4: Comparison summary if running both modes
-    if args.mode == "ab" and mode_a_data and mode_b_data:
-        _show_comparison(mode_a_data, mode_b_data, console)
+    if "c" in args.mode and graph is not None:
+        mode_c_data = run_mode_c(selected_prompt, args.path, graph, console)
+
+    # Step 4: Comparison summary
+    if len(args.mode) > 1 and (mode_a_data or mode_b_data):
+        _show_comparison(
+            mode_a_data or {},
+            mode_b_data or {},
+            console,
+            mode_c_data=mode_c_data if mode_c_data else None,
+        )
 
     console.print()
 
