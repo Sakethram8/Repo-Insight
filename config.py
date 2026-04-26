@@ -7,7 +7,7 @@ GRAPH_NAME = os.getenv("GRAPH_NAME", "repo_insight")
 
 SGLANG_BASE_URL = os.getenv("SGLANG_BASE_URL", "http://localhost:11434/v1")
 SGLANG_API_KEY = os.getenv("SGLANG_API_KEY", "EMPTY")        # SGLang default; required by openai client but unused
-LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:1.5b")          # Must match the model name served by SGLang
+LLM_MODEL = os.getenv("LLM_MODEL", "qwen2.5:1.5b")          # Override via env var for production (e.g. Qwen2.5-72B)
 
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")   # Sentence-transformer model; runs locally
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))                # Output dimension for all-MiniLM-L6-v2
@@ -17,6 +17,6 @@ IMPACT_RADIUS_WARN_THRESHOLD = int(os.getenv("IMPACT_RADIUS_WARN_THRESHOLD", "5"
 AGENT_MAX_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", "10"))
 AGENT_TOOL_TIMEOUT_SECONDS = int(os.getenv("AGENT_TOOL_TIMEOUT_SECONDS", "5"))
 
-FLUSH_GRAPH_ON_INGEST = os.getenv("FLUSH_GRAPH_ON_INGEST", "true").lower() in ("true", "1", "yes")
+FLUSH_GRAPH_ON_INGEST = os.getenv("FLUSH_GRAPH_ON_INGEST", "false").lower() in ("true", "1", "yes")
 
 INGEST_CONCURRENCY = int(os.getenv("INGEST_CONCURRENCY", "5"))   # Max LLM threads for Node Summarization

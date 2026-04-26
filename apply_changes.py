@@ -9,6 +9,7 @@ import logging
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -295,7 +296,7 @@ def run_tests(
     """
     if test_command is None:
         test_command = [
-            "python", "-m", "pytest", "tests/", "-v",
+            sys.executable, "-m", "pytest", "tests/", "-v",
             "--tb=short", "-q",
             "-m", "not integration",  # Skip integration tests in sandbox
         ]

@@ -158,7 +158,7 @@ def run_scoring_suite(
         tasks: Override tasks. Default: GROUND_TRUTH_TASKS.
     """
     if modes is None:
-        modes = ["a", "b"]  # Mode C requires change_engine, added separately
+        modes = ["a", "b", "c"]
     if tasks is None:
         tasks = GROUND_TRUTH_TASKS
 
@@ -246,7 +246,6 @@ def print_scoring_report(report: ScoringReport) -> None:
     """Display scoring results as Rich tables."""
     from rich.console import Console
     from rich.table import Table
-    from rich.panel import Panel
 
     console = Console()
 

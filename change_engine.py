@@ -12,6 +12,7 @@ Phase 5: Verified Apply + Graph Re-Analysis
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,6 +59,7 @@ class ChangePlan:
     missing_files: set[str] = field(default_factory=set)
     is_validated: bool = False
     justifications: dict[str, str] = field(default_factory=dict)
+    actions: dict[str, str] = field(default_factory=dict)  # file → "modify"|"no_change"
     raw_plan: str = ""
 
 
@@ -421,6 +423,7 @@ class GraphDrivenEngine:
             fp = item.get("file", "")
             plan.planned_files.add(fp)
             plan.justifications[fp] = item.get("reason", "")
+            plan.actions[fp] = item.get("action", "modify")
 
         # VALIDATION GATE: check for missing files
         plan.missing_files = plan.blast_radius_files - plan.planned_files
@@ -467,10 +470,12 @@ class GraphDrivenEngine:
 
             plan.planned_files.clear()
             plan.justifications.clear()
+            plan.actions.clear()
             for item in plan_items:
                 fp = item.get("file", "")
                 plan.planned_files.add(fp)
                 plan.justifications[fp] = item.get("reason", "")
+                plan.actions[fp] = item.get("action", "modify")
 
             plan.missing_files = plan.blast_radius_files - plan.planned_files
         except Exception as e:
@@ -487,8 +492,8 @@ class GraphDrivenEngine:
     ) -> tuple[list[EditBlock], str]:
         """Generate SEARCH/REPLACE blocks for all planned modifications."""
         modify_files = {
-            f for f, j in plan.justifications.items()
-            if "no_change" not in j.lower() and f in plan.planned_files
+            f for f, action in plan.actions.items()
+            if action != "no_change" and f in plan.planned_files
         }
 
         plan_text = "\n".join(
@@ -595,9 +600,6 @@ class GraphDrivenEngine:
     ) -> dict:
         """Re-parse changed files and check for new dependencies."""
         try:
-            changed_files = [eb.file_path for eb in subgraph.source_code.keys()
-                             if eb in subgraph.all_affected_files]
-            # Use reingest_files on sandbox to check the new graph shape
             from parser import parse_file
             new_calls = set()
             for fp in subgraph.all_affected_files:
@@ -611,6 +613,7 @@ class GraphDrivenEngine:
                         pass
 
             return {
+                "files_analyzed": len(subgraph.all_affected_files),
                 "new_call_edges_detected": len(new_calls),
                 "status": "analyzed",
             }
@@ -660,7 +663,6 @@ class GraphDrivenEngine:
             pass
 
         # Try to find JSON array in the text
-        import re
         match = re.search(r'\[.*\]', cleaned, re.DOTALL)
         if match:
             try:
