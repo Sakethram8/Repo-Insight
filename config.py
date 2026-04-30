@@ -7,7 +7,7 @@ GRAPH_NAME = os.getenv("GRAPH_NAME", "repo_insight")
 
 SGLANG_BASE_URL = os.getenv("SGLANG_BASE_URL", "http://localhost:30000/v1")
 SGLANG_API_KEY = os.getenv("SGLANG_API_KEY", "EMPTY")        # SGLang default; required by openai client but unused
-LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3-Coder-Next")          # Override via env var for production (e.g. Qwen3-Coder-Next)
+LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3-8B")          # Override via env var for production (e.g. Qwen3-8B)
 
 # Baseline model for "fair fight" A/B comparison
 # This is the STRONGER model that runs WITHOUT the graph — proving structure > scale

@@ -288,16 +288,32 @@ class GraphDrivenEngine:
     # ------------------------------------------------------------------
 
     def _localize_seeds(self, prompt: str) -> list[str]:
-        """Use semantic search + LLM to identify primary change targets."""
-        search_result = semantic_search(prompt, self.graph, top_k=10)
-        candidates = search_result.get("results", [])
+        """Use LLM + graph semantic search to identify entry points."""
+        from tools import semantic_search
+        candidates = semantic_search(prompt, self.graph, top_k=10)
+
+        # Lexical Fallback: If the prompt explicitly mentions a file or function name,
+        # guarantee it is in the candidate list even if semantic search missed it!
+        try:
+            # Extract potential file names or function names from prompt (simple word split)
+            words = [w.strip("`'\".,") for w in prompt.split()]
+            for word in words:
+                if len(word) > 3 and ("/" in word or ".py" in word or word.islower()):
+                    res = self.graph.query(
+                        "MATCH (f:Function) WHERE f.file_path ENDS WITH $word OR f.name = $word RETURN 'Function', f.fqn, f.file_path",
+                        {"word": word}
+                    ).result_set
+                    for r in res:
+                        if not any(c["fqn"] == r[1] for c in candidates):
+                            candidates.append({"label": r[0], "fqn": r[1], "file_path": r[2], "score": 1.0})
+        except Exception as e:
+            logger.error("Lexical fallback failed: %s", e)
 
         if not candidates:
-            logger.warning("Semantic search returned no candidates for: %s", prompt)
             return []
 
         candidates_text = "\n".join(
-            f"- {c['fqn']} ({c['label']}, file: {c['file_path']}, score: {c['score']})"
+            f"- {c['fqn']} ({c['label']}, file: {c['file_path']}, score: {c.get('score', 1.0)})"
             for c in candidates
         )
 
