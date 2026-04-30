@@ -1,0 +1,52 @@
+# Repo-Insight Docker Compose
+# Usage:
+#   docker compose up -d          # Start FalkorDB + Streamlit app
+#   docker compose up falkordb    # Start only FalkorDB (for local dev)
+#
+# For the SGLang inference server, run separately on the GPU host:
+#   python -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30000
+#   python -m sglang.launch_server --model-path Qwen/Qwen3-Coder-Next --port 30001
+
+services:
+  falkordb:
+    image: falkordb/falkordb:latest
+    container_name: repo-insight-falkordb
+    ports:
+      - "6379:6379"   # Redis protocol (FalkorDB client)
+      - "8001:8001"   # FalkorDB Browser UI
+    volumes:
+      - falkordb_data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: repo-insight-app
+    ports:
+      - "8501:8501"
+    environment:
+      - FALKORDB_HOST=falkordb
+      - FALKORDB_PORT=6379
+      - SGLANG_BASE_URL=${SGLANG_BASE_URL:-http://host.docker.internal:30000/v1}
+      - SGLANG_API_KEY=${SGLANG_API_KEY:-EMPTY}
+      - LLM_MODEL=${LLM_MODEL:-Qwen/Qwen3-8B}
+      - BASELINE_SGLANG_BASE_URL=${BASELINE_SGLANG_BASE_URL:-http://host.docker.internal:30001/v1}
+      - BASELINE_LLM_MODEL=${BASELINE_LLM_MODEL:-Qwen/Qwen3-Coder-Next}
+    depends_on:
+      falkordb:
+        condition: service_healthy
+    restart: unless-stopped
+    # Mount repo for ingestion (override with your target repo)
+    volumes:
+      - ${REPO_PATH:-.}:/workspace:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+volumes:
+  falkordb_data:

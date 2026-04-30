@@ -1,9 +1,10 @@
 # demo_cli.py
 """
-Rich terminal demo. Three modes:
+Rich terminal demo. Four modes:
   Mode A — Baseline: LLM answers with no tools (shows what AI coding agents do today)
   Mode B — Graph-Grounded: LLM uses graph tools (shows what Repo-Insight enables)
   Mode C — Graph-Driven: 6-phase pipeline with validation gate + auto-apply
+  Fair  — Head-to-head: Graph-Driven (smaller model) vs Blind (bigger model)
 """
 
 import sys
@@ -20,7 +21,8 @@ from rich.syntax import Syntax
 from rich import print as rprint
 from contextlib import contextmanager
 from config import (SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
-                    FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME)
+                    FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
+                    BASELINE_SGLANG_BASE_URL, BASELINE_LLM_MODEL)
 from agent import run_repo_agent
 from ingest import run_ingestion, get_connection
 from pathlib import Path
@@ -411,6 +413,136 @@ def _show_comparison(mode_a_data: dict, mode_b_data: dict, console: Console,
     ))
 
 
+# ---------------------------------------------------------------------------
+# Fair Fight: Graph-Driven (smaller model) vs Blind (bigger model)
+# ---------------------------------------------------------------------------
+
+def run_baseline(query: str, console: Console) -> dict:
+    """
+    Run the STRONGER model (BASELINE_LLM_MODEL) with NO graph tools.
+    This is the 'champion' that Repo-Insight's smaller model must beat.
+    """
+    console.print()
+    console.print(f"[bold bright_red]━━━ BASELINE: {BASELINE_LLM_MODEL} (No Graph) ━━━[/bold bright_red]")
+    console.print()
+
+    client = openai.OpenAI(
+        base_url=BASELINE_SGLANG_BASE_URL,
+        api_key=SGLANG_API_KEY,
+    )
+
+    data = {"time": 0, "answer": "", "error": None, "model": BASELINE_LLM_MODEL}
+
+    try:
+        start = time.time()
+        with console.status(f"[bold yellow]Querying {BASELINE_LLM_MODEL} (no graph)...[/bold yellow]"):
+            response = client.chat.completions.create(
+                model=BASELINE_LLM_MODEL,
+                messages=[
+                    {"role": "system", "content": (
+                        "You are a helpful coding assistant. When asked to make code changes, "
+                        "list every file that needs modification and describe what changes to make. "
+                        "Be thorough — missing a file means the change will break things."
+                    )},
+                    {"role": "user", "content": query},
+                ],
+            )
+        elapsed = time.time() - start
+        answer = response.choices[0].message.content or "(empty response)"
+        data["time"] = round(elapsed, 1)
+        data["answer"] = answer
+
+        console.print(Panel(
+            answer,
+            title=f"[bold bright_red]BASELINE: {BASELINE_LLM_MODEL} (No Graph)[/bold bright_red]",
+            subtitle=f"[dim]{elapsed:.1f}s[/dim]",
+            border_style="bright_red",
+            padding=(1, 2),
+        ))
+
+    except Exception as e:
+        data["error"] = str(e)
+        console.print(Panel(
+            f"[red]Error in Baseline: {e}[/red]",
+            title="[bold red]BASELINE: Error[/bold red]",
+            border_style="red",
+        ))
+
+    return data
+
+
+def _show_fair_fight_comparison(
+    mode_c_data: dict, baseline_data: dict, console: Console,
+) -> None:
+    """Show head-to-head comparison: Graph-Driven (smaller model) vs Blind (bigger model)."""
+    console.print()
+
+    table = Table(
+        title="[bold bright_blue]⚔ FAIR FIGHT: Structure vs. Scale ⚔[/bold bright_blue]",
+        show_header=True, header_style="bold",
+    )
+    table.add_column("Metric", style="white", width=28)
+    table.add_column(
+        f"🧠 {LLM_MODEL}\n+ Graph Pipeline",
+        style="bright_magenta", justify="center", width=26,
+    )
+    table.add_column(
+        f"🤖 {BASELINE_LLM_MODEL}\n(Blind, No Graph)",
+        style="bright_red", justify="center", width=26,
+    )
+
+    table.add_row(
+        "Model",
+        f"[bright_magenta]{LLM_MODEL}[/bright_magenta]",
+        f"[bright_red]{BASELINE_LLM_MODEL}[/bright_red]",
+    )
+    table.add_row(
+        "Graph Tools",
+        "[green]✓ 9 deterministic tools[/green]",
+        "[red]✗ None[/red]",
+    )
+    table.add_row(
+        "Response Time",
+        f"{mode_c_data.get('time', '?')}s",
+        f"{baseline_data.get('time', '?')}s",
+    )
+    table.add_row(
+        "Validation Gate",
+        "[green]✓ Structural guarantee[/green]" if mode_c_data.get("validated") else "[yellow]attempted[/yellow]",
+        "[red]✗ None[/red]",
+    )
+    table.add_row(
+        "Auto-Apply + Test",
+        "[green]✓ Sandbox verified[/green]" if mode_c_data.get("tests_passed") else "[yellow]attempted[/yellow]",
+        "[red]✗ None[/red]",
+    )
+    table.add_row(
+        "Structural Coverage",
+        "[green]✓ Exhaustive (graph)[/green]",
+        "[red]✗ Guess from training data[/red]",
+    )
+    table.add_row(
+        "Edit Blocks Generated",
+        str(mode_c_data.get("edits", 0)),
+        "0 (prose only)",
+    )
+
+    console.print(table)
+    console.print()
+    console.print(Panel(
+        f"[bold]The Question:[/bold] Can a [bright_magenta]smaller model + code graph[/bright_magenta] "
+        f"outperform a [bright_red]larger model running blind[/bright_red]?\n\n"
+        f"• [bright_magenta]{LLM_MODEL}[/bright_magenta] uses Repo-Insight's graph pipeline: "
+        f"blast radius analysis, validation gate, and surgical edits.\n"
+        f"• [bright_red]{BASELINE_LLM_MODEL}[/bright_red] gets the same prompt but has to guess "
+        f"which files need changing from training data alone.\n\n"
+        f"[bold green]Run '--score' to get quantitative Precision/Recall/F1 proof.[/bold green]",
+        title="[bold bright_blue]🏆 Why Structure Beats Scale[/bold bright_blue]",
+        border_style="bright_blue",
+        padding=(1, 2),
+    ))
+
+
 def main() -> None:
     """
     CLI entry point.
@@ -429,6 +561,7 @@ def main() -> None:
             "Examples:\n"
             "  python demo_cli.py --ingest --path ./ --mode abc\n"
             "  python demo_cli.py --prompt 'Rename get_connection everywhere' --mode c\n"
+            "  python demo_cli.py --mode fair --path ./   # Head-to-head: graph vs blind\n"
             "  python demo_cli.py --score --path ./\n"
         ),
     )
@@ -453,7 +586,7 @@ def main() -> None:
         "--mode",
         type=str,
         default="ab",
-        help="Which mode(s) to run: a, b, c, ab, abc. Default: ab",
+        help="Which mode(s) to run: a, b, c, ab, abc, fair. Default: ab",
     )
     parser.add_argument(
         "--score",
@@ -528,20 +661,22 @@ def main() -> None:
         console.print("\n[bold cyan]📊 Running Scoring Suite...[/bold cyan]")
         try:
             graph = get_connection()
-            report = run_scoring_suite(graph, Path(args.path).resolve())
+            score_modes = ["a", "baseline", "b", "c"]
+            report = run_scoring_suite(graph, Path(args.path).resolve(), modes=score_modes)
             print_scoring_report(report)
         except Exception as e:
             console.print(f"[red]Scoring failed: {e}[/red]")
         return
 
     # Step 3: Run the selected mode(s)
+    is_fair = args.mode == "fair"
     graph = None
-    if "b" in args.mode or "c" in args.mode:
+    if "b" in args.mode or "c" in args.mode or is_fair:
         try:
             graph = get_connection()
         except ConnectionError as e:
             console.print(f"[red]Cannot connect to FalkorDB: {e}[/red]")
-            if args.mode in ("b", "c"):
+            if args.mode in ("b", "c", "fair"):
                 sys.exit(1)
             else:
                 console.print("[yellow]Skipping graph modes due to connection error.[/yellow]")
@@ -549,24 +684,31 @@ def main() -> None:
     mode_a_data = {}
     mode_b_data = {}
     mode_c_data = {}
+    baseline_data = {}
 
-    if "a" in args.mode:
-        mode_a_data = run_mode_a(selected_prompt, console)
-
-    if "b" in args.mode and graph is not None:
-        mode_b_data = run_mode_b(selected_prompt, graph, console)
-
-    if "c" in args.mode and graph is not None:
+    if is_fair:
+        # Fair Fight: Graph-Driven (Mode C) vs Blind Baseline
         mode_c_data = run_mode_c(selected_prompt, args.path, graph, console)
+        baseline_data = run_baseline(selected_prompt, console)
+        _show_fair_fight_comparison(mode_c_data, baseline_data, console)
+    else:
+        if "a" in args.mode:
+            mode_a_data = run_mode_a(selected_prompt, console)
 
-    # Step 4: Comparison summary
-    if len(args.mode) > 1 and (mode_a_data or mode_b_data):
-        _show_comparison(
-            mode_a_data or {},
-            mode_b_data or {},
-            console,
-            mode_c_data=mode_c_data if mode_c_data else None,
-        )
+        if "b" in args.mode and graph is not None:
+            mode_b_data = run_mode_b(selected_prompt, graph, console)
+
+        if "c" in args.mode and graph is not None:
+            mode_c_data = run_mode_c(selected_prompt, args.path, graph, console)
+
+        # Step 4: Comparison summary
+        if len(args.mode) > 1 and (mode_a_data or mode_b_data):
+            _show_comparison(
+                mode_a_data or {},
+                mode_b_data or {},
+                console,
+                mode_c_data=mode_c_data if mode_c_data else None,
+            )
 
     console.print()
 

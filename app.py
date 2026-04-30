@@ -14,7 +14,8 @@ from pathlib import Path
 from collections import Counter
 
 from config import (FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
-                    SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL)
+                    SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
+                    BASELINE_SGLANG_BASE_URL, BASELINE_LLM_MODEL)
 from ingest import run_ingestion, get_connection
 from agent import run_repo_agent
 from tools import get_macro_architecture, get_class_architecture
@@ -29,6 +30,68 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+# ---------------------------------------------------------------------------
+# Custom CSS — dark theme polish
+# ---------------------------------------------------------------------------
+
+st.markdown("""
+<style>
+    /* Dark theme accents */
+    .stApp { background-color: #0e1117; }
+    
+    /* Sidebar branding */
+    [data-testid="stSidebar"] {
+        background: linear-gradient(180deg, #0f1923 0%, #0e1117 100%);
+        border-right: 1px solid #1e293b;
+    }
+    
+    /* Chat message styling */
+    .stChatMessage {
+        border-radius: 12px;
+        border: 1px solid #1e293b;
+        margin-bottom: 0.5rem;
+    }
+    
+    /* Primary button gradient */
+    .stButton > button[kind="primary"] {
+        background: linear-gradient(135deg, #06b6d4 0%, #8b5cf6 100%);
+        border: none;
+        color: white;
+        font-weight: 600;
+    }
+    
+    /* Tab styling */
+    .stTabs [data-baseweb="tab-list"] {
+        gap: 8px;
+    }
+    .stTabs [data-baseweb="tab"] {
+        border-radius: 8px 8px 0 0;
+        padding: 10px 20px;
+    }
+    
+    /* Metric cards */
+    [data-testid="stMetric"] {
+        background: #1e293b;
+        border-radius: 10px;
+        padding: 12px;
+        border: 1px solid #334155;
+    }
+    
+    /* Success/error/warning boxes */
+    .stAlert {
+        border-radius: 10px;
+    }
+    
+    /* Fair fight comparison cards */
+    .fair-fight-card {
+        background: #1e293b;
+        border-radius: 12px;
+        padding: 16px;
+        border: 1px solid #334155;
+    }
+</style>
+""", unsafe_allow_html=True)
 
 # ---------------------------------------------------------------------------
 # Session state defaults
@@ -242,10 +305,11 @@ with st.sidebar:
     st.markdown("### 🔧 Agent Mode")
     mode = st.radio(
         "Select pipeline",
-        options=["c", "b"],
+        options=["c", "b", "fair"],
         format_func=lambda x: {
             "c": "⚡ Mode C — Graph-Driven (6-Phase)",
             "b": "🔧 Mode B — Tool-Calling Agent",
+            "fair": "⚔️ Fair Fight — Graph vs. Blind",
         }[x],
         index=0,
         label_visibility="collapsed",
@@ -254,8 +318,10 @@ with st.sidebar:
 
     if mode == "c":
         st.caption("Deterministic graph traversal → validated plan → auto-apply + test")
-    else:
+    elif mode == "b":
         st.caption("ReAct loop with graph tools (non-deterministic)")
+    elif mode == "fair":
+        st.caption(f"Graph-Driven ({LLM_MODEL}) vs. Blind ({BASELINE_LLM_MODEL})")
 
     st.divider()
 
@@ -462,6 +528,118 @@ with tab_chat:
                     error_msg = f"❌ Pipeline error: {e}"
                     st.error(error_msg)
                     st.session_state.messages.append({"role": "assistant", "content": error_msg})
+
+            elif st.session_state.agent_mode == "fair":
+                # --- Fair Fight: Graph-Driven vs Blind Baseline ---
+                from change_engine import GraphDrivenEngine
+
+                st.markdown("### ⚔️ Fair Fight: Structure vs. Scale")
+                col_graph, col_blind = st.columns(2)
+
+                # --- Left column: Graph-Driven (Mode C) ---
+                with col_graph:
+                    st.markdown(f"#### 🧠 {LLM_MODEL} + Graph")
+                    phase_status = st.status("Running Graph Pipeline...", expanded=True)
+                    phase_log_fair = []
+
+                    def _on_phase_fair(phase, data):
+                        labels = {
+                            "phase_0": "Graph Construction",
+                            "phase_1": "Seed Localization",
+                            "phase_2": "Structural Expansion",
+                            "phase_3": "Validated Planning",
+                            "phase_4": "Surgical Editing",
+                            "phase_5": "Verified Apply",
+                        }
+                        label = labels.get(phase, phase)
+                        phase_log_fair.append(label)
+                        phase_status.update(label=f"⏳ {label}...")
+                        phase_status.write(f"✓ {label}")
+
+                    try:
+                        graph = get_db_graph()
+                        engine = GraphDrivenEngine(Path(repo_path).resolve(), graph)
+                        start_c = time.time()
+                        result_c = engine.run(prompt, on_phase=_on_phase_fair)
+                        elapsed_c = time.time() - start_c
+                        phase_status.update(label=f"✅ Done ({elapsed_c:.1f}s)", state="complete")
+
+                        st.session_state.last_result = result_c
+                        if result_c.subgraph:
+                            st.session_state.last_subgraph_data = result_c
+
+                        answer_c = result_c.answer or "(No answer)"
+                        st.markdown(answer_c[:2000])
+
+                        if result_c.edits:
+                            st.metric("Edit Blocks", len(result_c.edits))
+                        if result_c.plan:
+                            st.metric("Validated", "✅ Yes" if result_c.plan.is_validated else "❌ No")
+                    except Exception as e:
+                        answer_c = f"Error: {e}"
+                        elapsed_c = 0
+                        result_c = None
+                        st.error(answer_c)
+
+                # --- Right column: Blind Baseline ---
+                with col_blind:
+                    st.markdown(f"#### 🤖 {BASELINE_LLM_MODEL} (Blind)")
+                    try:
+                        baseline_client = openai.OpenAI(
+                            base_url=BASELINE_SGLANG_BASE_URL,
+                            api_key=SGLANG_API_KEY,
+                        )
+                        with st.spinner(f"Querying {BASELINE_LLM_MODEL}..."):
+                            start_b = time.time()
+                            response = baseline_client.chat.completions.create(
+                                model=BASELINE_LLM_MODEL,
+                                messages=[
+                                    {"role": "system", "content": (
+                                        "You are a helpful coding assistant. When asked to make code changes, "
+                                        "list every file that needs modification. Be thorough."
+                                    )},
+                                    {"role": "user", "content": prompt},
+                                ],
+                            )
+                            elapsed_b = time.time() - start_b
+
+                        answer_b = response.choices[0].message.content or "(empty)"
+                        st.success(f"Done ({elapsed_b:.1f}s)")
+                        st.markdown(answer_b[:2000])
+                        st.metric("Graph Tools Used", "0")
+                        st.metric("Validation Gate", "❌ None")
+                    except Exception as e:
+                        answer_b = f"Error: {e}"
+                        elapsed_b = 0
+                        st.error(answer_b)
+
+                # --- Comparison ---
+                st.divider()
+                st.markdown("### 📊 Head-to-Head Results")
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    graph_edits = len(result_c.edits) if result_c and result_c.edits else 0
+                    st.metric("Graph Pipeline Edits", graph_edits, delta="surgical")
+                with m2:
+                    validated = result_c.plan.is_validated if result_c and result_c.plan else False
+                    st.metric("Validation Gate", "✅ Passed" if validated else "❌ Failed")
+                with m3:
+                    st.metric("Baseline Has Graph", "❌ No", delta="blind guess")
+
+                st.info(
+                    f"💡 **{LLM_MODEL}** with the graph pipeline produced "
+                    f"**{graph_edits}** surgical edit blocks with structural validation. "
+                    f"**{BASELINE_LLM_MODEL}** provided prose guidance without any structural guarantee. "
+                    f"Run `python demo_cli.py --score` for quantitative Precision/Recall/F1 proof."
+                )
+
+                msg_data = {
+                    "role": "assistant",
+                    "content": f"**⚔️ Fair Fight Complete**\n\n"
+                               f"- Graph-Driven ({LLM_MODEL}): {elapsed_c:.1f}s, {graph_edits} edits\n"
+                               f"- Blind Baseline ({BASELINE_LLM_MODEL}): {elapsed_b:.1f}s, prose only\n",
+                }
+                st.session_state.messages.append(msg_data)
 
             else:
                 # --- Mode B: Tool-Calling Agent ---

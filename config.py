@@ -7,7 +7,12 @@ GRAPH_NAME = os.getenv("GRAPH_NAME", "repo_insight")
 
 SGLANG_BASE_URL = os.getenv("SGLANG_BASE_URL", "http://localhost:30000/v1")
 SGLANG_API_KEY = os.getenv("SGLANG_API_KEY", "EMPTY")        # SGLang default; required by openai client but unused
-LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen2.5-72B-Instruct")          # Override via env var for production (e.g. Qwen2.5-72B)
+LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3-Coder-Next")          # Override via env var for production (e.g. Qwen3-Coder-Next)
+
+# Baseline model for "fair fight" A/B comparison
+# This is the STRONGER model that runs WITHOUT the graph — proving structure > scale
+BASELINE_SGLANG_BASE_URL = os.getenv("BASELINE_SGLANG_BASE_URL", "http://localhost:30001/v1")
+BASELINE_LLM_MODEL = os.getenv("BASELINE_LLM_MODEL", "Qwen/Qwen3-Coder-Next")
 
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")   # Sentence-transformer model; runs locally
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))                # Output dimension for all-MiniLM-L6-v2
@@ -20,3 +25,4 @@ AGENT_TOOL_TIMEOUT_SECONDS = int(os.getenv("AGENT_TOOL_TIMEOUT_SECONDS", "5"))
 FLUSH_GRAPH_ON_INGEST = os.getenv("FLUSH_GRAPH_ON_INGEST", "false").lower() in ("true", "1", "yes")
 
 INGEST_CONCURRENCY = int(os.getenv("INGEST_CONCURRENCY", "5"))   # Max LLM threads for Node Summarization
+

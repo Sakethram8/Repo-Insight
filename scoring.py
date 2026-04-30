@@ -16,7 +16,8 @@ from typing import Optional
 import openai
 import falkordb
 
-from config import SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL
+from config import (SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
+                    BASELINE_SGLANG_BASE_URL, BASELINE_LLM_MODEL)
 
 logger = logging.getLogger(__name__)
 
@@ -127,13 +128,22 @@ def score_single(
     return precision, recall, f1, hallucinated
 
 
-def run_mode_a_for_scoring(prompt: str, client: openai.OpenAI) -> tuple[str, float]:
-    """Run Mode A (blind LLM) and return the answer + time."""
+def run_mode_a_for_scoring(prompt: str, client: openai.OpenAI, model: str = None) -> tuple[str, float]:
+    """Run a blind LLM (no tools) and return the answer + time."""
+    if model is None:
+        model = LLM_MODEL
     start = time.time()
     try:
         response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            model=model,
+            messages=[
+                {"role": "system", "content": (
+                    "You are a helpful coding assistant. When asked to make code changes, "
+                    "list every file that needs modification and describe what changes to make. "
+                    "Be thorough — missing a file means the change will break things."
+                )},
+                {"role": "user", "content": prompt},
+            ],
             max_tokens=2000,
         )
         answer = response.choices[0].message.content.strip()
@@ -162,6 +172,9 @@ def run_scoring_suite(
     if tasks is None:
         tasks = GROUND_TRUTH_TASKS
 
+    # Create clients — primary (for Repo-Insight modes) and baseline (for blind comparison)
+    baseline_client = None
+
     # Collect all known files in the repo
     all_repo_files: set[str] = set()
     for f in repo_root.rglob("*.py"):
@@ -171,6 +184,8 @@ def run_scoring_suite(
             pass
 
     client = openai.OpenAI(base_url=SGLANG_BASE_URL, api_key=SGLANG_API_KEY)
+    if "baseline" in modes:
+        baseline_client = openai.OpenAI(base_url=BASELINE_SGLANG_BASE_URL, api_key=SGLANG_API_KEY)
     report = ScoringReport()
 
     for task in tasks:
@@ -199,6 +214,15 @@ def run_scoring_suite(
                 except Exception as e:
                     answer = f"Error: {e}"
                 elapsed = time.time() - start
+            elif mode == "baseline":
+                # "Fair fight" — stronger model, no graph tools
+                if baseline_client is None:
+                    baseline_client = openai.OpenAI(
+                        base_url=BASELINE_SGLANG_BASE_URL, api_key=SGLANG_API_KEY,
+                    )
+                answer, elapsed = run_mode_a_for_scoring(
+                    prompt, baseline_client, model=BASELINE_LLM_MODEL,
+                )
             else:
                 continue
 
