@@ -628,3 +628,22 @@ def reingest_files(
         "files_reingested": len(parsed_files),
         "file_paths": file_paths,
     }
+
+if __name__ == "__main__":
+    import sys
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+    
+    if len(sys.argv) < 2:
+        print("Usage: python3 ingest.py <directory_path>")
+        sys.exit(1)
+        
+    target_dir = sys.argv[1]
+    logger.info(f"Starting graph ingestion for directory: {target_dir}")
+    
+    try:
+        stats = run_ingestion(target_dir)
+        logger.info("Ingestion completed successfully!")
+        print(json.dumps(stats, indent=2))
+    except Exception as e:
+        logger.error(f"Ingestion failed: {e}", exc_info=True)
+        sys.exit(1)
