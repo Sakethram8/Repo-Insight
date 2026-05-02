@@ -8,7 +8,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from ingest import (
-    _file_to_module, generate_summary, extract_source_code,
+    _file_to_module, generate_summaries_batch, extract_source_code,
 )
 
 
@@ -29,35 +29,31 @@ class TestFileToModule:
         assert _file_to_module("pkg/__init__.py") == "pkg.__init__"
 
 
-class TestGenerateSummary:
-    def test_empty_code_returns_empty_string(self):
-        result = generate_summary("test_func", "")
-        assert result == ""
-
-    def test_whitespace_only_returns_empty_string(self):
-        result = generate_summary("test_func", "   \n  \t  ")
-        assert result == ""
+class TestGenerateSummariesBatch:
+    def test_empty_batch_returns_empty_dict(self):
+        result = generate_summaries_batch([])
+        assert result == {}
 
     @patch("ingest._get_summary_client")
     def test_successful_summary(self, mock_client_factory):
         mock_client = MagicMock()
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = "  This function adds two numbers.  "
+        mock_response.choices[0].message.content = '{"123": "This function adds two numbers."}'
         mock_client.chat.completions.create.return_value = mock_response
         mock_client_factory.return_value = mock_client
 
-        result = generate_summary("add", "def add(a, b): return a + b")
-        assert result == "This function adds two numbers."
+        result = generate_summaries_batch([("123", "def add(a, b): return a + b")])
+        assert result == {"123": "This function adds two numbers."}
 
     @patch("ingest._get_summary_client")
-    def test_llm_error_returns_empty_string(self, mock_client_factory):
+    def test_llm_error_returns_empty_dict(self, mock_client_factory):
         mock_client = MagicMock()
         mock_client.chat.completions.create.side_effect = Exception("LLM down")
         mock_client_factory.return_value = mock_client
 
-        result = generate_summary("broken", "def broken(): pass")
-        assert result == ""
+        result = generate_summaries_batch([("123", "def broken(): pass")])
+        assert result == {}
 
 
 class TestExtractSourceCode:

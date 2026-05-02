@@ -18,6 +18,8 @@ from config import (FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
                     BASELINE_SGLANG_BASE_URL, BASELINE_LLM_MODEL)
 from ingest import run_ingestion, get_connection
 from agent import run_repo_agent
+from sandbox import SandboxManager
+from apply_changes import apply_to_original
 from tools import get_macro_architecture, get_class_architecture
 
 # ---------------------------------------------------------------------------
@@ -111,6 +113,12 @@ if "last_subgraph_data" not in st.session_state:
     st.session_state.last_subgraph_data = None
 if "agent_mode" not in st.session_state:
     st.session_state.agent_mode = "c"
+if "sandbox_manager" not in st.session_state:
+    st.session_state.sandbox_manager = None
+if "sandbox_path" not in st.session_state:
+    st.session_state.sandbox_path = None
+if "original_path" not in st.session_state:
+    st.session_state.original_path = None
 if "active_tab" not in st.session_state:
     st.session_state.active_tab = "chat"
 
@@ -277,18 +285,30 @@ with st.sidebar:
     st.session_state.repo_path = repo_path
 
     if st.button("🚀 Load Codebase", use_container_width=True, type="primary"):
-        with st.spinner("Parsing AST, generating embeddings..."):
-            try:
-                report = run_ingestion(repo_path)
-                st.session_state.ingestion_report = report
-                st.session_state.graph_ready = True
-                st.success(
-                    f"✅ Graph ready: {report.get('functions', 0)} functions, "
-                    f"{report.get('classes', 0)} classes, "
-                    f"{report.get('call_edges', 0)} call edges"
-                )
-            except Exception as e:
-                st.error(f"Ingestion failed: {e}")
+        try:
+            manager = SandboxManager(repo_path)
+            progress_bar = st.progress(0, text="Creating sandbox...")
+            sandbox_path = manager.create()
+            st.session_state.sandbox_manager = manager
+            st.session_state.sandbox_path = sandbox_path
+            st.session_state.original_path = Path(repo_path).resolve()
+            progress_bar.progress(20, text="Parsing files...")
+            def _on_progress(stage, current, total, detail=""):
+                pct = 20 + int(current / max(total, 1) * 75)
+                progress_bar.progress(pct, text=f"{stage}... {detail[:50]}")
+            report = run_ingestion(str(sandbox_path), on_progress=_on_progress)
+            progress_bar.progress(100, text="✅ Graph ready")
+            st.session_state.ingestion_report = report
+            st.session_state.graph_ready = True
+            st.success(
+                f"✅ Sandbox [{manager.sandbox_id}]: "
+                f"{report.get('functions',0)} functions · "
+                f"{report.get('classes',0)} classes · "
+                f"{report.get('call_edges',0)} edges"
+            )
+            st.caption(f"📁 `{sandbox_path}`")
+        except Exception as e:
+            st.error(f"Ingestion failed: {e}")
 
     if st.session_state.ingestion_report:
         r = st.session_state.ingestion_report
@@ -361,7 +381,9 @@ with st.sidebar:
 # Main area — Tabs: Chat | Graph
 # ---------------------------------------------------------------------------
 
-tab_chat, tab_graph = st.tabs(["💬 Agent Chat", "🔗 Graph Explorer"])
+tab_chat, tab_graph, tab_bench = st.tabs([
+    "💬 Agent Chat", "🔗 Graph Explorer", "📊 Benchmark"
+])
 
 
 # ===========================
@@ -446,6 +468,14 @@ with tab_chat:
                         detail = f"apply={'✅' if data.get('apply_success') else '❌'} tests={'✅' if data.get('tests_passed') else '❌'}"
                     elif phase == "phase_5_test":
                         detail = f"attempt {data.get('attempt')}: {data.get('passed', 0)}P / {data.get('failed', 0)}F"
+                    elif phase == "self_correction":
+                        missing = data.get("missing_files", [])
+                        phase_status.write(
+                            f"🔄 **Self-Correction** — LLM missed "
+                            f"{len(missing)} file(s): "
+                            f"{', '.join(f'`{f}`' for f in missing[:3])}\n"
+                            f"Graph is recovering them now..."
+                        )
 
                     phase_log.append(f"✓ **{label}** — {detail}")
                     phase_status.update(label=f"⏳ {label}...")
@@ -453,7 +483,12 @@ with tab_chat:
 
                 try:
                     graph = get_db_graph()
-                    engine = GraphDrivenEngine(Path(repo_path).resolve(), graph)
+                    sandbox_path = st.session_state.sandbox_path
+                    original_path = st.session_state.original_path or Path(repo_path).resolve()
+                    engine = GraphDrivenEngine(
+                        original_path, graph,
+                        sandbox_path=sandbox_path if sandbox_path != original_path else None
+                    )
                     start = time.time()
                     result = engine.run(prompt, on_phase=_on_phase)
                     elapsed = time.time() - start
@@ -519,6 +554,55 @@ with tab_chat:
                     if result.subgraph and result.subgraph.blast_radius_nodes:
                         st.info("💡 Switch to the **Graph Explorer** tab to see the blast radius visualization.")
 
+                    if st.session_state.sandbox_manager:
+                        st.divider()
+                        with st.expander("🗂️ Sandbox Review", expanded=True):
+                            mgr = st.session_state.sandbox_manager
+                            changed = mgr.get_changed_files()
+                            if changed:
+                                st.markdown(f"**{len(changed)} file(s) modified in sandbox:**")
+                                for f in changed:
+                                    added = f.get('lines_added', 0)
+                                    removed = f.get('lines_removed', 0)
+                                    st.markdown(
+                                        f"✏️ `{f['path']}` "
+                                        f"<span style='color:#4ade80'>+{added}</span> "
+                                        f"<span style='color:#f87171'>-{removed}</span>",
+                                        unsafe_allow_html=True
+                                    )
+                            else:
+                                st.info("No file changes yet.")
+                            diff = mgr.get_diff()
+                            if diff:
+                                with st.expander("📄 Unified Diff", expanded=False):
+                                    st.code(diff[:6000], language="diff")
+                            st.divider()
+                            st.caption(
+                                f"💡 Run your own tests: `cd {st.session_state.sandbox_path} && pytest`"
+                            )
+                            ca, cd = st.columns(2)
+                            with ca:
+                                if st.button("✅ Apply to Real Repo", type="primary", use_container_width=True):
+                                    res = apply_to_original(
+                                        st.session_state.sandbox_path,
+                                        st.session_state.original_path,
+                                    )
+                                    if res.success:
+                                        st.success(f"Applied {len(res.files_applied)} file(s)")
+                                        for f in res.files_applied:
+                                            st.caption(f"  ✓ {f}")
+                                    else:
+                                        st.error(res.error or "Apply failed")
+                            with cd:
+                                if st.button("🗑️ Discard Sandbox", use_container_width=True):
+                                    mgr.discard()
+                                    st.session_state.sandbox_manager = None
+                                    st.session_state.sandbox_path = None
+                                    st.session_state.original_path = None
+                                    st.session_state.graph_ready = False
+                                    st.warning("Sandbox discarded.")
+                                    st.rerun()
+
                     if result.error:
                         st.warning(f"Pipeline error: {result.error}")
 
@@ -558,7 +642,12 @@ with tab_chat:
 
                     try:
                         graph = get_db_graph()
-                        engine = GraphDrivenEngine(Path(repo_path).resolve(), graph)
+                        sb_path = st.session_state.sandbox_path
+                        orig_path = st.session_state.original_path or Path(repo_path).resolve()
+                        engine = GraphDrivenEngine(
+                            orig_path, graph,
+                            sandbox_path=sb_path if sb_path != orig_path else None
+                        )
                         start_c = time.time()
                         result_c = engine.run(prompt, on_phase=_on_phase_fair)
                         elapsed_c = time.time() - start_c
@@ -810,4 +899,63 @@ with tab_graph:
             except Exception as e:
                 st.error(f"Error: {e}")
         else:
-            st.info("Enter a module name to explore its class architecture.")
+                    st.info("Enter a module name to explore its class architecture.")
+
+
+# ===========================
+# TAB 3: Benchmark
+# ===========================
+with tab_bench:
+    st.markdown("## 📊 Precision / Recall / F1 Benchmark")
+    st.caption(
+        "How precisely does the graph-guided agent identify the correct files vs. "
+        "a blind LLM? Uses the internal scoring harness against the loaded codebase."
+    )
+
+    if not st.session_state.graph_ready:
+        st.info("Load a codebase first to run the benchmark.")
+    else:
+        col_cfg, col_res = st.columns([1, 2])
+        with col_cfg:
+            n_cases = st.number_input("Test cases", min_value=1, max_value=20, value=4)
+            if st.button("▶ Run Scoring", type="primary", use_container_width=True):
+                with st.spinner("Running scoring harness..."):
+                    try:
+                        from scoring import run_scoring_suite
+                        from change_engine import GraphDrivenEngine
+                        GraphDrivenEngine  # keep import reference
+
+                        tasks = __import__("scoring", fromlist=["GROUND_TRUTH_TASKS"]).GROUND_TRUTH_TASKS[:n_cases]
+                        scores = run_scoring_suite(
+                            graph=get_db_graph(),
+                            repo_root=Path(st.session_state.sandbox_path or repo_path),
+                            modes=["c", "baseline"],
+                            tasks=tasks,
+                        )
+                        st.session_state.bench_scores = scores
+                    except Exception as e:
+                        st.error(f"Scoring failed: {e}")
+
+        with col_res:
+            if scores_data := st.session_state.get("bench_scores"):
+                avgs = scores_data.mode_averages
+                mode_c = avgs.get("Mode C", {})
+                mode_b = avgs.get("Mode BASELINE", {})
+
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Graph-RAG F1", f"{mode_c.get('avg_f1', 0)*100:.1f}%")
+                m2.metric("Baseline F1", f"{mode_b.get('avg_f1', 0)*100:.1f}%")
+                m3.metric("Improvement", f"+{(mode_c.get('avg_f1',0) - mode_b.get('avg_f1',0))*100:.1f}%")
+
+                metrics = ["Precision", "Recall", "F1"]
+                keys = ["avg_precision", "avg_recall", "avg_f1"]
+                graph_vals = [mode_c.get(k, 0)*100 for k in keys]
+                baseline_vals = [mode_b.get(k, 0)*100 for k in keys]
+
+                import pandas as pd
+                df = pd.DataFrame({
+                    "Metric": metrics,
+                    "Graph-RAG": graph_vals,
+                    "Blind Baseline": baseline_vals,
+                }).set_index("Metric")
+                st.bar_chart(df, y=["Graph-RAG", "Blind Baseline"], horizontal=True)

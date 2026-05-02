@@ -111,9 +111,9 @@ def get_blast_radius(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT_RA
     }
 
 
-def get_macro_architecture(graph: falkordb.Graph) -> dict:
+def get_macro_architecture(graph: falkordb.Graph, inherits_weight: int = 10, imports_weight: int = 5) -> dict:
     # Sums CALLS, INHERITS_FROM, and IMPORTS edges between modules to generate Thick Edges
-    query = """
+    query = f"""
     MATCH (f1:Function)-[c:CALLS]->(f2:Function)
     WHERE f1.module_name <> f2.module_name
     WITH f1.module_name AS src, f2.module_name AS tgt, count(c) AS weight
@@ -123,11 +123,11 @@ def get_macro_architecture(graph: falkordb.Graph) -> dict:
     MATCH (c1)-[:DEFINED_IN]->(m1:Module)
     MATCH (c2)-[:DEFINED_IN]->(m2:Module)
     WHERE m1.name <> m2.name
-    RETURN m1.name AS src, m2.name AS tgt, 10 AS weight, 'INHERITS_FROM' as type
+    RETURN m1.name AS src, m2.name AS tgt, {inherits_weight} AS weight, 'INHERITS_FROM' as type
     UNION ALL
     MATCH (m1:Module)-[i:IMPORTS]->(m2:Module)
     WHERE m1.name <> m2.name
-    RETURN m1.name AS src, m2.name AS tgt, 5 AS weight, 'IMPORTS' as type
+    RETURN m1.name AS src, m2.name AS tgt, {imports_weight} AS weight, 'IMPORTS' as type
     """
     result = graph.query(query)
     edges = {}
@@ -145,8 +145,8 @@ def get_macro_architecture(graph: falkordb.Graph) -> dict:
     return {"modules": list(edges.values())}
 
 
-def get_class_architecture(module_name: str, graph: falkordb.Graph) -> dict:
-    query = """
+def get_class_architecture(module_name: str, graph: falkordb.Graph, inherits_weight: int = 10) -> dict:
+    query = f"""
     MATCH (f1:Function)-[c:CALLS]->(f2:Function)
     WHERE f1.module_name = $module AND f1.class_name <> '' AND f2.class_name <> ''
     WITH f1.class_name AS src, f2.class_name AS tgt, count(c) AS weight
@@ -154,7 +154,7 @@ def get_class_architecture(module_name: str, graph: falkordb.Graph) -> dict:
     UNION ALL
     MATCH (c1:Class)-[i:INHERITS_FROM]->(c2:Class)
     MATCH (c1)-[:DEFINED_IN]->(m1:Module) WHERE m1.name = $module
-    RETURN c1.name AS src, c2.name AS tgt, 10 AS weight, 'INHERITS_FROM' as type
+    RETURN c1.name AS src, c2.name AS tgt, {inherits_weight} AS weight, 'INHERITS_FROM' as type
     """
     result = graph.query(query, {"module": module_name})
     edges = {}
@@ -203,6 +203,12 @@ def get_source_code(fqn: str, graph: falkordb.Graph) -> dict:
         except (OSError, UnicodeDecodeError):
             continue
 
+    if source == "<file not readable>":
+        return {
+            "found": False, "fqn": fqn, "file_path": file_path,
+            "error": "Could not read file from disk. Ensure repo_root is correct or path is accessible."
+        }
+
     return {
         "found": True, "fqn": fqn, "file_path": file_path,
         "start_line": start_line, "end_line": end_line, "source": source,
@@ -212,6 +218,11 @@ def get_source_code(fqn: str, graph: falkordb.Graph) -> dict:
 def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
     query_embedding = embed_text(query)
     now = time.time()
+
+    # Prune expired cache items
+    expired_keys = [k for k, v in _embedding_cache.items() if (now - v[1]) >= _EMBEDDING_CACHE_TTL]
+    for k in expired_keys:
+        del _embedding_cache[k]
 
     # Calculate in-degree to rank core utilities higher
     func_query = """

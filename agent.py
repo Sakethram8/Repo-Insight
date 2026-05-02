@@ -13,12 +13,15 @@ from typing import Callable, Optional
 import openai
 import falkordb
 from config import (SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
-                    AGENT_MAX_ITERATIONS, AGENT_TOOL_TIMEOUT_SECONDS)
+                    AGENT_MAX_ITERATIONS, AGENT_TOOL_TIMEOUT_SECONDS, TOOL_OUTPUT_MAX_LENGTH)
 from tools import (get_function_context, get_callers, get_callees,
                    get_impact_radius, get_blast_radius, get_source_code,
                    semantic_search, get_macro_architecture, get_class_architecture)
 
 logger = logging.getLogger(__name__)
+
+# Persistent thread pool for tool execution to avoid thread churn
+_TOOL_EXECUTOR = ThreadPoolExecutor(max_workers=5)
 
 
 TOOL_SCHEMAS = [
@@ -226,19 +229,23 @@ def _dispatch_tool(tool_name: str, tool_args: dict,
         else:
             return func(fqn=tool_args.get("fqn", ""), graph=graph)
 
-    # Use ThreadPoolExecutor for proper resource management (fixes thread leak)
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(_run)
-        try:
-            result = future.result(timeout=AGENT_TOOL_TIMEOUT_SECONDS)
-        except FuturesTimeoutError:
-            future.cancel()
-            raise TimeoutError(
-                f"Tool '{tool_name}' exceeded timeout of "
-                f"{AGENT_TOOL_TIMEOUT_SECONDS} seconds"
-            )
+    # Use the persistent thread pool to avoid thread churn
+    future = _TOOL_EXECUTOR.submit(_run)
+    try:
+        result = future.result(timeout=AGENT_TOOL_TIMEOUT_SECONDS)
+    except FuturesTimeoutError:
+        # Note: ThreadPoolExecutor doesn't actually kill the thread on cancel,
+        # but we return to the LLM quickly
+        future.cancel()
+        raise TimeoutError(
+            f"Tool '{tool_name}' exceeded timeout of "
+            f"{AGENT_TOOL_TIMEOUT_SECONDS} seconds"
+        )
 
-    return json.dumps(result)
+    output_str = json.dumps(result)
+    if len(output_str) > TOOL_OUTPUT_MAX_LENGTH:
+        return output_str[:TOOL_OUTPUT_MAX_LENGTH] + "... [Output truncated to save context window]"
+    return output_str
 
 
 def format_change_set_as_diff(answer: str, tool_calls_log: list[dict]) -> str:

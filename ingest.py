@@ -90,28 +90,36 @@ def create_indices(graph: falkordb.Graph) -> None:
             raise
 
 
-def generate_summary(name: str, code: str) -> str:
-    """Generate a 1-2 sentence AI summary for a function or class.
+import json
 
-    Returns an empty string on any error (errors are logged, not stored).
+def generate_summaries_batch(batch: list[tuple[str, str]]) -> dict[str, str]:
+    """Generate 1-2 sentence AI summaries for a batch of functions/classes.
+    batch: list of (id_string, code_string)
+    Returns: dict mapping id_string to summary
     """
-    if not code.strip():
-        return ""
+    if not batch:
+        return {}
     try:
         client = _get_summary_client()
-        prompt = (
-            f"Summarize what this Python function/class does in 1-2 sentences. "
-            f"Name: {name}\nCode:\n{code}"
-        )
+        prompt_parts = ["Summarize what each of these functions/classes does in 1-2 sentences. Return ONLY a valid JSON object mapping the ID to the summary string, like {\"id1\": \"summary1\"}.\n\n"]
+        for idx, code in batch:
+            prompt_parts.append(f"--- ID: {idx} ---\n{code[:1000]}\n")
+        
+        prompt = "".join(prompt_parts)
         response = client.chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
+            max_tokens=2000,
         )
-        return response.choices[0].message.content.strip()
+        content = response.choices[0].message.content.strip()
+        try:
+            return json.loads(content)
+        except json.JSONDecodeError:
+            content = content.replace("```json", "").replace("```", "").strip()
+            return json.loads(content)
     except Exception as e:
-        logger.error("Summary generation failed for '%s': %s", name, e)
-        return ""
+        logger.error("Batch summary generation failed: %s", e)
+        return {}
 
 
 def extract_source_code(file_path: Path, start_line: int, end_line: int) -> str:
@@ -131,6 +139,7 @@ def ingest_parsed_files(
     parsed_files: list[ParsedFile],
     graph: falkordb.Graph,
     repo_root: Path,
+    on_progress=None,
 ) -> None:
     """Write parsed AST entities into FalkorDB as nodes and edges."""
     file_modules: dict[str, str] = {}
@@ -173,6 +182,24 @@ def ingest_parsed_files(
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
     
     summaries: dict[int, str] = {}
+    BATCH_SIZE = 10
+    batches = []
+    current_batch = []
+    
+    for item in items_to_summarize:
+        idx = str(id(item[1]))
+        code = item[4]
+        if len(code.strip()) > 0:
+            current_batch.append((idx, code))
+            if len(current_batch) >= BATCH_SIZE:
+                batches.append(current_batch)
+                current_batch = []
+        else:
+            summaries[id(item[1])] = ""
+
+    if current_batch:
+        batches.append(current_batch)
+
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -180,19 +207,20 @@ def ingest_parsed_files(
         TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
         TimeElapsedColumn(),
     ) as progress:
-        task_id = progress.add_task("[cyan]Generating AI Node Summaries...", total=len(items_to_summarize))
+        task_id = progress.add_task("[cyan]Generating AI Node Summaries...", total=len(batches))
         with ThreadPoolExecutor(max_workers=INGEST_CONCURRENCY) as executor:
-            future_to_item = {
-                executor.submit(generate_summary, item[1].name, item[4]): item
-                for item in items_to_summarize
+            future_to_batch = {
+                executor.submit(generate_summaries_batch, batch): batch
+                for batch in batches
             }
-            for future in as_completed(future_to_item):
-                item = future_to_item[future]
-                try:
-                    summaries[id(item[1])] = future.result()
-                except Exception as e:
-                    logger.error("Summary thread failed for '%s': %s", item[1].name, e)
-                    summaries[id(item[1])] = ""
+            for future in as_completed(future_to_batch):
+                batch_result = future.result()
+                if batch_result:
+                    for idx_str, summary in batch_result.items():
+                        try:
+                            summaries[int(idx_str)] = summary
+                        except ValueError:
+                            pass
                 progress.advance(task_id)
 
     # Step 2: Upsert Class nodes
@@ -211,6 +239,9 @@ def ingest_parsed_files(
             "docstring": cls.docstring or "", "summary": summary,
         })
         
+    if on_progress:
+        on_progress("Embeddings", 2, 3, "Generating vectors...")
+
     if class_emb_texts:
         class_embeddings = embed_texts(class_emb_texts)
         for i, node in enumerate(class_nodes):
@@ -418,7 +449,7 @@ def ingest_parsed_files(
         )
 
 
-def run_ingestion(directory_path: str) -> dict:
+def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
     """Run full ingestion pipeline: parse, summarise, embed, and write to graph.
 
     Returns a summary dict with counts of all entities ingested.
@@ -454,11 +485,11 @@ def run_ingestion(directory_path: str) -> dict:
         parts = py_file.relative_to(dir_path).parts
         if any(part in SKIP_DIRS for part in parts):
             continue
-            
+
         rel_path = str(py_file.relative_to(dir_path))
         current_files.add(rel_path)
         mtime = py_file.stat().st_mtime
-        
+
         # Only parse if file changed or if FLUSH_GRAPH_ON_INGEST was True (which wipes existing_states)
         if rel_path not in existing_states or existing_states[rel_path] != mtime:
             files_to_parse.append((py_file, rel_path, mtime))
@@ -478,15 +509,32 @@ def run_ingestion(directory_path: str) -> dict:
             {"fps": files_to_delete},
         )
 
-    parsed_files: list[ParsedFile] = []
-    for py_file, rel_path, mtime in files_to_parse:
+    if on_progress:
+        on_progress("Scanning", 0, len(files_to_parse), f"{len(files_to_parse)} files found")
+
+    parsed_with_meta: list[tuple[ParsedFile, str, float]] = []
+    for i, (py_file, rel_path, mtime) in enumerate(files_to_parse):
+        if on_progress:
+            on_progress("Parsing", i + 1, len(files_to_parse), rel_path)
         try:
             parsed = parse_file(py_file, dir_path)
-            parsed_files.append(parsed)
-            graph.query("MERGE (s:FileState {file_path: $fp}) SET s.mtime = $mtime", {"fp": rel_path, "mtime": mtime})
+            parsed_with_meta.append((parsed, rel_path, mtime))
         except Exception as e:
             logger.warning("Failed to parse %s: %s", rel_path, e)
             continue
+
+    if on_progress:
+        on_progress("Ingesting", 1, 3, "Writing graph nodes...")
+
+    if parsed_with_meta:
+        try:
+            ingest_parsed_files([p for p, _, _ in parsed_with_meta], graph, dir_path, on_progress=on_progress)
+        except Exception as e:
+            logger.error("Ingest failed: %s", e)
+            raise
+
+        for _, rel_path, mtime in parsed_with_meta:
+            graph.query("MERGE (s:FileState {file_path: $fp}) SET s.mtime = $mtime", {"fp": rel_path, "mtime": mtime})
 
     if parsed_files:
         ingest_parsed_files(parsed_files, graph, dir_path)

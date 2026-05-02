@@ -26,3 +26,6 @@ FLUSH_GRAPH_ON_INGEST = os.getenv("FLUSH_GRAPH_ON_INGEST", "false").lower() in (
 
 INGEST_CONCURRENCY = int(os.getenv("INGEST_CONCURRENCY", "5"))   # Max LLM threads for Node Summarization
 
+SKIP_DIRS = ["__pycache__", ".git", ".venv", "venv", "node_modules", "dist", "build"]
+TEST_COMMAND = os.getenv("TEST_COMMAND", "pytest tests/ -v --tb=short -q -m 'not integration'")
+TOOL_OUTPUT_MAX_LENGTH = int(os.getenv("TOOL_OUTPUT_MAX_LENGTH", "2000"))

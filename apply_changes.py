@@ -163,6 +163,13 @@ def _find_and_replace(
     best_end = 0
     window = len(search_lines)
 
+    # To prevent CPU spikes on massive files, restrict fuzzy matching
+    if len(content_lines) > 3000 and window > 20:
+        raise ValueError(
+            f"Fuzzy matching disabled for massive files (lines: {len(content_lines)}, "
+            f"search window: {window}) to prevent CPU exhaustion."
+        )
+
     for i in range(len(content_lines) - window + 1):
         candidate = "\n".join(content_lines[i:i + window])
         ratio = difflib.SequenceMatcher(None, search_text, candidate).ratio()
@@ -193,9 +200,18 @@ def apply_edits(edit_blocks: list[EditBlock], target_dir: Path) -> ApplyResult:
         ApplyResult with per-file success/failure details.
     """
     result = ApplyResult(total_edits=len(edit_blocks))
+    target_dir = target_dir.resolve()
 
     for block in edit_blocks:
-        file_path = target_dir / block.file_path
+        file_path = (target_dir / block.file_path).resolve()
+        if not str(file_path).startswith(str(target_dir) + "/"):
+            result.file_results.append(FileApplyResult(
+                file_path=block.file_path, success=False,
+                error=f"Security: path escapes sandbox: {block.file_path}",
+            ))
+            result.failed_edits += 1
+            continue
+
         if not file_path.exists():
             result.file_results.append(FileApplyResult(
                 file_path=block.file_path,
@@ -248,16 +264,24 @@ def create_sandbox(repo_root: Path) -> Path:
     Returns the path to the sandbox directory.
     The caller is responsible for cleanup via `cleanup_sandbox()`.
     """
+    import os
+    from config import SKIP_DIRS
+
     sandbox_dir = Path(tempfile.mkdtemp(prefix="repo_insight_sandbox_"))
     target = sandbox_dir / "repo"
 
     # Copy repo, ignoring heavy/irrelevant directories
     ignore = shutil.ignore_patterns(
-        ".git", "__pycache__", "*.pyc", ".venv", "venv",
-        "node_modules", ".mypy_cache", ".pytest_cache",
-        "dist", "build", "*.egg-info",
+        *SKIP_DIRS, "*.pyc", ".mypy_cache", ".pytest_cache", "*.egg-info",
     )
-    shutil.copytree(repo_root, target, ignore=ignore)
+    
+    try:
+        # Attempt to use hardlinks for near-instantaneous sandbox creation
+        shutil.copytree(repo_root, target, ignore=ignore, copy_function=os.link, dirs_exist_ok=True)
+    except OSError:
+        # Fallback to standard copy if hardlinks fail (e.g., across filesystems)
+        shutil.copytree(repo_root, target, ignore=ignore, dirs_exist_ok=True)
+
     logger.info("Created sandbox at %s", target)
     return target
 
@@ -295,11 +319,9 @@ def run_tests(
         TestResult with pass/fail counts and output.
     """
     if test_command is None:
-        test_command = [
-            sys.executable, "-m", "pytest", "tests/", "-v",
-            "--tb=short", "-q",
-            "-m", "not integration",  # Skip integration tests in sandbox
-        ]
+        import shlex
+        from config import TEST_COMMAND
+        test_command = shlex.split(TEST_COMMAND)
 
     try:
         proc = subprocess.run(
@@ -353,3 +375,16 @@ def run_tests(
             stdout="",
             stderr=f"Failed to run tests: {e}",
         )
+
+
+def apply_to_original(sandbox_path: Path, original_path: Path):
+    """
+    Copy changed files from sandbox back to original repo.
+    Delegates to SandboxManager.apply_to_original().
+    Import is deferred to avoid circular imports.
+    """
+    from sandbox import SandboxManager
+    manager = SandboxManager(original_path)
+    manager.sandbox_path = sandbox_path
+    manager.sandbox_id = sandbox_path.name
+    return manager.apply_to_original()

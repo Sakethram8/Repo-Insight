@@ -44,7 +44,8 @@ _EXTENSION_MAP: dict[str, Language | None] = {
 
 SUPPORTED_EXTENSIONS = {ext for ext, lang in _EXTENSION_MAP.items() if lang is not None}
 
-SKIP_DIRS = {"__pycache__", ".git", ".venv", "node_modules", "dist", "build"}
+from config import SKIP_DIRS
+SKIP_DIRS = set(SKIP_DIRS)
 
 
 @dataclass

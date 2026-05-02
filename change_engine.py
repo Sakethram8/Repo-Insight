@@ -23,13 +23,14 @@ import falkordb
 
 from config import SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL
 from ingest import get_connection, run_ingestion, reingest_files
+from sandbox import SandboxManager
 from tools import (
     get_blast_radius, get_impact_radius, get_callers, get_callees,
     get_source_code, semantic_search,
 )
 from apply_changes import (
     EditBlock, ApplyResult, TestResult,
-    parse_edit_blocks, apply_edits, create_sandbox, cleanup_sandbox, run_tests,
+    parse_edit_blocks, apply_edits, run_tests,
 )
 
 logger = logging.getLogger(__name__)
@@ -181,8 +182,9 @@ Use the same FILE: ... <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE format."""
 class GraphDrivenEngine:
     """Orchestrates the 6-phase graph-driven coding pipeline."""
 
-    def __init__(self, repo_root: Path, graph: Optional[falkordb.Graph] = None):
-        self.repo_root = Path(repo_root).resolve()
+    def __init__(self, repo_root: Path, graph: Optional[falkordb.Graph] = None, sandbox_path: Path | None = None):
+        self.original_root = Path(repo_root).resolve()
+        self.repo_root = Path(sandbox_path).resolve() if sandbox_path is not None else self.original_root
         self.graph = graph
         self.client = openai.OpenAI(base_url=SGLANG_BASE_URL, api_key=SGLANG_API_KEY)
         self._on_phase: Optional[callable] = None  # callback for streaming
@@ -204,6 +206,12 @@ class GraphDrivenEngine:
         result = ChangeResult()
 
         try:
+            self._notify("sandbox_active", {
+                "sandboxed": self.repo_root != self.original_root,
+                "sandbox_path": str(self.repo_root),
+                "original_path": str(self.original_root),
+            })
+
             # Phase 0: Graph Construction
             t0 = time.time()
             result.ingestion_report = self._ensure_graph_fresh()
@@ -289,25 +297,8 @@ class GraphDrivenEngine:
 
     def _localize_seeds(self, prompt: str) -> list[str]:
         """Use LLM + graph semantic search to identify entry points."""
-        from tools import semantic_search
-        candidates = semantic_search(prompt, self.graph, top_k=10)
-
-        # Lexical Fallback: If the prompt explicitly mentions a file or function name,
-        # guarantee it is in the candidate list even if semantic search missed it!
-        try:
-            # Extract potential file names or function names from prompt (simple word split)
-            words = [w.strip("`'\".,") for w in prompt.split()]
-            for word in words:
-                if len(word) > 3 and ("/" in word or ".py" in word or word.islower()):
-                    res = self.graph.query(
-                        "MATCH (f:Function) WHERE f.file_path ENDS WITH $word OR f.name = $word RETURN 'Function', f.fqn, f.file_path",
-                        {"word": word}
-                    ).result_set
-                    for r in res:
-                        if not any(c["fqn"] == r[1] for c in candidates):
-                            candidates.append({"label": r[0], "fqn": r[1], "file_path": r[2], "score": 1.0})
-        except Exception as e:
-            logger.error("Lexical fallback failed: %s", e)
+        search_result = semantic_search(prompt, self.graph, top_k=10)
+        candidates = search_result.get("results", [])
 
         if not candidates:
             return []
@@ -453,11 +444,28 @@ class GraphDrivenEngine:
 
     def _force_coverage(self, prompt: str, plan: ChangePlan, subgraph: ChangeSubgraph) -> ChangePlan:
         """Force LLM to address files the graph says are affected but plan missed."""
-        missing_source = {}
-        for fqn, src in subgraph.source_code.items():
-            for mf in plan.missing_files:
-                if mf in str(fqn):
-                    missing_source[fqn] = src
+        if self._on_phase:
+            self._on_phase("self_correction", {
+                "missing_files": list(plan.missing_files),
+                "trigger": "LLM plan did not cover all blast-radius files",
+                "recovering": f"{len(plan.missing_files)} file(s) via graph lookup",
+            })
+
+        # Build a file_path → [fqn] map from graph node metadata
+        file_to_fqns: dict[str, list[str]] = {}
+        all_nodes = (subgraph.blast_radius_nodes + subgraph.caller_nodes
+                     + subgraph.impact_radius_nodes + subgraph.callee_nodes)
+        for node in all_nodes:
+            fp = node.get("file_path", "")
+            fqn = node.get("fqn") or node.get("name", "")
+            if fp and fqn:
+                file_to_fqns.setdefault(fp, []).append(fqn)
+
+        missing_source: dict[str, str] = {}
+        for mf in plan.missing_files:
+            for fqn in file_to_fqns.get(mf, []):
+                if fqn in subgraph.source_code:
+                    missing_source[fqn] = subgraph.source_code[fqn]
 
         missing_src_text = "\n\n".join(
             f"### {fqn}\n```python\n{src}\n```" for fqn, src in missing_source.items()
@@ -547,45 +555,38 @@ class GraphDrivenEngine:
         subgraph: ChangeSubgraph,
         max_retries: int = 2,
     ) -> tuple[Optional[ApplyResult], Optional[TestResult], Optional[dict]]:
-        """Apply edits in sandbox, run tests, retry on failure."""
-        sandbox = create_sandbox(self.repo_root)
+        """Apply edits directly to repo_root (already sandboxed), run tests, retry on failure."""
         current_edits = edits
 
-        try:
-            for attempt in range(1, max_retries + 1):
-                # Apply edits
-                apply_result = apply_edits(current_edits, sandbox)
-                if not apply_result.all_succeeded:
-                    logger.warning("Attempt %d: %d edits failed to apply", attempt, apply_result.failed_edits)
-                    if attempt == max_retries:
-                        return apply_result, None, None
+        for attempt in range(1, max_retries + 1):
+            # Apply edits
+            apply_result = apply_edits(current_edits, self.repo_root)
+            if not apply_result.all_succeeded:
+                logger.warning("Attempt %d: %d edits failed to apply", attempt, apply_result.failed_edits)
+                if attempt == max_retries:
+                    return apply_result, None, None
 
-                # Run tests
-                test_result = run_tests(sandbox)
-                self._notify("phase_5_test", {
-                    "attempt": attempt,
-                    "passed": test_result.passed,
-                    "failed": test_result.failed,
-                })
+            # Run tests
+            test_result = run_tests(self.repo_root)
+            self._notify("phase_5_test", {
+                "attempt": attempt,
+                "passed": test_result.passed,
+                "failed": test_result.failed,
+            })
 
-                if test_result.all_passed:
-                    # Success! Do post-edit graph re-analysis
-                    post_analysis = self._post_edit_graph_analysis(sandbox, subgraph)
-                    return apply_result, test_result, post_analysis
+            if test_result.all_passed:
+                # Success! Do post-edit graph re-analysis
+                post_analysis = self._post_edit_graph_analysis(self.repo_root, subgraph)
+                return apply_result, test_result, post_analysis
 
-                # Tests failed — retry with error feedback
-                if attempt < max_retries:
-                    logger.info("Tests failed, retrying (attempt %d/%d)", attempt, max_retries)
-                    # Re-create sandbox for clean retry
-                    cleanup_sandbox(sandbox)
-                    sandbox = create_sandbox(self.repo_root)
-                    current_edits = self._retry_edits(prompt, subgraph, test_result)
-                    if not current_edits:
-                        return apply_result, test_result, None
+            # Tests failed — retry with error feedback
+            if attempt < max_retries:
+                logger.info("Tests failed, retrying (attempt %d/%d)", attempt, max_retries)
+                current_edits = self._retry_edits(prompt, subgraph, test_result)
+                if not current_edits:
+                    return apply_result, test_result, None
 
-            return apply_result, test_result, None
-        finally:
-            cleanup_sandbox(sandbox)
+        return apply_result, test_result, None
 
     def _retry_edits(
         self, prompt: str, subgraph: ChangeSubgraph, test_result: TestResult,
