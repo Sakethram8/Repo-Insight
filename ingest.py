@@ -555,7 +555,7 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
         "modules": all_modules,
         "call_edges": all_calls,
         "import_edges": all_imports,
-        "files_parsed": len(parsed_files),
+        "files_parsed": len(parsed_with_meta),
     }
 
 
