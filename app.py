@@ -379,6 +379,12 @@ with st.sidebar:
         st.session_state.last_subgraph_data = None
         st.rerun()
 
+    st.divider()
+    if "graph_watcher" in st.session_state:
+        st.sidebar.success("● Live graph sync active")
+    else:
+        st.sidebar.info("○ No active repo — ingest to start live sync")
+
 
 # ---------------------------------------------------------------------------
 # Main area — Tabs: Chat | Graph
@@ -507,6 +513,14 @@ with tab_chat:
                     answer = result.answer or "(No answer generated)"
                     st.markdown(answer)
 
+                    if result.timings:
+                        st.subheader("⏱ Phase Timings")
+                        timing_rows = []
+                        for phase_key, secs in result.timings.items():
+                            label = phase_key.replace("phase_", "Phase ").replace("_", " ").title()
+                            timing_rows.append({"Phase": label, "Time": f"{secs:.2f}s"})
+                        st.table(timing_rows)
+
                     # Build assistant message with metadata
                     msg_data = {
                         "role": "assistant",
@@ -552,6 +566,25 @@ with tab_chat:
                     if result.timings:
                         with st.expander("⏱️ Timing"):
                             st.json(result.timings)
+
+                    # Graph Diff
+                    if result.post_edit_analysis and result.post_edit_analysis.get("status") == "analyzed":
+                        with st.expander("🔀 Graph Diff — What changed in the dependency graph"):
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.metric("New Call Edges", result.post_edit_analysis.get("new_edge_count", 0))
+                                new_edges = result.post_edit_analysis.get("new_call_edges", [])
+                                if new_edges:
+                                    st.caption("New dependencies introduced:")
+                                    for caller, callee in new_edges[:20]:
+                                        st.code(f"{caller}  →  {callee}", language=None)
+                            with col2:
+                                st.metric("Removed Call Edges", result.post_edit_analysis.get("removed_edge_count", 0))
+                                removed_edges = result.post_edit_analysis.get("removed_call_edges", [])
+                                if removed_edges:
+                                    st.caption("Dependencies removed:")
+                                    for caller, callee in removed_edges[:20]:
+                                        st.code(f"{caller}  →  {callee}", language=None)
 
                     # Nudge to graph tab
                     if result.subgraph and result.subgraph.blast_radius_nodes:

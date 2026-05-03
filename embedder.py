@@ -68,13 +68,10 @@ def cosine_similarity(a: list[float], b: list[float]) -> float:
     if len(a) == 0:
         raise ValueError("Vectors must not be zero-length")
 
-    vec_a = np.array(a)
-    vec_b = np.array(b)
-    
-    norm_a = np.linalg.norm(vec_a)
-    norm_b = np.linalg.norm(vec_b)
-
-    if norm_a == 0.0 or norm_b == 0.0:
+    vec_a = np.array(a,  dtype=np.float32)
+    vec_b = np.array(b,  dtype=np.float32)
+    denom =np.linalg.norm(vec_a)*np.linalg.norm(vec_b)
+    if denom >0:
+        return float(np.dot(vec_a, vec_b) / denom )
+    else:
         return 0.0
-
-    return float(np.dot(vec_a, vec_b) / (norm_a * norm_b))

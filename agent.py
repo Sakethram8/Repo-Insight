@@ -15,7 +15,7 @@ import falkordb
 from config import (SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
                     AGENT_MAX_ITERATIONS, AGENT_TOOL_TIMEOUT_SECONDS, TOOL_OUTPUT_MAX_LENGTH)
 from tools import (get_function_context, get_callers, get_callees,
-                   get_impact_radius, get_blast_radius, get_source_code,
+                   get_downstream_deps, get_upstream_callers, get_source_code,
                    semantic_search, get_macro_architecture, get_class_architecture)
 
 logger = logging.getLogger(__name__)
@@ -70,7 +70,7 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "get_impact_radius",
+            "name": "get_downstream_deps",
             "description": "Find all functions transitively called BY the function (downstream). Shows what this function touches.",
             "parameters": {
                 "type": "object",
@@ -84,7 +84,7 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "get_blast_radius",
+            "name": "get_upstream_callers",
             "description": "Find all functions that transitively CALL the function (upstream). Shows what breaks if this function changes.",
             "parameters": {
                 "type": "object",
@@ -158,8 +158,8 @@ You must strictly follow a TWO-PHASE execution loop to PREVENT CASCADE ERRORS:
 
 PHASE 1: THE ARCHITECT (Mapping)
 1. Do NOT call get_source_code in this phase.
-2. Use semantic_search, get_function_context, get_blast_radius, get_macro_architecture, and get_callers to build a mental map of the codebase.
-3. CRITICAL: You MUST execute `get_blast_radius` on any core function you plan to modify to see what upstream components will break.
+2. Use semantic_search, get_function_context, get_upstream_callers, get_macro_architecture, and get_callers to build a mental map of the codebase.
+3. CRITICAL: You MUST execute `get_upstream_callers` on any core function you plan to modify to see what upstream components will break.
 4. Output a brief Dependency Map to yourself before proceeding.
 
 PHASE 2: THE SURGEON (Execution)
@@ -179,8 +179,8 @@ _KNOWN_TOOLS = {
     "get_function_context",
     "get_callers",
     "get_callees",
-    "get_impact_radius",
-    "get_blast_radius",
+    "get_downstream_deps",
+    "get_upstream_callers",
     "get_source_code",
     "semantic_search",
     "get_macro_architecture",
@@ -249,42 +249,66 @@ def _dispatch_tool(tool_name: str, tool_args: dict,
 
 
 def format_change_set_as_diff(answer: str, tool_calls_log: list[dict]) -> str:
-    """Convert an agent's change-set answer into a unified diff-like format.
+    """Produce a real unified diff from the agent's answer and retrieved source code."""
+    import difflib
+    from apply_changes import parse_edit_blocks
 
-    Parses the structured answer and any source code retrieved via tools
-    to produce a diff that could be reviewed or applied.
-    """
-    diff_lines = ["# Repo-Insight Change Set (Unified Diff Format)", ""]
+    diff_sections = []
 
-    # Collect all source code that was retrieved during the session
-    source_files: dict[str, str] = {}
+    # Build a map of file_path -> original source lines from get_source_code tool calls
+    source_by_file: dict[str, list[str]] = {}
     for entry in tool_calls_log:
         if entry["tool"] == "get_source_code":
-            result = entry["result"]
-            if isinstance(result, dict) and result.get("found"):
-                fp = result.get("file_path", "unknown")
-                source_files[fp] = result.get("source", "")
+            r = entry["result"]
+            if isinstance(r, dict) and r.get("found") and r.get("source"):
+                fp = r.get("file_path", "")
+                if fp:
+                    source_by_file[fp] = r["source"].splitlines(keepends=True)
 
-    if source_files:
-        diff_lines.append("## Files Analysed by Graph Queries")
-        diff_lines.append("")
-        for fp, source in sorted(source_files.items()):
-            diff_lines.append(f"--- a/{fp}")
-            diff_lines.append(f"+++ b/{fp}")
-            diff_lines.append("@@ (graph-identified change region) @@")
-            for line in source.splitlines():
-                diff_lines.append(f" {line}")
-            diff_lines.append("")
+    # Parse SEARCH/REPLACE blocks from the answer
+    edits = parse_edit_blocks(answer)
 
-    diff_lines.append("## Agent Proposed Changes")
-    diff_lines.append("")
-    diff_lines.append(answer)
+    for edit in edits:
+        fp = edit.file_path
+        original = source_by_file.get(fp)
+        if not original:
+            continue
+        original_text = "".join(original)
+        new_text = original_text.replace(edit.search_text, edit.replace_text, 1)
+        new_lines = new_text.splitlines(keepends=True)
+        diff = list(difflib.unified_diff(
+            original, new_lines,
+            fromfile=f"a/{fp}",
+            tofile=f"b/{fp}",
+            lineterm="",
+        ))
+        if diff:
+            diff_sections.append("\n".join(diff))
 
-    return "\n".join(diff_lines)
+    if diff_sections:
+        return "\n".join(diff_sections)
+
+    # Fallback: return answer as-is if no source was retrieved
+    return f"## Proposed Changes\n\n{answer}"
 
 
 # Type alias for the streaming callback
 ToolCallCallback = Optional[Callable[[dict], None]]
+
+
+def _trim_messages(messages: list[dict], max_chars: int = 40_000) -> list[dict]:
+    """Keep system prompt pinned. Trim oldest non-system messages when total exceeds max_chars."""
+    system = [m for m in messages if m.get("role") == "system"]
+    rest = [m for m in messages if m.get("role") != "system"]
+    total = sum(len(str(m)) for m in system)
+    kept = []
+    for m in reversed(rest):
+        size = len(str(m))
+        if total + size > max_chars:
+            break
+        kept.insert(0, m)
+        total += size
+    return system + kept
 
 
 def run_repo_agent(
@@ -340,6 +364,7 @@ def run_repo_agent(
 
     while iteration < AGENT_MAX_ITERATIONS:
         iteration += 1
+        messages = _trim_messages(messages)
 
         # 3.1: Wrap LLM call in try/except for robustness
         try:
@@ -402,18 +427,33 @@ def run_repo_agent(
             ],
         })
 
-        # Dispatch each tool call
+        # Dispatch all tool calls concurrently via the persistent thread pool.
+        # Parse args and submit futures first, keyed by tool_call_id.
+        tc_meta: dict[str, tuple] = {}  # tool_call_id -> (tool_name, tool_args)
+        futures: dict[str, "Future[str]"] = {}  # tool_call_id -> future
+
         for tc in assistant_message.tool_calls:
             tool_name = tc.function.name
             try:
                 tool_args = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
                 tool_args = {}
+            tc_meta[tc.id] = (tool_name, tool_args)
+            futures[tc.id] = _TOOL_EXECUTOR.submit(
+                _dispatch_tool, tool_name, tool_args, graph
+            )
 
+        # Collect results in original order to preserve message history ordering.
+        for tc in assistant_message.tool_calls:
+            tool_name, tool_args = tc_meta[tc.id]
             try:
-                result_str = _dispatch_tool(tool_name, tool_args, graph)
+                result_str = futures[tc.id].result(timeout=AGENT_TOOL_TIMEOUT_SECONDS)
                 result_parsed = json.loads(result_str)
-            except (ValueError, TimeoutError) as e:
+            except (FuturesTimeoutError, TimeoutError) as e:
+                logger.warning("Tool '%s' timed out: %s", tool_name, e)
+                result_str = json.dumps({"error": str(e)})
+                result_parsed = {"error": str(e)}
+            except ValueError as e:
                 logger.warning("Tool '%s' failed: %s", tool_name, e)
                 result_str = json.dumps({"error": str(e)})
                 result_parsed = {"error": str(e)}

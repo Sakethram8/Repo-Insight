@@ -31,10 +31,17 @@ class GraphWatcher(FileSystemEventHandler):
             self._debounce_timers[abs_path].cancel()
         
         def do_reingest():
-            rel = str(Path(abs_path).relative_to(self.repo_root))
-            from ingest import reingest_files
-            reingest_files([rel], self.graph, self.repo_root)
-            del self._debounce_timers[abs_path]
+            try:
+                rel = str(Path(abs_path).relative_to(self.repo_root))
+                from ingest import reingest_files
+                reingest_files([rel], self.graph, self.repo_root)
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).warning(
+                    "Live re-ingest failed for %s: %s", abs_path, e
+                )
+            finally:
+                self._debounce_timers.pop(abs_path, None)
         
         timer = threading.Timer(0.8, do_reingest)
         timer.daemon = True

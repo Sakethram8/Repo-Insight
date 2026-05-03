@@ -57,6 +57,9 @@ class FunctionDef:
     docstring: Optional[str]
     is_method: bool         # True if defined inside a class body
     class_name: Optional[str]  # Populated when is_method=True
+    params: list[str] = field(default_factory=list)
+    decorators: list[str] = field(default_factory=list)
+    return_annotation: Optional[str] = None
 
 
 @dataclass
@@ -82,6 +85,7 @@ class CallEdge:
     callee_name: str        # Raw name as it appears at the call site
     file_path: str
     line: int
+    column: int = 0
 
 
 @dataclass
@@ -246,6 +250,28 @@ def _extract_import_module(node) -> list[tuple[str, Optional[str]]]:
     return results
 
 
+def _resolve_relative_import(module: str, source_file_path: str) -> str:
+    """Convert a relative import string to an absolute dotted module path.
+
+    Examples:
+        _resolve_relative_import(".utils", "mypackage/parser.py") -> "mypackage.utils"
+        _resolve_relative_import(".", "mypackage/sub/file.py")    -> "mypackage.sub"
+        _resolve_relative_import("os", "mypackage/file.py")       -> "os"  (unchanged)
+    """
+    if not module.startswith("."):
+        return module
+    level = len(module) - len(module.lstrip("."))
+    rel_part = module.lstrip(".")
+    # Convert file path to package parts
+    parts = source_file_path.replace("\\", "/").replace(".py", "").split("/")
+    # Go up `level` directories from the file's package
+    base_parts = parts[:-level] if level <= len(parts) else []
+    base = ".".join(p for p in base_parts if p and p != ".")
+    if rel_part:
+        return f"{base}.{rel_part}" if base else rel_part
+    return base if base else "."
+
+
 def _walk_tree(node, result: ParsedFile, source_bytes: bytes, rel_path: str) -> None:
     """Recursively walk the AST and extract entities."""
 
@@ -275,6 +301,34 @@ def _walk_tree(node, result: ParsedFile, source_bytes: bytes, rel_path: str) -> 
             func_name = name_node.text.decode("utf-8")
             docstring = _extract_docstring(node)
             enclosing_class = _find_enclosing_class(node)
+
+            # Extract parameters
+            params = []
+            params_node = node.child_by_field_name("parameters")
+            if params_node:
+                for child in params_node.children:
+                    if child.type == "identifier":
+                        params.append(child.text.decode("utf-8"))
+                    elif child.type in ("typed_parameter", "default_parameter"):
+                        pname = child.child_by_field_name("name")
+                        if pname is None and child.children:
+                            pname = child.children[0]
+                        if pname:
+                            params.append(pname.text.decode("utf-8"))
+
+            # Extract decorators
+            decorators = []
+            sibling = node.prev_sibling
+            while sibling and sibling.type == "decorator":
+                decorators.append(sibling.text.decode("utf-8").lstrip("@").strip())
+                sibling = sibling.prev_sibling
+
+            # Extract return annotation
+            return_annotation = None
+            return_type_node = node.child_by_field_name("return_type")
+            if return_type_node:
+                return_annotation = return_type_node.text.decode("utf-8").lstrip("->").strip()
+
             result.functions.append(FunctionDef(
                 name=func_name,
                 file_path=rel_path,
@@ -283,11 +337,15 @@ def _walk_tree(node, result: ParsedFile, source_bytes: bytes, rel_path: str) -> 
                 docstring=docstring,
                 is_method=enclosing_class is not None,
                 class_name=enclosing_class,
+                params=params,
+                decorators=decorators,
+                return_annotation=return_annotation,
             ))
 
     elif node.type in ("import_statement", "import_from_statement"):
         imports = _extract_import_module(node)
         for module, alias in imports:
+            module = _resolve_relative_import(module, rel_path)
             result.imports.append(ImportRef(
                 file_path=rel_path,
                 module=module,
@@ -303,6 +361,7 @@ def _walk_tree(node, result: ParsedFile, source_bytes: bytes, rel_path: str) -> 
                 callee_name=callee_name,
                 file_path=rel_path,
                 line=node.start_point[0] + 1,
+                column=node.start_point[1],
             ))
 
     # Recurse into children
@@ -396,6 +455,7 @@ def _walk_js_tree(node, result: ParsedFile, source_bytes: bytes, rel_path: str,
         source_node = node.child_by_field_name("source")
         if source_node:
             module = source_node.text.decode("utf-8").strip("'\"")
+            module = _resolve_relative_import(module, rel_path)
             result.imports.append(ImportRef(
                 file_path=rel_path,
                 module=module,
@@ -425,6 +485,7 @@ def _walk_js_tree(node, result: ParsedFile, source_bytes: bytes, rel_path: str,
                     callee_name=callee_name,
                     file_path=rel_path,
                     line=node.start_point[0] + 1,
+                    column=node.start_point[1],
                 ))
 
     # Recurse into children (skip if we already recursed for class body)

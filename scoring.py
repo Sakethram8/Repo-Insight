@@ -1,8 +1,8 @@
 # scoring.py
 """
 Quantitative scoring harness for Repo-Insight.
-Measures file-level precision, recall, and F1 for Mode A (blind LLM),
-Mode B (tool-calling agent), and Mode C (graph-driven engine).
+Measures file-level precision, recall, and F1 for
+Mode B (tool-calling agent) and Mode C (graph-driven engine).
 """
 
 import json
@@ -127,30 +127,6 @@ def score_single(
     return precision, recall, f1, hallucinated
 
 
-def run_mode_a_for_scoring(prompt: str, client: openai.OpenAI, model: str = None) -> tuple[str, float]:
-    """Run a blind LLM (no tools) and return the answer + time."""
-    if model is None:
-        model = LLM_MODEL
-    start = time.time()
-    try:
-        response = client.chat.completions.create(
-            model=model,
-            messages=[
-                {"role": "system", "content": (
-                    "You are a helpful coding assistant. When asked to make code changes, "
-                    "list every file that needs modification and describe what changes to make. "
-                    "Be thorough — missing a file means the change will break things."
-                )},
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=2000,
-        )
-        answer = response.choices[0].message.content.strip()
-    except Exception as e:
-        answer = f"Error: {e}"
-    elapsed = time.time() - start
-    return answer, elapsed
-
 
 def run_scoring_suite(
     graph: falkordb.Graph,
@@ -163,16 +139,13 @@ def run_scoring_suite(
     Args:
         graph: FalkorDB graph connection.
         repo_root: Path to the repository.
-        modes: List of modes to test. Default: ["a", "b", "c"].
+        modes: List of modes to test. Default: ["b", "c"].
         tasks: Override tasks. Default: GROUND_TRUTH_TASKS.
     """
     if modes is None:
         modes = ["b", "c"]
     if tasks is None:
         tasks = GROUND_TRUTH_TASKS
-
-    # Create clients — primary (for Repo-Insight modes) and baseline (for blind comparison)
-    
 
     # Collect all known files in the repo
     all_repo_files: set[str] = set()

@@ -25,7 +25,7 @@ from config import SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL
 from ingest import get_connection, run_ingestion, reingest_files
 from sandbox import SandboxManager
 from tools import (
-    get_blast_radius, get_impact_radius, get_callers, get_callees,
+    get_upstream_callers, get_downstream_deps, get_callers, get_callees,
     get_source_code, semantic_search,
 )
 from apply_changes import (
@@ -286,9 +286,45 @@ class GraphDrivenEngine:
     # ------------------------------------------------------------------
 
     def _ensure_graph_fresh(self) -> dict:
-        """Build or incrementally refresh the code knowledge graph."""
+        """Build or refresh the code graph. Skips ingestion if no files have changed."""
+        from config import SKIP_DIRS
+
+        # Compute fingerprint from all .py file mtimes
+        current_mtimes = {}
+        for f in sorted(self.repo_root.rglob("*.py")):
+            parts = f.relative_to(self.repo_root).parts
+            if not any(p in SKIP_DIRS for p in parts):
+                rel = str(f.relative_to(self.repo_root))
+                current_mtimes[rel] = f.stat().st_mtime
+
+        fingerprint = str(hash(frozenset(current_mtimes.items())))
+
+        # Check stored fingerprint in graph Meta node
+        stored = None
+        if self.graph is not None:
+            try:
+                res = self.graph.query(
+                    "MATCH (m:Meta {key: 'repo_fingerprint'}) RETURN m.value LIMIT 1"
+                ).result_set
+                stored = res[0][0] if res else None
+            except Exception:
+                pass
+
+        if stored == fingerprint:
+            return {"skipped": True, "reason": "no file changes detected", "fingerprint": fingerprint}
+
+        # Run ingestion and store new fingerprint
         report = run_ingestion(str(self.repo_root))
         self.graph = get_connection()
+
+        try:
+            self.graph.query(
+                "MERGE (m:Meta {key: 'repo_fingerprint'}) SET m.value = $v",
+                {"v": fingerprint}
+            )
+        except Exception as e:
+            logger.warning("Could not store repo fingerprint: %s", e)
+
         return report
 
     # ------------------------------------------------------------------
@@ -341,7 +377,7 @@ class GraphDrivenEngine:
 
         for seed in seeds:
             # Blast radius (upstream — what breaks)
-            blast = get_blast_radius(seed, self.graph)
+            blast = get_upstream_callers(seed, self.graph)
             for node in blast.get("affected", []):
                 fqn = node.get("fqn", "")
                 if fqn and fqn not in seen_fqns:
@@ -351,7 +387,7 @@ class GraphDrivenEngine:
                         subgraph.all_affected_files.add(node["file_path"])
 
             # Impact radius (downstream)
-            impact = get_impact_radius(seed, self.graph)
+            impact = get_downstream_deps(seed, self.graph)
             for node in impact.get("impacted", []):
                 fqn = node.get("fqn", "")
                 if fqn and fqn not in seen_fqns:
@@ -432,14 +468,25 @@ class GraphDrivenEngine:
             plan.justifications[fp] = item.get("reason", "")
             plan.actions[fp] = item.get("action", "modify")
 
-        # VALIDATION GATE: check for missing files
-        plan.missing_files = plan.blast_radius_files - plan.planned_files
-
-        if plan.missing_files:
-            logger.info("Validation gate: %d missing files, forcing coverage", len(plan.missing_files))
+        # VALIDATION GATE: retry loop up to MAX_VALIDATION_ROUNDS
+        MAX_VALIDATION_ROUNDS = 3
+        for round_num in range(MAX_VALIDATION_ROUNDS):
+            plan.missing_files = plan.blast_radius_files - plan.planned_files
+            if not plan.missing_files:
+                break
+            logger.info(
+                "Validation round %d: %d files still missing, forcing coverage",
+                round_num + 1, len(plan.missing_files)
+            )
             plan = self._force_coverage(prompt, plan, subgraph)
 
+        plan.missing_files = plan.blast_radius_files - plan.planned_files
         plan.is_validated = len(plan.missing_files) == 0
+        if not plan.is_validated:
+            logger.warning(
+                "Validation did not converge after %d rounds. Missing: %s",
+                MAX_VALIDATION_ROUNDS, plan.missing_files
+            )
         return plan
 
     def _force_coverage(self, prompt: str, plan: ChangePlan, subgraph: ChangeSubgraph) -> ChangePlan:
@@ -558,6 +605,16 @@ class GraphDrivenEngine:
         """Apply edits directly to repo_root (already sandboxed), run tests, retry on failure."""
         current_edits = edits
 
+        # Snapshot current call edges before any edits
+        pre_edit_calls = set()
+        try:
+            rows = self.graph.query(
+                "MATCH (a:Function)-[:CALLS]->(b:Function) RETURN a.fqn, b.fqn"
+            ).result_set
+            pre_edit_calls = {(r[0], r[1]) for r in rows}
+        except Exception:
+            pass
+
         for attempt in range(1, max_retries + 1):
             # Apply edits
             apply_result = apply_edits(current_edits, self.repo_root)
@@ -576,7 +633,7 @@ class GraphDrivenEngine:
 
             if test_result.all_passed:
                 # Success! Do post-edit graph re-analysis
-                post_analysis = self._post_edit_graph_analysis(self.repo_root, subgraph)
+                post_analysis = self._post_edit_graph_analysis(self.repo_root, subgraph, pre_edit_calls)
                 return apply_result, test_result, post_analysis
 
             # Tests failed — retry with error feedback
@@ -613,25 +670,37 @@ class GraphDrivenEngine:
             return []
 
     def _post_edit_graph_analysis(
-        self, sandbox: Path, subgraph: ChangeSubgraph,
+        self, sandbox: Path, subgraph: ChangeSubgraph, pre_edit_calls: set,
     ) -> dict:
-        """Re-parse changed files and check for new dependencies."""
+        """Re-parse changed files and diff call edges against pre-edit snapshot."""
         try:
             from parser import parse_file
-            new_calls = set()
             for fp in subgraph.all_affected_files:
                 full_path = sandbox / fp
                 if full_path.exists() and full_path.suffix == ".py":
                     try:
-                        parsed = parse_file(full_path, sandbox)
-                        for call in parsed.calls:
-                            new_calls.add((call.caller_name, call.callee_name))
+                        parse_file(full_path, sandbox)
                     except Exception:
                         pass
 
+            post_edit_calls = set()
+            try:
+                rows = self.graph.query(
+                    "MATCH (a:Function)-[:CALLS]->(b:Function) RETURN a.fqn, b.fqn"
+                ).result_set
+                post_edit_calls = {(r[0], r[1]) for r in rows}
+            except Exception:
+                pass
+
+            new_edges = post_edit_calls - pre_edit_calls
+            removed_edges = pre_edit_calls - post_edit_calls
+
             return {
                 "files_analyzed": len(subgraph.all_affected_files),
-                "new_call_edges_detected": len(new_calls),
+                "new_call_edges": list(new_edges),
+                "removed_call_edges": list(removed_edges),
+                "new_edge_count": len(new_edges),
+                "removed_edge_count": len(removed_edges),
                 "status": "analyzed",
             }
         except Exception as e:

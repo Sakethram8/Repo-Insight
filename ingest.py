@@ -181,13 +181,13 @@ def ingest_parsed_files(
 
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
     
-    summaries: dict[int, str] = {}
+    summaries: dict[str, str] = {}
     BATCH_SIZE = 10
     batches = []
     current_batch = []
     
     for item in items_to_summarize:
-        idx = str(id(item[1]))
+        idx = f"{item[2]}::{item[1].name}::{item[1].start_line}"
         code = item[4]
         if len(code.strip()) > 0:
             current_batch.append((idx, code))
@@ -195,7 +195,7 @@ def ingest_parsed_files(
                 batches.append(current_batch)
                 current_batch = []
         else:
-            summaries[id(item[1])] = ""
+            summaries[idx] = ""
 
     if current_batch:
         batches.append(current_batch)
@@ -217,10 +217,7 @@ def ingest_parsed_files(
                 batch_result = future.result()
                 if batch_result:
                     for idx_str, summary in batch_result.items():
-                        try:
-                            summaries[int(idx_str)] = summary
-                        except ValueError:
-                            pass
+                        summaries[idx_str] = summary
                 progress.advance(task_id)
 
     # Step 2: Upsert Class nodes
@@ -229,7 +226,7 @@ def ingest_parsed_files(
     for item in items_to_summarize:
         if item[0] != "class": continue
         cls, file_path, mod_name, code = item[1], item[2], item[3], item[4]
-        summary = summaries.get(id(cls), "")
+        summary = summaries.get(f"{file_path}::{cls.name}::{cls.start_line}", "")
         emb_text = build_embedding_text(cls.name, cls.docstring, file_path)
         class_emb_texts.append(emb_text)
         fqn = f"{mod_name}.{cls.name}"
@@ -267,7 +264,7 @@ def ingest_parsed_files(
     for item in items_to_summarize:
         if item[0] != "function": continue
         func, file_path, mod_name, code = item[1], item[2], item[3], item[4]
-        summary = summaries.get(id(func), "")
+        summary = summaries.get(f"{file_path}::{func.name}::{func.start_line}", "")
         emb_text = build_embedding_text(func.name, func.docstring, file_path)
         func_emb_texts.append(emb_text)
         fqn = f"{mod_name}.{func.class_name}.{func.name}" if func.is_method else f"{mod_name}.{func.name}"
@@ -277,6 +274,9 @@ def ingest_parsed_files(
             "docstring": func.docstring or "", "is_method": func.is_method,
             "class_name": func.class_name or "", "module_name": mod_name,
             "summary": summary,
+            "params": json.dumps(func.params),
+            "decorators": json.dumps(func.decorators),
+            "return_annotation": func.return_annotation or "",
         })
         
     if func_emb_texts:
@@ -297,7 +297,10 @@ def ingest_parsed_files(
                    f.class_name = n.class_name,
                    f.module_name = n.module_name,
                    f.summary = n.summary,
-                   f.embedding = n.embedding""",
+                   f.embedding = n.embedding,
+                   f.params = n.params,
+                   f.decorators = n.decorators,
+                   f.return_annotation = n.return_annotation""",
             {"nodes": func_nodes},
         )
 
@@ -608,7 +611,7 @@ def resolve_calls_with_jedi(
 
         try:
             # Jedi goto resolves to the definition
-            defs = script.goto(line=call.line, column=0)
+            defs = script.goto(line=call.line, column=call.column)
             if defs:
                 target = defs[0]
                 if target.full_name:

@@ -8,16 +8,14 @@ import json
 import logging
 import math
 import time
+from functools import lru_cache
 from pathlib import Path
+import numpy as np
 from config import IMPACT_RADIUS_MAX_DEPTH, IMPACT_RADIUS_WARN_THRESHOLD
 import falkordb
-from embedder import embed_text, cosine_similarity
+from embedder import embed_text
 
 logger = logging.getLogger(__name__)
-
-# Cache for deserialized embeddings: {fqn: (embedding_list, timestamp)}
-_embedding_cache: dict[str, tuple[list[float], float]] = {}
-_EMBEDDING_CACHE_TTL = 300  # seconds
 
 
 def get_function_context(fqn: str, graph: falkordb.Graph) -> dict:
@@ -73,7 +71,7 @@ def get_callees(fqn: str, graph: falkordb.Graph) -> dict:
     return {"target_fqn": fqn, "callee_count": len(callees), "callees": callees}
 
 
-def get_impact_radius(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT_RADIUS_MAX_DEPTH) -> dict:
+def get_downstream_deps(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT_RADIUS_MAX_DEPTH) -> dict:
     max_depth = int(max_depth)
     cypher = (
         f"MATCH p = (src:Function {{fqn: $fqn}})-[:CALLS*1..{max_depth}]->(impacted:Function) "
@@ -92,7 +90,7 @@ def get_impact_radius(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT_R
     }
 
 
-def get_blast_radius(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT_RADIUS_MAX_DEPTH) -> dict:
+def get_upstream_callers(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT_RADIUS_MAX_DEPTH) -> dict:
     max_depth = int(max_depth)
     cypher = (
         f"MATCH p = (affected:Function)-[:CALLS*1..{max_depth}]->(target:Function {{fqn: $fqn}}) "
@@ -214,15 +212,15 @@ def get_source_code(fqn: str, graph: falkordb.Graph) -> dict:
         "start_line": start_line, "end_line": end_line, "source": source,
     }
 
+@lru_cache(maxsize=5000)
+def _get_cached_embedding(fqn: str, embedding_json: str) -> tuple[float, ...]:
+    """Deserialize and cache a node embedding. Returns tuple for lru_cache hashability."""
+    import json as _json
+    return tuple(_json.loads(embedding_json))
+
 
 def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
     query_embedding = embed_text(query)
-    now = time.time()
-
-    # Prune expired cache items
-    expired_keys = [k for k, v in _embedding_cache.items() if (now - v[1]) >= _EMBEDDING_CACHE_TTL]
-    for k in expired_keys:
-        del _embedding_cache[k]
 
     # Calculate in-degree to rank core utilities higher
     func_query = """
@@ -240,29 +238,37 @@ def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
     class_results = graph.query(class_query)
 
     all_rows = list(func_results.result_set) + list(class_results.result_set)
-    scored = []
+
+    # Filter rows with valid embeddings and deserialize via lru_cache
+    valid_rows = []
     for row in all_rows:
         label, fqn, file_path, summary, embedding_str, in_degree = row
         if not embedding_str:
             continue
+        try:
+            emb = list(_get_cached_embedding(fqn, embedding_str))
+            valid_rows.append((row, emb))
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Failed to parse embedding for %s", fqn)
+            continue
 
-        # Use cached deserialized embedding if available and fresh
-        cached = _embedding_cache.get(fqn)
-        if cached and (now - cached[1]) < _EMBEDDING_CACHE_TTL:
-            node_embedding = cached[0]
-        else:
-            try:
-                node_embedding = json.loads(embedding_str)
-                _embedding_cache[fqn] = (node_embedding, now)
-            except (json.JSONDecodeError, TypeError):
-                logger.warning("Failed to parse embedding for %s", fqn)
-                continue
+    if not valid_rows:
+        return {"query": query, "results": []}
 
-        base_score = cosine_similarity(query_embedding, node_embedding)
-        # Combine cosine_similarity with log(in_degree)
+    # Vectorized cosine similarity via NumPy
+    matrix = np.array([emb for _, emb in valid_rows], dtype=np.float32)
+    q_vec = np.array(query_embedding, dtype=np.float32)
+    norms = np.linalg.norm(matrix, axis=1)
+    q_norm = np.linalg.norm(q_vec)
+    scores = (matrix @ q_vec) / (norms * q_norm + 1e-8)
+
+    # Apply in-degree re-ranking bonus
+    scored = []
+    for i, (row, _emb) in enumerate(valid_rows):
+        label, fqn, file_path, summary, _embedding_str, in_degree = row
+        base_score = float(scores[i])
         weight = 0.05
         final_score = base_score + (math.log(in_degree + 1) * weight)
-
         scored.append({
             "label": label, "fqn": fqn, "file_path": file_path,
             "summary": summary, "in_degree": in_degree, "score": round(final_score, 4),
