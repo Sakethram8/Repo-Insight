@@ -498,18 +498,26 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
 
     files_to_parse: list[tuple[Path, str, float]] = []
     current_files: set[str] = set()
-    for py_file in sorted(dir_path.rglob("*.py")):
-        parts = py_file.relative_to(dir_path).parts
+    # Supported languages. Architecture is language-agnostic (tree-sitter);
+    # expand this set as precision resolvers are added per language.
+    INGEST_EXTENSIONS = {".py"}
+    
+    all_source_files = sorted(
+        f for ext in INGEST_EXTENSIONS
+        for f in dir_path.rglob(f"*{ext}")
+    )
+    for source_file in all_source_files:
+        parts = source_file.relative_to(dir_path).parts
         if any(part in SKIP_DIRS for part in parts):
             continue
 
-        rel_path = str(py_file.relative_to(dir_path))
+        rel_path = str(source_file.relative_to(dir_path))
         current_files.add(rel_path)
-        mtime = py_file.stat().st_mtime
+        mtime = source_file.stat().st_mtime
 
         # Only parse if file changed or if FLUSH_GRAPH_ON_INGEST was True (which wipes existing_states)
         if rel_path not in existing_states or existing_states[rel_path] != mtime:
-            files_to_parse.append((py_file, rel_path, mtime))
+            files_to_parse.append((source_file, rel_path, mtime))
 
     deleted_files = set(existing_states.keys()) - current_files
     changed_files = [f[1] for f in files_to_parse]
@@ -688,6 +696,20 @@ def reingest_files(
 
     if parsed_files:
         ingest_parsed_files(parsed_files, graph, repo_root)
+
+        # Update FileState mtime so the watcher knows this file is fresh
+        import time as _time
+        for pf in parsed_files:
+            abs_path = repo_root / pf.file_path
+            try:
+                mtime = abs_path.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            graph.query(
+                """MERGE (fs:FileState {path: $path})
+                   SET fs.mtime = $mtime, fs.last_ingested = $ts""",
+                {"path": pf.file_path, "mtime": mtime, "ts": _time.time()},
+            )
 
     return {
         "files_reingested": len(parsed_files),

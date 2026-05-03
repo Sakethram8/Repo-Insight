@@ -21,7 +21,7 @@ from typing import Any, Optional
 import openai
 import falkordb
 
-from config import SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL
+from config import SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL, BLAST_RADIUS_MAX_DEPTH, IMPACT_RADIUS_MAX_DEPTH
 from ingest import get_connection, run_ingestion, reingest_files
 from sandbox import SandboxManager
 from tools import (
@@ -380,7 +380,7 @@ class GraphDrivenEngine:
             fqn_depths[seed] = 0
             
             # Blast radius (upstream — what breaks)
-            blast = get_upstream_callers(seed, self.graph)
+            blast = get_upstream_callers(seed, self.graph, max_depth=BLAST_RADIUS_MAX_DEPTH)
             for node in blast.get("affected", []):
                 fqn = node.get("fqn", "")
                 if fqn:
@@ -393,7 +393,7 @@ class GraphDrivenEngine:
                             subgraph.all_affected_files.add(node["file_path"])
 
             # Impact radius (downstream)
-            impact = get_downstream_deps(seed, self.graph)
+            impact = get_downstream_deps(seed, self.graph, max_depth=IMPACT_RADIUS_MAX_DEPTH)
             for node in impact.get("impacted", []):
                 fqn = node.get("fqn", "")
                 if fqn:
@@ -425,7 +425,7 @@ class GraphDrivenEngine:
                         seen_fqns.add(fqn)
 
             # Add seed's own file
-            ctx = get_source_code(seed, self.graph)
+            ctx = get_source_code(seed, self.graph, repo_root_override=str(self.repo_root))
             if ctx.get("found"):
                 subgraph.source_code[seed] = ctx.get("source", "")
                 if ctx.get("file_path"):
@@ -435,7 +435,7 @@ class GraphDrivenEngine:
         for fqn in list(seen_fqns):
             if fqn not in subgraph.source_code:
                 if fqn_depths.get(fqn, 0) <= 2:
-                    src = get_source_code(fqn, self.graph)
+                    src = get_source_code(fqn, self.graph, repo_root_override=str(self.repo_root))
                     if src.get("found"):
                         subgraph.source_code[fqn] = src.get("source", "")
 
@@ -598,9 +598,33 @@ class GraphDrivenEngine:
                         source_code_section=self._format_source_section(subgraph),
                     ),
                 }],
-                max_tokens=4000,
+                max_tokens=8192,
             )
             answer = response.choices[0].message.content.strip()
+            
+            # If response was cut off, request continuation
+            if response.choices[0].finish_reason == "length":
+                logger.warning("Edit generation truncated — requesting continuation")
+                try:
+                    continuation = self.client.chat.completions.create(
+                        model=LLM_MODEL,
+                        messages=[
+                            {"role": "user", "content": EDIT_PROMPT.format(
+                                prompt=prompt,
+                                plan=plan_text,
+                                source_code_section=self._format_source_section(subgraph),
+                            )},
+                            {"role": "assistant", "content": answer},
+                            {"role": "user", "content": 
+                             "Continue the SEARCH/REPLACE blocks from exactly "
+                             "where you left off. Do not repeat blocks already written."},
+                        ],
+                        max_tokens=4096,
+                    )
+                    answer += "\n" + continuation.choices[0].message.content.strip()
+                except Exception as cont_err:
+                    logger.warning("Continuation request failed: %s", cont_err)
+
             edits = parse_edit_blocks(answer)
             return edits, answer
         except Exception as e:

@@ -16,16 +16,16 @@ LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3-8B")          # Override via env 
 
 # Baseline model for "fair fight" A/B comparison
 # This is the STRONGER model that runs WITHOUT the graph — proving structure > scale
-# BASELINE_SGLANG_BASE_URL = os.getenv("BASELINE_SGLANG_BASE_URL", "http://localhost:30001/v1")
-# BASELINE_LLM_MODEL = os.getenv("BASELINE_LLM_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
+
 
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")   # Sentence-transformer model; runs locally
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))                # Output dimension for all-MiniLM-L6-v2
 
-IMPACT_RADIUS_MAX_DEPTH = int(os.getenv("IMPACT_RADIUS_MAX_DEPTH", "2"))
+IMPACT_RADIUS_MAX_DEPTH = int(os.getenv("IMPACT_RADIUS_MAX_DEPTH", "3"))
+BLAST_RADIUS_MAX_DEPTH = int(os.getenv("BLAST_RADIUS_MAX_DEPTH", "4"))
 IMPACT_RADIUS_WARN_THRESHOLD = int(os.getenv("IMPACT_RADIUS_WARN_THRESHOLD", "5"))
 AGENT_MAX_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", "10"))
-AGENT_TOOL_TIMEOUT_SECONDS = int(os.getenv("AGENT_TOOL_TIMEOUT_SECONDS", "5"))
+AGENT_TOOL_TIMEOUT_SECONDS = int(os.getenv("AGENT_TOOL_TIMEOUT_SECONDS", "30"))
 
 FLUSH_GRAPH_ON_INGEST = os.getenv("FLUSH_GRAPH_ON_INGEST", "false").lower() in ("true", "1", "yes")
 
@@ -33,4 +33,4 @@ INGEST_CONCURRENCY = int(os.getenv("INGEST_CONCURRENCY", "5"))   # Max LLM threa
 
 SKIP_DIRS = ["__pycache__", ".git", ".venv", "venv", "node_modules", "dist", "build"]
 TEST_COMMAND = os.getenv("TEST_COMMAND", "pytest tests/ -v --tb=short -q -m 'not integration'")
-TOOL_OUTPUT_MAX_LENGTH = int(os.getenv("TOOL_OUTPUT_MAX_LENGTH", "2000"))
+TOOL_OUTPUT_MAX_LENGTH = int(os.getenv("TOOL_OUTPUT_MAX_LENGTH", "8000"))

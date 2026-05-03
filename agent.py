@@ -117,7 +117,12 @@ TOOL_SCHEMAS = [
             "parameters": {
                 "type": "object",
                 "properties": {
-                    "query": {"type": "string", "description": "Natural language description of what to find."}
+                    "query": {"type": "string", "description": "Natural language description of what to find."},
+                    "top_k": {
+                        "type": "integer", 
+                        "description": "Number of results to return (default: 5, max: 20).",
+                        "default": 5
+                    }
                 },
                 "required": ["query"]
             }
@@ -234,7 +239,8 @@ def _dispatch_tool(tool_name: str, tool_args: dict,
 
     def _run():
         if tool_name == "semantic_search":
-            return func(query=tool_args.get("query", ""), graph=graph)
+            top_k = min(int(tool_args.get("top_k", 5)), 20)
+            return func(query=tool_args.get("query", ""), graph=graph, top_k=top_k)
         elif tool_name == "get_macro_architecture":
             return func(graph=graph)
         elif tool_name == "get_class_architecture":
@@ -257,7 +263,24 @@ def _dispatch_tool(tool_name: str, tool_args: dict,
 
     output_str = json.dumps(result)
     if len(output_str) > TOOL_OUTPUT_MAX_LENGTH:
-        return output_str[:TOOL_OUTPUT_MAX_LENGTH] + "... [Output truncated to save context window]"
+        try:
+            result_obj = json.loads(output_str)
+            # Truncate list fields to preserve JSON validity
+            if isinstance(result_obj, dict):
+                for key in ("results", "affected", "impacted", "callers", 
+                            "callees", "modules", "class_edges"):
+                    if key in result_obj and isinstance(result_obj[key], list):
+                        original_len = len(result_obj[key])
+                        # Keep as many items as fit
+                        while len(json.dumps(result_obj)) > TOOL_OUTPUT_MAX_LENGTH and result_obj[key]:
+                            result_obj[key].pop()
+                        result_obj["_truncated"] = True
+                        result_obj["_original_count"] = original_len
+                        result_obj["_shown_count"] = len(result_obj[key])
+            return json.dumps(result_obj)
+        except (json.JSONDecodeError, Exception):
+            # Fallback: return as-is if we can't parse it
+            return output_str[:TOOL_OUTPUT_MAX_LENGTH] + "\"}"
     return output_str
 
 
@@ -288,6 +311,30 @@ def format_change_set_as_diff(answer: str, tool_calls_log: list[dict]) -> str:
             continue
         original_text = "".join(original)
         new_text = original_text.replace(edit.search_text, edit.replace_text, 1)
+        
+        # If no exact match, try normalized fallback
+        if new_text == original_text:
+            search_lines = edit.search_text.splitlines()
+            norm_search = [line.rstrip() for line in search_lines]
+            norm_orig = [line.rstrip() for line in original]
+            
+            search_len = len(norm_search)
+            orig_len = len(norm_orig)
+            match_start = -1
+            
+            for i in range(orig_len - search_len + 1):
+                if norm_orig[i:i+search_len] == norm_search:
+                    match_start = i
+                    break
+            
+            if match_start != -1:
+                # Substitute exactly at the original line positions
+                matched_orig_text = "".join(original[match_start:match_start+search_len])
+                new_text = original_text.replace(matched_orig_text, edit.replace_text, 1)
+            else:
+                logger.warning("format_change_set_as_diff: no match for edit in %s", fp)
+                continue
+                
         new_lines = new_text.splitlines(keepends=True)
         diff = list(difflib.unified_diff(
             original, new_lines,
@@ -309,15 +356,18 @@ def format_change_set_as_diff(answer: str, tool_calls_log: list[dict]) -> str:
 ToolCallCallback = Optional[Callable[[dict], None]]
 
 
-def _trim_messages(messages: list[dict], max_chars: int = 40_000) -> list[dict]:
-    """Keep system prompt pinned. Trim oldest non-system messages when total exceeds max_chars."""
+def _trim_messages(messages: list[dict], max_chars: int = 25_000) -> list[dict]:
+    """Keep system prompt pinned. Trim oldest non-system messages when total exceeds max_chars.
+    Always preserves at least the last 4 non-system messages so the agent
+    never loses its most recent tool results entirely."""
+    MIN_KEEP = 4
     system = [m for m in messages if m.get("role") == "system"]
     rest = [m for m in messages if m.get("role") != "system"]
     total = sum(len(str(m)) for m in system)
     kept = []
     for m in reversed(rest):
         size = len(str(m))
-        if total + size > max_chars:
+        if total + size > max_chars and len(kept) >= MIN_KEEP:
             break
         kept.insert(0, m)
         total += size
@@ -375,6 +425,10 @@ def run_repo_agent(
     iteration = 0
     hit_max = False
     iteration_architect_calls = 0
+
+    # Dedup identical tool calls to break LLM stuck-in-loop behaviour
+    seen_calls: dict[str, int] = {}  # "tool_name:args_hash" -> call_count
+    MAX_IDENTICAL_CALLS = 2
 
     while iteration < AGENT_MAX_ITERATIONS:
         iteration += 1
@@ -446,6 +500,14 @@ def run_repo_agent(
         tc_meta: dict[str, tuple] = {}  # tool_call_id -> (tool_name, tool_args)
         futures: dict[str, "Future[str]"] = {}  # tool_call_id -> future
 
+        # Pre-scan the batch to count architect tools BEFORE submitting any
+        # futures. This prevents a race where get_source_code in the same
+        # batch slips past the gate because the counter hasn't been bumped yet.
+        batch_architect_count = sum(
+            1 for tc in assistant_message.tool_calls
+            if tc.function.name in _ARCHITECT_TOOLS
+        )
+
         for tc in assistant_message.tool_calls:
             tool_name = tc.function.name
             try:
@@ -453,12 +515,35 @@ def run_repo_agent(
             except json.JSONDecodeError:
                 tool_args = {}
             tc_meta[tc.id] = (tool_name, tool_args)
-            futures[tc.id] = _TOOL_EXECUTOR.submit(
-                _dispatch_tool, tool_name, tool_args, graph, iteration_architect_calls
+
+            # Dedup: block identical tool calls after MAX_IDENTICAL_CALLS
+            call_key = f"{tool_name}:{hash(json.dumps(tool_args, sort_keys=True))}"
+            if seen_calls.get(call_key, 0) >= MAX_IDENTICAL_CALLS:
+                futures[tc.id] = _TOOL_EXECUTOR.submit(
+                    lambda: json.dumps({
+                        "blocked": True,
+                        "reason": f"Identical call to {tool_name} with same arguments was "
+                                  f"already made {MAX_IDENTICAL_CALLS} times. "
+                                  f"Try different arguments or proceed to next phase."
+                    })
+                )
+                continue
+            seen_calls[call_key] = seen_calls.get(call_key, 0) + 1
+
+            # For source-code tools, pass the effective count including
+            # architect tools queued in THIS batch so the gate sees the
+            # full picture. For all other tools, pass the running total.
+            effective_count = (
+                iteration_architect_calls + batch_architect_count
+                if tool_name in _SOURCE_CODE_TOOLS
+                else iteration_architect_calls
             )
-            
-            if tool_name in _ARCHITECT_TOOLS:
-                iteration_architect_calls += 1
+            futures[tc.id] = _TOOL_EXECUTOR.submit(
+                _dispatch_tool, tool_name, tool_args, graph, effective_count
+            )
+
+        # Increment the running counter AFTER the entire batch is submitted.
+        iteration_architect_calls += batch_architect_count
 
         # Collect results in original order to preserve message history ordering.
         for tc in assistant_message.tool_calls:

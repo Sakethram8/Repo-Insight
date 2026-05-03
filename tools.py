@@ -172,9 +172,10 @@ def get_class_architecture(module_name: str, graph: falkordb.Graph, inherits_wei
     return {"module": module_name, "class_edges": list(edges.values())}
 
 
-def get_source_code(fqn: str, graph: falkordb.Graph) -> dict:
+def get_source_code(fqn: str, graph: falkordb.Graph,
+                    repo_root_override: str | None = None) -> dict:
     result = graph.query(
-        "MATCH (n) WHERE n.fqn = $fqn RETURN n.file_path, n.start_line, n.end_line LIMIT 1",
+        "MATCH (n:Function|Class) WHERE n.fqn = $fqn RETURN n.file_path, n.start_line, n.end_line LIMIT 1",
         {"fqn": fqn},
     )
     if len(result.result_set) == 0:
@@ -183,15 +184,18 @@ def get_source_code(fqn: str, graph: falkordb.Graph) -> dict:
     row = result.result_set[0]
     file_path, start_line, end_line = row[0], row[1], row[2]
 
-    meta_result = graph.query("MATCH (m:Meta {key: 'repo_root'}) RETURN m.value LIMIT 1")
-    repo_root = meta_result.result_set[0][0] if meta_result.result_set else None
-
     source = "<file not readable>"
     candidates = []
-    if repo_root:
-        candidates.append(Path(repo_root) / file_path)
-    candidates.append(Path(file_path))
-    candidates.append(Path(".") / file_path)
+
+    if repo_root_override:
+        candidates.append(Path(repo_root_override) / file_path)
+    else:
+        meta_result = graph.query("MATCH (m:Meta {key: 'repo_root'}) RETURN m.value LIMIT 1")
+        repo_root = meta_result.result_set[0][0] if meta_result.result_set else None
+        if repo_root:
+            candidates.append(Path(repo_root) / file_path)
+        candidates.append(Path(file_path))
+        candidates.append(Path(".") / file_path)
 
     for candidate in candidates:
         try:
@@ -250,7 +254,7 @@ def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
     valid_rows = []
     for row in all_rows:
         label, fqn, file_path, summary, embedding_str, in_degree = row
-        if not embedding_str:
+        if not embedding_str or not fqn:
             continue
         try:
             emb = list(_get_cached_embedding(fqn, embedding_str))
