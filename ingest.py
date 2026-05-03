@@ -706,7 +706,7 @@ def reingest_files(
             except OSError:
                 mtime = 0.0
             graph.query(
-                """MERGE (fs:FileState {path: $path})
+                """MERGE (fs:FileState {file_path: $path})
                    SET fs.mtime = $mtime, fs.last_ingested = $ts""",
                 {"path": pf.file_path, "mtime": mtime, "ts": _time.time()},
             )

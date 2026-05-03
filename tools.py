@@ -11,7 +11,7 @@ import time
 from functools import lru_cache
 from pathlib import Path
 import numpy as np
-from config import IMPACT_RADIUS_MAX_DEPTH, IMPACT_RADIUS_WARN_THRESHOLD
+from config import IMPACT_RADIUS_MAX_DEPTH, BLAST_RADIUS_MAX_DEPTH, IMPACT_RADIUS_WARN_THRESHOLD
 import falkordb
 from embedder import embed_text
 
@@ -90,7 +90,7 @@ def get_downstream_deps(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT
     }
 
 
-def get_upstream_callers(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT_RADIUS_MAX_DEPTH) -> dict:
+def get_upstream_callers(fqn: str, graph: falkordb.Graph, max_depth: int = BLAST_RADIUS_MAX_DEPTH) -> dict:
     max_depth = int(max_depth)
     cypher = (
         f"MATCH p = (affected:Function)-[:CALLS*1..{max_depth}]->(target:Function {{fqn: $fqn}}) "
