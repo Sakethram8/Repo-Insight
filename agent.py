@@ -187,6 +187,12 @@ _KNOWN_TOOLS = {
     "get_class_architecture",
 }
 
+_SOURCE_CODE_TOOLS = {"get_source_code"}
+_ARCHITECT_TOOLS = {"semantic_search", "get_function_context", 
+                    "get_upstream_callers", "get_downstream_deps",
+                    "get_callers", "get_callees", 
+                    "get_macro_architecture", "get_class_architecture"}
+
 
 def _get_tool_func(tool_name: str):
     """
@@ -200,7 +206,8 @@ def _get_tool_func(tool_name: str):
 
 
 def _dispatch_tool(tool_name: str, tool_args: dict,
-                   graph: falkordb.Graph) -> str:
+                   graph: falkordb.Graph,
+                   iteration_architect_calls: int = 0) -> str:
     """
     Route a tool call from the LLM to the correct tools.py function.
     Returns the result serialised as a JSON string.
@@ -216,6 +223,12 @@ def _dispatch_tool(tool_name: str, tool_args: dict,
             f"Unknown tool: '{tool_name}'. "
             f"Known tools: {sorted(_KNOWN_TOOLS)}"
         )
+
+    if tool_name == "get_source_code" and iteration_architect_calls < 2:
+        return json.dumps({
+            "blocked": True,
+            "reason": "get_source_code blocked — complete structural mapping first. Use semantic_search and get_upstream_callers before requesting source code."
+        })
 
     func = _get_tool_func(tool_name)
 
@@ -361,6 +374,7 @@ def run_repo_agent(
     tool_calls_log: list[dict] = []
     iteration = 0
     hit_max = False
+    iteration_architect_calls = 0
 
     while iteration < AGENT_MAX_ITERATIONS:
         iteration += 1
@@ -440,8 +454,11 @@ def run_repo_agent(
                 tool_args = {}
             tc_meta[tc.id] = (tool_name, tool_args)
             futures[tc.id] = _TOOL_EXECUTOR.submit(
-                _dispatch_tool, tool_name, tool_args, graph
+                _dispatch_tool, tool_name, tool_args, graph, iteration_architect_calls
             )
+            
+            if tool_name in _ARCHITECT_TOOLS:
+                iteration_architect_calls += 1
 
         # Collect results in original order to preserve message history ordering.
         for tc in assistant_message.tool_calls:

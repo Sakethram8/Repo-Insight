@@ -374,40 +374,55 @@ class GraphDrivenEngine:
         """Deterministically expand seeds into a full change subgraph."""
         subgraph = ChangeSubgraph(seed_nodes=seeds)
         seen_fqns: set[str] = set()
+        fqn_depths: dict[str, int] = {}
 
         for seed in seeds:
+            fqn_depths[seed] = 0
+            
             # Blast radius (upstream — what breaks)
             blast = get_upstream_callers(seed, self.graph)
             for node in blast.get("affected", []):
                 fqn = node.get("fqn", "")
-                if fqn and fqn not in seen_fqns:
-                    subgraph.blast_radius_nodes.append(node)
-                    seen_fqns.add(fqn)
-                    if node.get("file_path"):
-                        subgraph.all_affected_files.add(node["file_path"])
+                if fqn:
+                    depth = node.get("depth", node.get("distance", 0))
+                    fqn_depths[fqn] = min(fqn_depths.get(fqn, depth), depth)
+                    if fqn not in seen_fqns:
+                        subgraph.blast_radius_nodes.append(node)
+                        seen_fqns.add(fqn)
+                        if node.get("file_path"):
+                            subgraph.all_affected_files.add(node["file_path"])
 
             # Impact radius (downstream)
             impact = get_downstream_deps(seed, self.graph)
             for node in impact.get("impacted", []):
                 fqn = node.get("fqn", "")
-                if fqn and fqn not in seen_fqns:
-                    subgraph.impact_radius_nodes.append(node)
-                    seen_fqns.add(fqn)
-                    if node.get("file_path"):
-                        subgraph.all_affected_files.add(node["file_path"])
+                if fqn:
+                    depth = node.get("depth", node.get("distance", 0))
+                    fqn_depths[fqn] = min(fqn_depths.get(fqn, depth), depth)
+                    if fqn not in seen_fqns:
+                        subgraph.impact_radius_nodes.append(node)
+                        seen_fqns.add(fqn)
+                        if node.get("file_path"):
+                            subgraph.all_affected_files.add(node["file_path"])
 
             # Direct callers/callees
             callers = get_callers(seed, self.graph)
             for c in callers.get("callers", []):
-                if c.get("fqn") not in seen_fqns:
-                    subgraph.caller_nodes.append(c)
-                    seen_fqns.add(c.get("fqn", ""))
+                fqn = c.get("fqn", "")
+                if fqn:
+                    fqn_depths[fqn] = min(fqn_depths.get(fqn, 1), 1)
+                    if fqn not in seen_fqns:
+                        subgraph.caller_nodes.append(c)
+                        seen_fqns.add(fqn)
 
             callees = get_callees(seed, self.graph)
             for c in callees.get("callees", []):
-                if c.get("fqn") not in seen_fqns:
-                    subgraph.callee_nodes.append(c)
-                    seen_fqns.add(c.get("fqn", ""))
+                fqn = c.get("fqn", "")
+                if fqn:
+                    fqn_depths[fqn] = min(fqn_depths.get(fqn, 1), 1)
+                    if fqn not in seen_fqns:
+                        subgraph.callee_nodes.append(c)
+                        seen_fqns.add(fqn)
 
             # Add seed's own file
             ctx = get_source_code(seed, self.graph)
@@ -419,9 +434,10 @@ class GraphDrivenEngine:
         # Fetch source code for all affected nodes
         for fqn in list(seen_fqns):
             if fqn not in subgraph.source_code:
-                src = get_source_code(fqn, self.graph)
-                if src.get("found"):
-                    subgraph.source_code[fqn] = src.get("source", "")
+                if fqn_depths.get(fqn, 0) <= 2:
+                    src = get_source_code(fqn, self.graph)
+                    if src.get("found"):
+                        subgraph.source_code[fqn] = src.get("source", "")
 
         return subgraph
 
@@ -672,39 +688,40 @@ class GraphDrivenEngine:
     def _post_edit_graph_analysis(
         self, sandbox: Path, subgraph: ChangeSubgraph, pre_edit_calls: set,
     ) -> dict:
-        """Re-parse changed files and diff call edges against pre-edit snapshot."""
-        try:
-            from parser import parse_file
-            for fp in subgraph.all_affected_files:
-                full_path = sandbox / fp
-                if full_path.exists() and full_path.suffix == ".py":
-                    try:
-                        parse_file(full_path, sandbox)
-                    except Exception:
-                        pass
+        """Re-ingest changed files into the graph and diff call edges."""
+        from ingest import reingest_files
 
+        changed_rel_paths = list(subgraph.all_affected_files)
+
+        try:
+            # Step 1: Actually write parsed changes back to FalkorDB
+            reingest_report = reingest_files(changed_rel_paths, self.graph, sandbox)
+            logger.info("Post-edit re-ingestion: %s", reingest_report)
+        except Exception as e:
+            logger.error("Post-edit reingest failed: %s", e)
+            return {"status": "failed", "error": str(e)}
+
+        try:
+            # Step 2: Now query for new/removed edges (graph is fresh)
             post_edit_calls = set()
-            try:
-                rows = self.graph.query(
-                    "MATCH (a:Function)-[:CALLS]->(b:Function) RETURN a.fqn, b.fqn"
-                ).result_set
-                post_edit_calls = {(r[0], r[1]) for r in rows}
-            except Exception:
-                pass
+            rows = self.graph.query(
+                "MATCH (a:Function)-[:CALLS]->(b:Function) RETURN a.fqn, b.fqn"
+            ).result_set
+            post_edit_calls = {(r[0], r[1]) for r in rows}
 
             new_edges = post_edit_calls - pre_edit_calls
             removed_edges = pre_edit_calls - post_edit_calls
 
             return {
-                "files_analyzed": len(subgraph.all_affected_files),
-                "new_call_edges": list(new_edges),
-                "removed_call_edges": list(removed_edges),
+                "files_reingested": reingest_report.get("files_reingested", 0),
+                "new_call_edges": [{"from": e[0], "to": e[1]} for e in new_edges],
+                "removed_call_edges": [{"from": e[0], "to": e[1]} for e in removed_edges],
                 "new_edge_count": len(new_edges),
                 "removed_edge_count": len(removed_edges),
                 "status": "analyzed",
             }
         except Exception as e:
-            logger.error("Post-edit analysis failed: %s", e)
+            logger.error("Post-edit graph diff failed: %s", e)
             return {"status": "failed", "error": str(e)}
 
     # ------------------------------------------------------------------

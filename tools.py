@@ -237,7 +237,14 @@ def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
     """
     class_results = graph.query(class_query)
 
-    all_rows = list(func_results.result_set) + list(class_results.result_set)
+    module_query = """
+    MATCH (m:Module) WHERE m.embedding IS NOT NULL
+    OPTIONAL MATCH ()-[d:DEFINED_IN]->(m)
+    RETURN 'Module', m.name, m.file_path, 'Module definition', m.embedding, count(d) as in_degree
+    """
+    module_results = graph.query(module_query)
+
+    all_rows = list(func_results.result_set) + list(class_results.result_set) + list(module_results.result_set)
 
     # Filter rows with valid embeddings and deserialize via lru_cache
     valid_rows = []

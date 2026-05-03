@@ -153,16 +153,30 @@ def ingest_parsed_files(
             import_modules.add(imp.module)
 
     # Step 1: Upsert Module nodes
-    module_nodes = [{"name": mod_name, "file_path": fpath} for mod_name, fpath in file_modules.items()]
+    mod_emb_texts = [f"{mod_name}. Module defined in {fpath}" 
+                     for mod_name, fpath in file_modules.items()]
+    mod_embeddings = embed_texts(mod_emb_texts) if mod_emb_texts else []
+    
+    module_nodes = []
+    mod_items = list(file_modules.items())
+    for i, (mod_name, fpath) in enumerate(mod_items):
+        module_nodes.append({
+            "name": mod_name, 
+            "file_path": fpath,
+            "embedding": json.dumps(mod_embeddings[i]) if mod_embeddings else None
+        })
+
     for mod_name in import_modules:
         if mod_name not in file_modules:
-            module_nodes.append({"name": mod_name, "file_path": ""})
+            module_nodes.append({"name": mod_name, "file_path": "", "embedding": None})
             
     if module_nodes:
         graph.query(
             """UNWIND $nodes AS n
                MERGE (m:Module {name: n.name})
-               SET m.file_path = n.file_path""",
+               SET m.file_path = n.file_path
+               WITH m, n WHERE n.file_path <> "" AND n.embedding IS NOT NULL
+               SET m.embedding = n.embedding""",
             {"nodes": module_nodes},
         )
 

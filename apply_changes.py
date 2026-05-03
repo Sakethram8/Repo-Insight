@@ -45,6 +45,7 @@ class ApplyResult:
     total_edits: int = 0
     successful_edits: int = 0
     failed_edits: int = 0
+    failed_edits_detail: list[dict] = field(default_factory=list)
 
     @property
     def all_succeeded(self) -> bool:
@@ -115,80 +116,6 @@ def parse_edit_blocks(llm_output: str) -> list[EditBlock]:
 # Edit application
 # ---------------------------------------------------------------------------
 
-_FUZZY_THRESHOLD = 0.85  # SequenceMatcher ratio for fuzzy matching
-
-
-def _find_and_replace(
-    content: str,
-    search_text: str,
-    replace_text: str,
-) -> tuple[str, str]:
-    """Find search_text in content and replace it.
-
-    Returns (new_content, match_method).
-    Raises ValueError if search_text cannot be found even with fuzzy matching.
-    """
-    # Try exact match first
-    if search_text in content:
-        return content.replace(search_text, replace_text, 1), "exact"
-
-    # Try with normalized whitespace (strip trailing spaces per line)
-    search_normalized = "\n".join(line.rstrip() for line in search_text.splitlines())
-    content_normalized = "\n".join(line.rstrip() for line in content.splitlines())
-
-    if search_normalized in content_normalized:
-        # Find the position in normalized, apply to original
-        idx = content_normalized.index(search_normalized)
-        # Map back to original content by counting characters
-        original_lines = content.splitlines(keepends=True)
-        normalized_lines = content_normalized.splitlines(keepends=True)
-
-        # Rebuild with replacement
-        before = content_normalized[:idx]
-        after = content_normalized[idx + len(search_normalized):]
-        new_normalized = before + replace_text + after
-
-        # Re-add original line endings
-        return new_normalized, "whitespace_normalized"
-
-    # Fuzzy matching: find the best matching region in the file
-    search_lines = search_text.splitlines()
-    content_lines = content.splitlines()
-
-    if not search_lines:
-        raise ValueError("Empty search text")
-
-    best_ratio = 0.0
-    best_start = 0
-    best_end = 0
-    window = len(search_lines)
-
-    # To prevent CPU spikes on massive files, restrict fuzzy matching
-    if len(content_lines) > 3000 and window > 20:
-        raise ValueError(
-            f"Fuzzy matching disabled for massive files (lines: {len(content_lines)}, "
-            f"search window: {window}) to prevent CPU exhaustion."
-        )
-
-    for i in range(len(content_lines) - window + 1):
-        candidate = "\n".join(content_lines[i:i + window])
-        ratio = difflib.SequenceMatcher(None, search_text, candidate).ratio()
-        if ratio > best_ratio:
-            best_ratio = ratio
-            best_start = i
-            best_end = i + window
-
-    if best_ratio >= _FUZZY_THRESHOLD:
-        new_lines = content_lines[:best_start] + replace_text.splitlines() + content_lines[best_end:]
-        return "\n".join(new_lines), f"fuzzy({best_ratio:.2f})"
-
-    raise ValueError(
-        f"Could not find search text in file (best fuzzy match: {best_ratio:.2f}, "
-        f"threshold: {_FUZZY_THRESHOLD}). First 80 chars of search: "
-        f"'{search_text[:80]}...'"
-    )
-
-
 def apply_edits(edit_blocks: list[EditBlock], target_dir: Path) -> ApplyResult:
     """Apply all edit blocks to files in the target directory.
 
@@ -202,54 +129,106 @@ def apply_edits(edit_blocks: list[EditBlock], target_dir: Path) -> ApplyResult:
     result = ApplyResult(total_edits=len(edit_blocks))
     target_dir = target_dir.resolve()
 
-    for block in edit_blocks:
-        file_path = (target_dir / block.file_path).resolve()
+    for edit in edit_blocks:
+        file_path = (target_dir / edit.file_path).resolve()
         if not str(file_path).startswith(str(target_dir) + "/"):
             result.file_results.append(FileApplyResult(
-                file_path=block.file_path, success=False,
-                error=f"Security: path escapes sandbox: {block.file_path}",
+                file_path=edit.file_path, success=False,
+                error=f"Security: path escapes sandbox: {edit.file_path}",
             ))
             result.failed_edits += 1
+            result.failed_edits_detail.append({
+                "file_path": edit.file_path,
+                "reason": "Path escapes sandbox",
+            })
             continue
 
         if not file_path.exists():
             result.file_results.append(FileApplyResult(
-                file_path=block.file_path,
+                file_path=edit.file_path,
                 success=False,
-                error=f"File not found: {block.file_path}",
+                error=f"File not found: {edit.file_path}",
             ))
             result.failed_edits += 1
+            result.failed_edits_detail.append({
+                "file_path": edit.file_path,
+                "reason": "File not found",
+            })
             continue
 
         try:
             content = file_path.read_text(encoding="utf-8")
-            new_content, method = _find_and_replace(
-                content, block.search_text, block.replace_text,
-            )
+            
+            # 1. Try exact match first
+            new_content = content.replace(edit.search_text, edit.replace_text, 1)
+            method = "exact"
+            
+            # 2. If exact match fails, try normalized match
+            if new_content == content:
+                orig_lines = content.splitlines(keepends=True)
+                search_lines = edit.search_text.splitlines()
+                
+                norm_search = [line.rstrip() for line in search_lines]
+                norm_content = [line.rstrip() for line in content.splitlines()]
+                
+                search_len = len(norm_search)
+                match_idx = -1
+                
+                if search_len > 0:
+                    for i in range(len(norm_content) - search_len + 1):
+                        if norm_content[i:i + search_len] == norm_search:
+                            match_idx = i
+                            break
+                
+                if match_idx >= 0:
+                    before = "".join(orig_lines[:match_idx])
+                    after = "".join(orig_lines[match_idx + search_len:])
+                    
+                    replaced_text_orig = "".join(orig_lines[match_idx:match_idx + search_len])
+                    replace_text = edit.replace_text
+                    if replaced_text_orig.endswith("\n") and not replace_text.endswith("\n"):
+                        replace_text += "\n"
+                        
+                    new_content = before + replace_text + after
+                    method = "normalized"
+                else:
+                    logger.warning(
+                        "Edit block failed for %s — search text not found. First 80 chars of search: %s",
+                        edit.file_path, edit.search_text[:80]
+                    )
+                    result.file_results.append(FileApplyResult(
+                        file_path=edit.file_path,
+                        success=False,
+                        error="search text not found",
+                    ))
+                    result.failed_edits += 1
+                    result.failed_edits_detail.append({
+                        "file_path": edit.file_path,
+                        "reason": "search text not found",
+                    })
+                    continue
+
             file_path.write_text(new_content, encoding="utf-8")
             result.file_results.append(FileApplyResult(
-                file_path=block.file_path,
+                file_path=edit.file_path,
                 success=True,
                 match_method=method,
             ))
             result.successful_edits += 1
-            logger.info("Applied edit to %s (method: %s)", block.file_path, method)
-        except ValueError as e:
-            result.file_results.append(FileApplyResult(
-                file_path=block.file_path,
-                success=False,
-                error=str(e),
-            ))
-            result.failed_edits += 1
-            logger.error("Failed to apply edit to %s: %s", block.file_path, e)
+            logger.info("Applied edit to %s (method: %s)", edit.file_path, method)
+
         except Exception as e:
             result.file_results.append(FileApplyResult(
-                file_path=block.file_path,
+                file_path=edit.file_path,
                 success=False,
                 error=f"Unexpected error: {e}",
             ))
             result.failed_edits += 1
-            logger.error("Unexpected error applying edit to %s: %s", block.file_path, e)
+            result.failed_edits_detail.append({
+                "file_path": edit.file_path,
+                "reason": f"Unexpected error: {e}",
+            })
+            logger.error("Unexpected error applying edit to %s: %s", edit.file_path, e)
 
     return result
 
