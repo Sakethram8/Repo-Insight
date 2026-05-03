@@ -186,6 +186,13 @@ def _run_instance(
         # -- Run pipeline --
         logger.info("[%s] Running 6-phase pipeline", instance_id)
         graph = get_connection()
+
+        # Flush stale nodes from previous instance to prevent cross-contamination
+        try:
+            graph.query("MATCH (n) DETACH DELETE n")
+        except Exception:
+            pass
+
         engine = GraphDrivenEngine(repo_root=repo_dir, graph=graph)
 
         change_result: ChangeResult = engine.run(
