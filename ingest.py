@@ -536,8 +536,8 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
         for _, rel_path, mtime in parsed_with_meta:
             graph.query("MERGE (s:FileState {file_path: $fp}) SET s.mtime = $mtime", {"fp": rel_path, "mtime": mtime})
 
-    if parsed_files:
-        ingest_parsed_files(parsed_files, graph, dir_path)
+    # if parsed_files:
+    #     ingest_parsed_files(parsed_files, graph, dir_path)
 
     # Summary
     try:
