@@ -13,6 +13,7 @@ from change_engine import (
     ChangeSubgraph, ChangePlan, ChangeResult,
     GraphDrivenEngine, LOCALIZATION_PROMPT,
 )
+from apply_changes import RunResult
 
 
 # ---------------------------------------------------------------------------
@@ -215,8 +216,8 @@ class TestExpandSubgraph:
     @patch("change_engine.get_source_code")
     @patch("change_engine.get_callees")
     @patch("change_engine.get_callers")
-    @patch("change_engine.get_impact_radius")
-    @patch("change_engine.get_blast_radius")
+    @patch("change_engine.get_downstream_deps")
+    @patch("change_engine.get_upstream_callers")
     def test_collects_blast_radius(self, mock_blast, mock_impact, mock_callers,
                                     mock_callees, mock_source):
         mock_blast.return_value = {
@@ -238,8 +239,8 @@ class TestExpandSubgraph:
     @patch("change_engine.get_source_code")
     @patch("change_engine.get_callees")
     @patch("change_engine.get_callers")
-    @patch("change_engine.get_impact_radius")
-    @patch("change_engine.get_blast_radius")
+    @patch("change_engine.get_downstream_deps")
+    @patch("change_engine.get_upstream_callers")
     def test_collects_impact_radius(self, mock_blast, mock_impact, mock_callers,
                                      mock_callees, mock_source):
         mock_blast.return_value = {"affected": []}
@@ -257,8 +258,8 @@ class TestExpandSubgraph:
     @patch("change_engine.get_source_code")
     @patch("change_engine.get_callees")
     @patch("change_engine.get_callers")
-    @patch("change_engine.get_impact_radius")
-    @patch("change_engine.get_blast_radius")
+    @patch("change_engine.get_downstream_deps")
+    @patch("change_engine.get_upstream_callers")
     def test_deduplicates_across_seeds(self, mock_blast, mock_impact, mock_callers,
                                         mock_callees, mock_source):
         """Same FQN appears in blast radius of two seeds → only added once."""
@@ -275,8 +276,8 @@ class TestExpandSubgraph:
     @patch("change_engine.get_source_code")
     @patch("change_engine.get_callees")
     @patch("change_engine.get_callers")
-    @patch("change_engine.get_impact_radius")
-    @patch("change_engine.get_blast_radius")
+    @patch("change_engine.get_downstream_deps")
+    @patch("change_engine.get_upstream_callers")
     def test_fetches_source_for_all_seen_fqns(self, mock_blast, mock_impact,
                                                mock_callers, mock_callees, mock_source):
         mock_blast.return_value = {
@@ -409,6 +410,97 @@ class TestGenerateEdits:
 
 
 # ---------------------------------------------------------------------------
+# Engine tests — _ensure_graph_fresh
+# ---------------------------------------------------------------------------
+
+class TestEnsureGraphFresh:
+    @patch("change_engine.get_connection")
+    @patch("change_engine.run_ingestion")
+    def test_fingerprint_uses_original_root_not_sandbox(self, mock_ingest, mock_conn, tmp_path):
+        original_root = tmp_path / "original"
+        original_root.mkdir()
+        sandbox_root = tmp_path / "sandbox"
+        sandbox_root.mkdir()
+
+        # Write file only in original_root
+        (original_root / "test.py").write_text("x = 1")
+
+        engine = GraphDrivenEngine(repo_root=original_root, sandbox_path=sandbox_root)
+        engine.graph = None  # Force fingerprint computation
+        mock_ingest.return_value = {}
+        mock_conn.return_value = MagicMock()
+
+        engine._ensure_graph_fresh()
+
+        # Ensure run_ingestion was called with sandbox path
+        mock_ingest.assert_called_once_with(str(sandbox_root))
+
+    def test_skips_ingestion_when_fingerprint_matches(self, tmp_path):
+        original_root = tmp_path / "original"
+        original_root.mkdir()
+        (original_root / "test.py").write_text("x = 1")
+
+        # Compute expected fingerprint
+        import change_engine
+        engine = change_engine.GraphDrivenEngine(repo_root=original_root)
+        engine.graph = MagicMock()
+        
+        # Manually compute what _ensure_graph_fresh would compute for original_root
+        current_mtimes = {}
+        for f in sorted(original_root.rglob("*.py")):
+            rel = str(f.relative_to(original_root))
+            current_mtimes[rel] = f.stat().st_mtime
+        expected_fp = str(hash(frozenset(current_mtimes.items())))
+
+        mock_res = MagicMock()
+        mock_res.result_set = [[expected_fp]]
+        engine.graph.query.return_value = mock_res
+
+        with patch("change_engine.run_ingestion") as mock_ingest:
+            result = engine._ensure_graph_fresh()
+            mock_ingest.assert_not_called()
+            assert result.get("skipped") is True
+            assert result.get("fingerprint") == expected_fp
+
+
+# ---------------------------------------------------------------------------
+# Engine tests — _retry_edits
+# ---------------------------------------------------------------------------
+
+class TestRetryEdits:
+    def test_retry_uses_max_tokens_8192(self):
+        engine = GraphDrivenEngine(repo_root=Path("/tmp/fake"), graph=MagicMock())
+        mock_response = MagicMock()
+        mock_response.choices = [MagicMock()]
+        mock_response.choices[0].message.content = "FILE: test.py\n<<<<<<< SEARCH\nx\n=======\ny\n>>>>>>> REPLACE\n"
+        
+        engine.client = MagicMock()
+        engine.client.chat.completions.create.return_value = mock_response
+
+        subgraph = ChangeSubgraph(seed_nodes=["mod"])
+        subgraph.source_code = {"mod": "x"}
+        run_result = RunResult(exit_code=1, stdout="AssertionError", stderr="")
+
+        edits = engine._retry_edits("fix it", subgraph, run_result)
+        
+        engine.client.chat.completions.create.assert_called_once()
+        kwargs = engine.client.chat.completions.create.call_args[1]
+        assert kwargs.get("max_tokens") == 8192
+        assert len(edits) == 1
+
+    def test_retry_returns_empty_on_llm_failure(self):
+        engine = GraphDrivenEngine(repo_root=Path("/tmp/fake"), graph=MagicMock())
+        engine.client = MagicMock()
+        engine.client.chat.completions.create.side_effect = Exception("API down")
+
+        subgraph = ChangeSubgraph(seed_nodes=["mod"])
+        run_result = RunResult(exit_code=1, stdout="err", stderr="")
+
+        edits = engine._retry_edits("fix it", subgraph, run_result)
+        assert edits == []
+
+
+# ---------------------------------------------------------------------------
 # Engine tests — full run (Phase 0 skip, mocked everything)
 # ---------------------------------------------------------------------------
 
@@ -416,8 +508,8 @@ class TestFullRun:
     @patch("change_engine.run_ingestion")
     @patch("change_engine.get_connection")
     @patch("change_engine.semantic_search")
-    @patch("change_engine.get_blast_radius")
-    @patch("change_engine.get_impact_radius")
+    @patch("change_engine.get_upstream_callers")
+    @patch("change_engine.get_downstream_deps")
     @patch("change_engine.get_callers")
     @patch("change_engine.get_callees")
     @patch("change_engine.get_source_code")

@@ -39,12 +39,12 @@ class TestDispatchTool:
         parsed = json.loads(result)
         assert parsed["callee_count"] == 0
 
-    def test_dispatches_get_impact_radius(self, mocker):
+    def test_dispatches_get_downstream_deps(self, mocker):
         mock_graph = MagicMock()
         mock_result = {"source": "foo", "depth": 2, "impacted_count": 0,
                        "warning": False, "impacted": []}
-        mocker.patch("agent.get_impact_radius", return_value=mock_result)
-        result = _dispatch_tool("get_impact_radius", {"name": "foo"}, mock_graph)
+        mocker.patch("agent.get_downstream_deps", return_value=mock_result)
+        result = _dispatch_tool("get_downstream_deps", {"name": "foo"}, mock_graph)
         parsed = json.loads(result)
         assert parsed["source"] == "foo"
 
@@ -56,12 +56,12 @@ class TestDispatchTool:
         parsed = json.loads(result)
         assert parsed["query"] == "test"
 
-    def test_dispatches_get_blast_radius(self, mocker):
+    def test_dispatches_get_upstream_callers(self, mocker):
         mock_graph = MagicMock()
         mock_result = {"target": "foo", "direction": "upstream", "depth": 2,
                        "affected_count": 3, "warning": False, "affected": []}
-        mocker.patch("agent.get_blast_radius", return_value=mock_result)
-        result = _dispatch_tool("get_blast_radius", {"name": "foo"}, mock_graph)
+        mocker.patch("agent.get_upstream_callers", return_value=mock_result)
+        result = _dispatch_tool("get_upstream_callers", {"name": "foo"}, mock_graph)
         parsed = json.loads(result)
         assert parsed["target"] == "foo"
         assert parsed["direction"] == "upstream"
@@ -70,7 +70,7 @@ class TestDispatchTool:
         mock_graph = MagicMock()
         mock_result = {"found": True, "name": "foo", "source": "def foo(): pass"}
         mocker.patch("agent.get_source_code", return_value=mock_result)
-        result = _dispatch_tool("get_source_code", {"name": "foo"}, mock_graph)
+        result = _dispatch_tool("get_source_code", {"name": "foo"}, mock_graph, iteration_architect_calls=2)
         parsed = json.loads(result)
         assert parsed["found"] is True
         assert "def foo" in parsed["source"]

@@ -7,12 +7,13 @@ Require a live FalkorDB. Skip if FalkorDB is not reachable.
 import pytest
 import falkordb
 from pathlib import Path
-from config import FALKORDB_HOST, FALKORDB_PORT, IMPACT_RADIUS_WARN_THRESHOLD
+from config import FALKORDB_HOST, FALKORDB_PORT, IMPACT_RADIUS_WARN_THRESHOLD, BLAST_RADIUS_MAX_DEPTH, IMPACT_RADIUS_MAX_DEPTH
 from ingest import run_ingestion, get_connection, create_indices, ingest_parsed_files
 from parser import parse_directory
 from tools import (get_function_context, get_callers, get_callees,
-                   get_impact_radius, get_blast_radius, get_source_code,
-                   semantic_search)
+                   get_source_code, semantic_search, get_downstream_deps, 
+                   get_upstream_callers)
+from unittest.mock import MagicMock
 
 FIXTURES = str(Path(__file__).parent / "fixtures")
 
@@ -104,62 +105,62 @@ class TestGetCallees:
 
 
 @pytest.mark.integration
-class TestGetImpactRadius:
+class TestGetDownstreamDeps:
     def test_alpha_impacts_beta_and_gamma(self, graph):
-        result = get_impact_radius("alpha", graph)
+        result = get_downstream_deps("alpha", graph)
         fqns = [r["fqn"] for r in result["impacted"]]
         assert any("beta" in f for f in fqns)
         assert any("gamma" in f for f in fqns)
 
     def test_gamma_has_no_impact(self, graph):
-        result = get_impact_radius("gamma", graph)
+        result = get_downstream_deps("gamma", graph)
         assert result["impacted_count"] == 0
 
     def test_result_limited_to_50(self, graph):
-        result = get_impact_radius("alpha", graph)
+        result = get_downstream_deps("alpha", graph)
         assert len(result["impacted"]) <= 50
 
     def test_direction_is_downstream(self, graph):
-        result = get_impact_radius("alpha", graph)
+        result = get_downstream_deps("alpha", graph)
         assert result["direction"] == "downstream"
 
     def test_warning_flag_when_threshold_exceeded(self, graph):
-        result = get_impact_radius("alpha", graph)
+        result = get_downstream_deps("alpha", graph)
         if result["impacted_count"] > IMPACT_RADIUS_WARN_THRESHOLD:
             assert result["warning"] is True
         else:
             assert result["warning"] is False
 
     def test_depth_field_matches_parameter(self, graph):
-        result = get_impact_radius("alpha", graph, max_depth=3)
+        result = get_downstream_deps("alpha", graph, max_depth=3)
         assert result["depth"] == 3
 
 
 @pytest.mark.integration
-class TestGetBlastRadius:
+class TestGetUpstreamCallers:
     def test_gamma_blast_radius_includes_alpha_and_beta(self, graph):
         """gamma is called by beta, which is called by alpha."""
-        result = get_blast_radius("gamma", graph)
+        result = get_upstream_callers("gamma", graph)
         fqns = [r["fqn"] for r in result["affected"]]
         assert any("beta" in f for f in fqns)
         # alpha -> beta -> gamma, so alpha should also appear at depth 2
         assert any("alpha" in f for f in fqns)
 
     def test_direction_is_upstream(self, graph):
-        result = get_blast_radius("gamma", graph)
+        result = get_upstream_callers("gamma", graph)
         assert result["direction"] == "upstream"
 
     def test_alpha_has_no_upstream_callers(self, graph):
         """alpha is top of the chain, nothing calls it."""
-        result = get_blast_radius("alpha", graph)
+        result = get_upstream_callers("alpha", graph)
         assert result["affected_count"] == 0
 
     def test_affected_count_matches_list_length(self, graph):
-        result = get_blast_radius("gamma", graph)
+        result = get_upstream_callers("gamma", graph)
         assert result["affected_count"] == len(result["affected"])
 
     def test_result_limited_to_50(self, graph):
-        result = get_blast_radius("gamma", graph)
+        result = get_upstream_callers("gamma", graph)
         assert len(result["affected"]) <= 50
 
 
@@ -211,3 +212,42 @@ class TestSemanticSearch:
     def test_respects_top_k(self, graph):
         result = semantic_search("test", graph, top_k=2)
         assert len(result["results"]) <= 2
+
+
+# ---------------------------------------------------------------------------
+# Default Depth Parameter Tests
+# ---------------------------------------------------------------------------
+
+class TestDepthDefaults:
+    def test_get_upstream_callers_default_depth_is_blast_radius(self):
+        mock_graph = MagicMock()
+        mock_graph.query.return_value = MagicMock(result_set=[])
+        
+        get_upstream_callers("some.func", mock_graph)
+        
+        # Check what was passed to graph.query
+        call_args = mock_graph.query.call_args[0]
+        cypher_query = call_args[0]
+        
+        assert f"CALLS*1..{BLAST_RADIUS_MAX_DEPTH}" in cypher_query
+        if BLAST_RADIUS_MAX_DEPTH != IMPACT_RADIUS_MAX_DEPTH:
+            assert f"CALLS*1..{IMPACT_RADIUS_MAX_DEPTH}" not in cypher_query
+
+    def test_get_downstream_deps_default_depth_is_impact_radius(self):
+        mock_graph = MagicMock()
+        mock_graph.query.return_value = MagicMock(result_set=[])
+        
+        get_downstream_deps("some.func", mock_graph)
+        
+        # Check what was passed to graph.query
+        call_args = mock_graph.query.call_args[0]
+        cypher_query = call_args[0]
+        
+        assert f"CALLS*1..{IMPACT_RADIUS_MAX_DEPTH}" in cypher_query
+        if BLAST_RADIUS_MAX_DEPTH != IMPACT_RADIUS_MAX_DEPTH:
+            assert f"CALLS*1..{BLAST_RADIUS_MAX_DEPTH}" not in cypher_query
+
+    def test_depths_are_different_values(self):
+        """Canary test: if they are the same, the above directional assertions lose meaning."""
+        assert BLAST_RADIUS_MAX_DEPTH != IMPACT_RADIUS_MAX_DEPTH
+
