@@ -101,22 +101,39 @@ def generate_summaries_batch(batch: list[tuple[str, str]]) -> dict[str, str]:
         return {}
     try:
         client = _get_summary_client()
-        prompt_parts = ["Summarize what each of these functions/classes does in 1-2 sentences. Return ONLY a valid JSON object mapping the ID to the summary string, like {\"id1\": \"summary1\"}.\n\n"]
+        prompt_parts = ["Summarize what each of these functions/classes does in 1-2 sentences.\nReturn ONLY a valid JSON object mapping the ID to the summary string, like {\"id1\": \"summary1\"}.\nDo NOT include any explanation, markdown, or code fences.\n\n"]
         for idx, code in batch:
             prompt_parts.append(f"--- ID: {idx} ---\n{code[:1000]}\n")
-        
+
         prompt = "".join(prompt_parts)
         response = client.chat.completions.create(
             model=LLM_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a code summarizer. Return ONLY valid JSON. No markdown fences, no explanation, no thinking. Output must be a single JSON object.",
+                },
+                {"role": "user", "content": prompt},
+            ],
             max_tokens=2000,
+            temperature=0,
+            response_format={"type": "json_object"},
         )
-        content = response.choices[0].message.content.strip()
+        content = response.choices[0].message.content
+
+        if not content or not content.strip():
+            logger.error("Batch summary: empty model content")
+            return {}
+
+        raw = content.strip()
+        logger.debug("Batch summary raw content (first 300): %s", raw[:300])
+
         try:
-            return json.loads(content)
+            return json.loads(raw)
         except json.JSONDecodeError:
-            content = content.replace("```json", "").replace("```", "").strip()
-            return json.loads(content)
+            if raw.startswith("```"):
+                raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+            return json.loads(raw)
     except Exception as e:
         logger.error("Batch summary generation failed: %s", e)
         return {}
@@ -560,9 +577,6 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
 
         for _, rel_path, mtime in parsed_with_meta:
             graph.query("MERGE (s:FileState {file_path: $fp}) SET s.mtime = $mtime", {"fp": rel_path, "mtime": mtime})
-
-    # if parsed_files:
-    #     ingest_parsed_files(parsed_files, graph, dir_path)
 
     # Summary
     try:
