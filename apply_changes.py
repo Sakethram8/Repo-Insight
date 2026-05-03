@@ -46,6 +46,7 @@ class ApplyResult:
     successful_edits: int = 0
     failed_edits: int = 0
     failed_edits_detail: list[dict] = field(default_factory=list)
+    rolled_back: bool = False
 
     @property
     def all_succeeded(self) -> bool:
@@ -116,6 +117,42 @@ def parse_edit_blocks(llm_output: str) -> list[EditBlock]:
 # Edit application
 # ---------------------------------------------------------------------------
 
+def _fuzzy_apply(content: str, search_text: str, replace_text: str,
+                 threshold: float = 0.85) -> tuple[str | None, float]:
+    """Find best approximate match for search_text in content.
+    Returns (new_content, similarity_ratio) or (None, 0.0) if below threshold.
+    """
+    content_lines = content.splitlines(keepends=True)
+    search_lines = search_text.splitlines()
+    search_len = len(search_lines)
+
+    if search_len == 0:
+        return None, 0.0
+
+    best_ratio = 0.0
+    best_idx = -1
+
+    for i in range(max(1, len(content_lines) - search_len + 1)):
+        window = [l.rstrip() for l in content_lines[i:i + search_len]]
+        target = [l.rstrip() for l in search_lines]
+        ratio = difflib.SequenceMatcher(
+            None, "\n".join(target), "\n".join(window)
+        ).ratio()
+        if ratio > best_ratio:
+            best_ratio = ratio
+            best_idx = i
+
+    if best_ratio >= threshold and best_idx >= 0:
+        before = "".join(content_lines[:best_idx])
+        after = "".join(content_lines[best_idx + search_len:])
+        replaced_orig = "".join(content_lines[best_idx:best_idx + search_len])
+        new_replace = replace_text
+        if replaced_orig.endswith("\n") and not new_replace.endswith("\n"):
+            new_replace += "\n"
+        return before + new_replace + after, best_ratio
+    return None, best_ratio
+
+
 def apply_edits(edit_blocks: list[EditBlock], target_dir: Path) -> ApplyResult:
     """Apply all edit blocks to files in the target directory.
 
@@ -129,9 +166,23 @@ def apply_edits(edit_blocks: list[EditBlock], target_dir: Path) -> ApplyResult:
     result = ApplyResult(total_edits=len(edit_blocks))
     target_dir = target_dir.resolve()
 
+    # Snapshot all files that will be touched for atomic rollback
+    snapshots: dict[str, str] = {}
+    for edit in edit_blocks:
+        fpath = (target_dir / edit.file_path).resolve()
+        if fpath.exists() and str(fpath).startswith(str(target_dir)):
+            key = str(fpath)
+            if key not in snapshots:
+                try:
+                    snapshots[key] = fpath.read_text(encoding="utf-8")
+                except Exception:
+                    pass
+
     for edit in edit_blocks:
         file_path = (target_dir / edit.file_path).resolve()
-        if not str(file_path).startswith(str(target_dir) + "/"):
+        try:
+            file_path.relative_to(target_dir)
+        except ValueError:
             result.file_results.append(FileApplyResult(
                 file_path=edit.file_path, success=False,
                 error=f"Security: path escapes sandbox: {edit.file_path}",
@@ -192,21 +243,32 @@ def apply_edits(edit_blocks: list[EditBlock], target_dir: Path) -> ApplyResult:
                     new_content = before + replace_text + after
                     method = "normalized"
                 else:
-                    logger.warning(
-                        "Edit block failed for %s — search text not found. First 80 chars of search: %s",
-                        edit.file_path, edit.search_text[:80]
-                    )
-                    result.file_results.append(FileApplyResult(
-                        file_path=edit.file_path,
-                        success=False,
-                        error="search text not found",
-                    ))
-                    result.failed_edits += 1
-                    result.failed_edits_detail.append({
-                        "file_path": edit.file_path,
-                        "reason": "search text not found",
-                    })
-                    continue
+                    # 3. Fuzzy match fallback
+                    fuzzy_content, ratio = _fuzzy_apply(content, edit.search_text, edit.replace_text)
+                    if fuzzy_content is not None:
+                        new_content = fuzzy_content
+                        method = f"fuzzy_{ratio:.0%}"
+                        logger.info(
+                            "Fuzzy match applied at %.1f%% similarity for %s",
+                            ratio * 100, edit.file_path
+                        )
+                    else:
+                        logger.warning(
+                            "Edit block failed for %s — search text not found (best fuzzy: %.1f%%). "
+                            "First 80 chars of search: %s",
+                            edit.file_path, ratio * 100, edit.search_text[:80]
+                        )
+                        result.file_results.append(FileApplyResult(
+                            file_path=edit.file_path,
+                            success=False,
+                            error=f"search text not found (best fuzzy: {ratio:.0%})",
+                        ))
+                        result.failed_edits += 1
+                        result.failed_edits_detail.append({
+                            "file_path": edit.file_path,
+                            "reason": f"search text not found (best fuzzy: {ratio:.0%})",
+                        })
+                        continue
 
             file_path.write_text(new_content, encoding="utf-8")
             result.file_results.append(FileApplyResult(
@@ -229,6 +291,19 @@ def apply_edits(edit_blocks: list[EditBlock], target_dir: Path) -> ApplyResult:
                 "reason": f"Unexpected error: {e}",
             })
             logger.error("Unexpected error applying edit to %s: %s", edit.file_path, e)
+
+    # Atomic rollback on partial failure
+    if result.failed_edits > 0 and result.successful_edits > 0:
+        for path_str, original_content in snapshots.items():
+            try:
+                Path(path_str).write_text(original_content, encoding="utf-8")
+            except Exception as rollback_err:
+                logger.error("Rollback failed for %s: %s", path_str, rollback_err)
+        logger.warning(
+            "Rolled back %d file(s) due to %d failed edit(s)",
+            len(snapshots), result.failed_edits
+        )
+        result.rolled_back = True
 
     return result
 

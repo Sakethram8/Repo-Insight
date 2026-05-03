@@ -291,10 +291,10 @@ class GraphDrivenEngine:
 
         # Compute fingerprint from all .py file mtimes
         current_mtimes = {}
-        for f in sorted(self.repo_root.rglob("*.py")):
-            parts = f.relative_to(self.repo_root).parts
+        for f in sorted(self.original_root.rglob("*.py")):
+            parts = f.relative_to(self.original_root).parts
             if not any(p in SKIP_DIRS for p in parts):
-                rel = str(f.relative_to(self.repo_root))
+                rel = str(f.relative_to(self.original_root))
                 current_mtimes[rel] = f.stat().st_mtime
 
         fingerprint = str(hash(frozenset(current_mtimes.items())))
@@ -701,7 +701,7 @@ class GraphDrivenEngine:
                         source_code_section=self._format_source_section(subgraph),
                     ),
                 }],
-                max_tokens=4000,
+                max_tokens=8192,
             )
             raw = response.choices[0].message.content.strip()
             return parse_edit_blocks(raw)
