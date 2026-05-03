@@ -1,7 +1,7 @@
 # tests/test_apply_changes.py
 """
-Unit tests for apply_changes.py — edit block parsing, text matching,
-sandbox management, and test runner.
+Unit tests for apply_changes.py — edit block parsing, fuzzy matching,
+three-tier edit application, atomic rollback, sandbox management, and test runner.
 No live infrastructure required.
 """
 
@@ -10,8 +10,8 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from apply_changes import (
-    EditBlock, FileApplyResult, ApplyResult, TestResult,
-    parse_edit_blocks, _find_and_replace, apply_edits,
+    EditBlock, FileApplyResult, ApplyResult, RunResult,
+    parse_edit_blocks, _fuzzy_apply, apply_edits,
     create_sandbox, cleanup_sandbox, run_tests,
 )
 
@@ -126,45 +126,184 @@ class TestParseEditBlocks:
 
 
 # ---------------------------------------------------------------------------
-# Find and replace
+# Fuzzy apply (module-level helper)
 # ---------------------------------------------------------------------------
 
-class TestFindAndReplace:
-    def test_exact_match(self):
-        content = "line1\nline2\nline3\n"
-        new, method = _find_and_replace(content, "line2", "LINE2")
-        assert method == "exact"
-        assert "LINE2" in new
-        assert "line2" not in new
+class TestFuzzyApply:
+    def test_returns_none_below_threshold(self):
+        content = "def alpha():\n    return 1\n\ndef beta():\n    return 2\n"
+        search = "class Gamma:\n    x = 99\n    y = 100"
+        result, ratio = _fuzzy_apply(content, search, "replacement")
+        assert result is None
+        assert ratio < 0.85
 
-    def test_whitespace_normalized_match(self):
-        content = "line1  \nline2  \nline3\n"
-        new, method = _find_and_replace(content, "line1\nline2", "LINE1\nLINE2")
-        assert method == "whitespace_normalized"
-
-    def test_fuzzy_match_above_threshold(self):
-        content = "def foo(a, b):\n    return a + b\n\ndef bar():\n    pass\n"
-        # Slightly different version (extra space)
-        search = "def foo(a,  b):\n    return a + b"
+    def test_exact_match_above_threshold(self):
+        content = "def foo(a, b):\n    return a + b\n"
+        search = "def foo(a, b):\n    return a + b"
         replace = "def foo(a, b, c):\n    return a + b + c"
-        new, method = _find_and_replace(content, search, replace)
-        assert "fuzzy" in method
-        assert "a + b + c" in new
+        result, ratio = _fuzzy_apply(content, search, replace)
+        assert result is not None
+        assert ratio >= 0.99
+        assert "a + b + c" in result
 
-    def test_no_match_raises_valueerror(self):
-        content = "completely different content here"
-        with pytest.raises(ValueError, match="Could not find"):
-            _find_and_replace(content, "nothing like this at all\nfor real", "replacement")
+    def test_fuzzy_match_reformatted_code(self):
+        content = "def foo(a,  b):\n    return  a + b\n\ndef bar():\n    pass\n"
+        search = "def foo(a, b):\n    return a + b"
+        replace = "def foo(a, b, c):\n    return a + b + c"
+        result, ratio = _fuzzy_apply(content, search, replace)
+        assert result is not None
+        assert 0.85 <= ratio < 1.0
+        assert "a + b + c" in result
 
-    def test_empty_search_returns_exact_match(self):
-        """Empty search text matches immediately via 'in' check."""
-        content = "some content"
-        new, method = _find_and_replace(content, "", "replacement")
-        assert method == "exact"
+    def test_empty_search_returns_none(self):
+        content = "some content\n"
+        result, ratio = _fuzzy_apply(content, "", "replacement")
+        assert result is None
+        assert ratio == 0.0
+
+    def test_ratio_returned_on_failure(self):
+        content = "completely unrelated code here\nand more lines\nnothing similar\n"
+        search = "def very_specific_function():\n    return 42\n    # special comment"
+        result, ratio = _fuzzy_apply(content, search, "replacement")
+        assert result is None
+        assert isinstance(ratio, float)
+        assert 0.0 <= ratio < 0.85
 
 
 # ---------------------------------------------------------------------------
-# Apply edits
+# Three-tier matching in apply_edits
+# ---------------------------------------------------------------------------
+
+class TestApplyEditsThreeTierMatching:
+    def test_exact_tier_used(self, tmp_path):
+        f = tmp_path / "test.py"
+        f.write_text("def foo():\n    return 1\n")
+        edits = [EditBlock(file_path="test.py", search_text="return 1", replace_text="return 2")]
+        result = apply_edits(edits, tmp_path)
+        assert result.successful_edits == 1
+        assert result.file_results[0].match_method == "exact"
+        assert "return 2" in f.read_text()
+
+    def test_normalized_tier_used(self, tmp_path):
+        f = tmp_path / "test.py"
+        f.write_text("line1   \nline2   \nline3\n")
+        edits = [EditBlock(file_path="test.py", search_text="line1\nline2", replace_text="LINE1\nLINE2")]
+        result = apply_edits(edits, tmp_path)
+        assert result.successful_edits == 1
+        assert result.file_results[0].match_method == "normalized"
+        content = f.read_text()
+        assert "LINE1" in content
+        assert "LINE2" in content
+
+    def test_fuzzy_tier_used(self, tmp_path):
+        f = tmp_path / "test.py"
+        # Content has minor formatting differences (~90% similar)
+        f.write_text("def foo(a,  b):\n    return  a + b\n\ndef bar():\n    pass\n")
+        edits = [EditBlock(
+            file_path="test.py",
+            search_text="def foo(a, b):\n    return a + b",
+            replace_text="def foo(a, b, c):\n    return a + b + c",
+        )]
+        result = apply_edits(edits, tmp_path)
+        assert result.successful_edits == 1
+        assert result.file_results[0].match_method.startswith("fuzzy_")
+        assert "a + b + c" in f.read_text()
+
+    def test_all_tiers_fail(self, tmp_path):
+        f = tmp_path / "test.py"
+        f.write_text("completely different content here\n")
+        edits = [EditBlock(
+            file_path="test.py",
+            search_text="def very_specific_function():\n    return 42\n    # special comment",
+            replace_text="replacement",
+        )]
+        result = apply_edits(edits, tmp_path)
+        assert result.failed_edits == 1
+        assert "fuzzy" in result.file_results[0].error
+
+    def test_fuzzy_ratio_in_method_string(self, tmp_path):
+        f = tmp_path / "test.py"
+        f.write_text("def process(x,  y):\n    result  = x * y\n    return result\n")
+        edits = [EditBlock(
+            file_path="test.py",
+            search_text="def process(x, y):\n    result = x * y\n    return result",
+            replace_text="def process(x, y, z):\n    result = x * y * z\n    return result",
+        )]
+        result = apply_edits(edits, tmp_path)
+        assert result.successful_edits == 1
+        method = result.file_results[0].match_method
+        assert method.startswith("fuzzy_")
+        assert "%" in method  # e.g. "fuzzy_92%"
+
+
+# ---------------------------------------------------------------------------
+# Atomic rollback
+# ---------------------------------------------------------------------------
+
+class TestAtomicRollback:
+    def test_no_rollback_on_full_success(self, tmp_path):
+        f = tmp_path / "test.py"
+        f.write_text("old_content\n")
+        edits = [EditBlock(file_path="test.py", search_text="old_content", replace_text="new_content")]
+        result = apply_edits(edits, tmp_path)
+        assert result.rolled_back is False
+        assert result.successful_edits == 1
+
+    def test_no_rollback_on_full_failure(self, tmp_path):
+        edits = [
+            EditBlock(file_path="missing1.py", search_text="x", replace_text="y"),
+            EditBlock(file_path="missing2.py", search_text="a", replace_text="b"),
+        ]
+        result = apply_edits(edits, tmp_path)
+        assert result.rolled_back is False
+        assert result.failed_edits == 2
+        assert result.successful_edits == 0
+
+    def test_rollback_on_partial_failure(self, tmp_path):
+        good_file = tmp_path / "good.py"
+        original_content = "old_content\n"
+        good_file.write_text(original_content)
+
+        edits = [
+            EditBlock(file_path="good.py", search_text="old_content", replace_text="new_content"),
+            EditBlock(file_path="missing.py", search_text="x", replace_text="y"),
+        ]
+        result = apply_edits(edits, tmp_path)
+        assert result.rolled_back is True
+        # File should be restored to original
+        assert good_file.read_text() == original_content
+
+    def test_rollback_restores_exact_original(self, tmp_path):
+        f = tmp_path / "data.py"
+        original = "def compute():\n    # Important comment\n    return 42\n"
+        f.write_text(original)
+
+        edits = [
+            EditBlock(file_path="data.py", search_text="return 42", replace_text="return 99"),
+            EditBlock(file_path="nonexistent.py", search_text="z", replace_text="w"),
+        ]
+        result = apply_edits(edits, tmp_path)
+        assert result.rolled_back is True
+        # Byte-for-byte match
+        assert f.read_text() == original
+
+    def test_successful_edits_count_unaffected(self, tmp_path):
+        f = tmp_path / "test.py"
+        f.write_text("old\n")
+
+        edits = [
+            EditBlock(file_path="test.py", search_text="old", replace_text="new"),
+            EditBlock(file_path="ghost.py", search_text="x", replace_text="y"),
+        ]
+        result = apply_edits(edits, tmp_path)
+        assert result.rolled_back is True
+        # Count reflects what was attempted, not post-rollback state
+        assert result.successful_edits == 1
+        assert result.failed_edits == 1
+
+
+# ---------------------------------------------------------------------------
+# Apply edits (original tests)
 # ---------------------------------------------------------------------------
 
 class TestApplyEdits:
@@ -178,6 +317,7 @@ class TestApplyEdits:
         assert result.all_succeeded is True
         assert result.successful_edits == 1
         assert result.failed_edits == 0
+        # With only 1 edit succeeding and 0 failing, no rollback occurs
         assert f.read_text() == "def foo():\n    return 2\n"
 
     def test_file_not_found(self, tmp_path):
@@ -202,6 +342,8 @@ class TestApplyEdits:
         assert result.successful_edits == 1
         assert result.failed_edits == 1
         assert result.all_succeeded is False
+        # Partial failure triggers rollback
+        assert result.rolled_back is True
 
     def test_search_not_found_in_file(self, tmp_path):
         f = tmp_path / "test.py"
@@ -310,13 +452,13 @@ class TestRunTests:
         assert result.timed_out is True
 
     def test_all_passed_property(self):
-        r = TestResult(exit_code=0, passed=5, failed=0, errors=0)
+        r = RunResult(exit_code=0, passed=5, failed=0, errors=0)
         assert r.all_passed is True
 
     def test_all_passed_false_with_failures(self):
-        r = TestResult(exit_code=1, passed=3, failed=2, errors=0)
+        r = RunResult(exit_code=1, passed=3, failed=2, errors=0)
         assert r.all_passed is False
 
     def test_all_passed_false_with_errors(self):
-        r = TestResult(exit_code=1, passed=3, failed=0, errors=1)
+        r = RunResult(exit_code=1, passed=3, failed=0, errors=1)
         assert r.all_passed is False

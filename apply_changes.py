@@ -54,7 +54,7 @@ class ApplyResult:
 
 
 @dataclass
-class TestResult:
+class RunResult:
     """Result of running pytest in the sandbox."""
     passed: int = 0
     failed: int = 0
@@ -361,7 +361,7 @@ def run_tests(
     sandbox_path: Path,
     timeout: int = 120,
     test_command: Optional[list[str]] = None,
-) -> TestResult:
+) -> RunResult:
     """Run pytest in the sandbox directory.
 
     Args:
@@ -370,7 +370,7 @@ def run_tests(
         test_command: Custom test command. Defaults to pytest with minimal output.
 
     Returns:
-        TestResult with pass/fail counts and output.
+        RunResult with pass/fail counts and output.
     """
     if test_command is None:
         import shlex
@@ -386,7 +386,7 @@ def run_tests(
             timeout=timeout,
         )
 
-        result = TestResult(
+        result = RunResult(
             exit_code=proc.returncode,
             stdout=proc.stdout,
             stderr=proc.stderr,
@@ -416,7 +416,7 @@ def run_tests(
 
     except subprocess.TimeoutExpired:
         logger.error("Tests timed out after %ds", timeout)
-        return TestResult(
+        return RunResult(
             exit_code=-1,
             timed_out=True,
             stdout="",
@@ -424,7 +424,7 @@ def run_tests(
         )
     except Exception as e:
         logger.error("Failed to run tests: %s", e)
-        return TestResult(
+        return RunResult(
             exit_code=-1,
             stdout="",
             stderr=f"Failed to run tests: {e}",

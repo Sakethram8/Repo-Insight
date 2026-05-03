@@ -29,7 +29,7 @@ from tools import (
     get_source_code, semantic_search,
 )
 from apply_changes import (
-    EditBlock, ApplyResult, TestResult,
+    EditBlock, ApplyResult, RunResult,
     parse_edit_blocks, apply_edits, run_tests,
 )
 
@@ -73,7 +73,7 @@ class ChangeResult:
     plan: Optional[ChangePlan] = None
     edits: list[EditBlock] = field(default_factory=list)
     apply_result: Optional[ApplyResult] = None
-    test_result: Optional[TestResult] = None
+    test_result: Optional[RunResult] = None
     post_edit_analysis: Optional[dict] = None
     answer: str = ""
     phases_completed: list[str] = field(default_factory=list)
@@ -641,7 +641,7 @@ class GraphDrivenEngine:
         prompt: str,
         subgraph: ChangeSubgraph,
         max_retries: int = 2,
-    ) -> tuple[Optional[ApplyResult], Optional[TestResult], Optional[dict]]:
+    ) -> tuple[Optional[ApplyResult], Optional[RunResult], Optional[dict]]:
         """Apply edits directly to repo_root (already sandboxed), run tests, retry on failure."""
         current_edits = edits
 
@@ -686,7 +686,7 @@ class GraphDrivenEngine:
         return apply_result, test_result, None
 
     def _retry_edits(
-        self, prompt: str, subgraph: ChangeSubgraph, test_result: TestResult,
+        self, prompt: str, subgraph: ChangeSubgraph, test_result: RunResult,
     ) -> list[EditBlock]:
         """Ask LLM to fix edits based on test failures."""
         error_text = test_result.stdout[-2000:] if test_result.stdout else test_result.stderr[-2000:]
