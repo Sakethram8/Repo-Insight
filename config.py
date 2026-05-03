@@ -16,8 +16,8 @@ LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3-8B")          # Override via env 
 
 # Baseline model for "fair fight" A/B comparison
 # This is the STRONGER model that runs WITHOUT the graph — proving structure > scale
-BASELINE_SGLANG_BASE_URL = os.getenv("BASELINE_SGLANG_BASE_URL", "http://localhost:30001/v1")
-BASELINE_LLM_MODEL = os.getenv("BASELINE_LLM_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
+# BASELINE_SGLANG_BASE_URL = os.getenv("BASELINE_SGLANG_BASE_URL", "http://localhost:30001/v1")
+# BASELINE_LLM_MODEL = os.getenv("BASELINE_LLM_MODEL", "Qwen/Qwen3-Coder-30B-A3B-Instruct")
 
 EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")   # Sentence-transformer model; runs locally
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))                # Output dimension for all-MiniLM-L6-v2

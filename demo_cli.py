@@ -21,8 +21,7 @@ from rich.syntax import Syntax
 from rich import print as rprint
 from contextlib import contextmanager
 from config import (SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
-                    FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
-                    BASELINE_SGLANG_BASE_URL, BASELINE_LLM_MODEL)
+                    FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME)
 from agent import run_repo_agent
 from ingest import run_ingestion, get_connection
 from pathlib import Path
@@ -78,58 +77,7 @@ def _summarize_tool_result(res: dict) -> str:
     return json.dumps(res)[:50]
 
 
-def run_mode_a(query: str, console: Console) -> dict:
-    """
-    Fire query directly to SGLang with NO tools. Display raw response in a red-bordered panel.
-    Returns timing and metadata for comparison.
-    """
-    console.print()
-    console.print("[bold red]━━━ MODE A: Baseline (No Graph Context) ━━━[/bold red]")
-    console.print()
 
-    client = openai.OpenAI(
-        base_url=SGLANG_BASE_URL,
-        api_key=SGLANG_API_KEY,
-    )
-
-    mode_a_data = {"time": 0, "answer": "", "error": None}
-
-    try:
-        start = time.time()
-        with console.status("[bold yellow]Querying LLM without tools...[/bold yellow]"):
-            response = client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": (
-                        "You are a helpful coding assistant. When asked to make code changes, "
-                        "list every file that needs modification and describe what changes to make. "
-                        "Be thorough — missing a file means the change will break things."
-                    )},
-                    {"role": "user", "content": query},
-                ],
-            )
-        elapsed = time.time() - start
-        answer = response.choices[0].message.content or "(empty response)"
-        mode_a_data["time"] = round(elapsed, 1)
-        mode_a_data["answer"] = answer
-
-        console.print(Panel(
-            answer,
-            title="[bold red]MODE A: Baseline (No Graph Context)[/bold red]",
-            subtitle=f"[dim]{elapsed:.1f}s[/dim]",
-            border_style="red",
-            padding=(1, 2),
-        ))
-
-    except Exception as e:
-        mode_a_data["error"] = str(e)
-        console.print(Panel(
-            f"[red]Error in Mode A: {e}[/red]",
-            title="[bold red]MODE A: Error[/bold red]",
-            border_style="red",
-        ))
-
-    return mode_a_data
 
 
 def run_mode_b(query: str, graph: falkordb.Graph, console: Console) -> dict:
@@ -366,7 +314,7 @@ def run_mode_c(query: str, repo_path: str, graph: falkordb.Graph, console: Conso
     return mode_c_data
 
 
-def _show_comparison(mode_a_data: dict, mode_b_data: dict, console: Console,
+def _show_comparison(mode_b_data: dict, console: Console,
                      mode_c_data: dict = None) -> None:
     """Show a quantitative comparison table between modes."""
     console.print()
@@ -378,18 +326,17 @@ def _show_comparison(mode_a_data: dict, mode_b_data: dict, console: Console,
         show_header=True, header_style="bold",
     )
     comp_table.add_column("Metric", style="white", width=25)
-    comp_table.add_column("Mode A (Blind)", style="red", justify="center", width=18)
     comp_table.add_column("Mode B (Tool-Call)", style="green", justify="center", width=18)
     if has_c:
         comp_table.add_column("Mode C (Graph-Driven)", style="bright_magenta", justify="center", width=20)
 
     row = lambda m, a, b, c=None: comp_table.add_row(m, a, b, *([c] if has_c and c else []))
 
-    row("Response Time", f"{mode_a_data.get('time', '?')}s", f"{mode_b_data.get('time', '?')}s",
+    row("Response Time",  f"{mode_b_data.get('time', '?')}s",
         f"{mode_c_data.get('time', '?')}s" if has_c else None)
-    row("Graph Queries", "0", str(mode_b_data.get("tool_count", 0)),
+    row("Graph Queries", str(mode_b_data.get("tool_count", 0)),
         "exhaustive" if has_c else None)
-    row("Files Traced", "0", str(mode_b_data.get("files_traced", 0)),
+    row("Files Traced", str(mode_b_data.get("files_traced", 0)),
         "all in blast radius" if has_c else None)
     row("Validation Gate", "[red]✗ No[/red]", "[red]✗ No[/red]",
         "[green]✓ Yes[/green]" if has_c and mode_c_data.get("validated") else "[red]✗ No[/red]" if has_c else None)
@@ -413,134 +360,8 @@ def _show_comparison(mode_a_data: dict, mode_b_data: dict, console: Console,
     ))
 
 
-# ---------------------------------------------------------------------------
-# Fair Fight: Graph-Driven (smaller model) vs Blind (bigger model)
-# ---------------------------------------------------------------------------
-
-def run_baseline(query: str, console: Console) -> dict:
-    """
-    Run the STRONGER model (BASELINE_LLM_MODEL) with NO graph tools.
-    This is the 'champion' that Repo-Insight's smaller model must beat.
-    """
-    console.print()
-    console.print(f"[bold bright_red]━━━ BASELINE: {BASELINE_LLM_MODEL} (No Graph) ━━━[/bold bright_red]")
-    console.print()
-
-    client = openai.OpenAI(
-        base_url=BASELINE_SGLANG_BASE_URL,
-        api_key=SGLANG_API_KEY,
-    )
-
-    data = {"time": 0, "answer": "", "error": None, "model": BASELINE_LLM_MODEL}
-
-    try:
-        start = time.time()
-        with console.status(f"[bold yellow]Querying {BASELINE_LLM_MODEL} (no graph)...[/bold yellow]"):
-            response = client.chat.completions.create(
-                model=BASELINE_LLM_MODEL,
-                messages=[
-                    {"role": "system", "content": (
-                        "You are a helpful coding assistant. When asked to make code changes, "
-                        "list every file that needs modification and describe what changes to make. "
-                        "Be thorough — missing a file means the change will break things."
-                    )},
-                    {"role": "user", "content": query},
-                ],
-            )
-        elapsed = time.time() - start
-        answer = response.choices[0].message.content or "(empty response)"
-        data["time"] = round(elapsed, 1)
-        data["answer"] = answer
-
-        console.print(Panel(
-            answer,
-            title=f"[bold bright_red]BASELINE: {BASELINE_LLM_MODEL} (No Graph)[/bold bright_red]",
-            subtitle=f"[dim]{elapsed:.1f}s[/dim]",
-            border_style="bright_red",
-            padding=(1, 2),
-        ))
-
-    except Exception as e:
-        data["error"] = str(e)
-        console.print(Panel(
-            f"[red]Error in Baseline: {e}[/red]",
-            title="[bold red]BASELINE: Error[/bold red]",
-            border_style="red",
-        ))
-
-    return data
 
 
-def _show_fair_fight_comparison(
-    mode_c_data: dict, baseline_data: dict, console: Console,
-) -> None:
-    """Show head-to-head comparison: Graph-Driven (smaller model) vs Blind (bigger model)."""
-    console.print()
-
-    table = Table(
-        title="[bold bright_blue]⚔ FAIR FIGHT: Structure vs. Scale ⚔[/bold bright_blue]",
-        show_header=True, header_style="bold",
-    )
-    table.add_column("Metric", style="white", width=28)
-    table.add_column(
-        f"🧠 {LLM_MODEL}\n+ Graph Pipeline",
-        style="bright_magenta", justify="center", width=26,
-    )
-    table.add_column(
-        f"🤖 {BASELINE_LLM_MODEL}\n(Blind, No Graph)",
-        style="bright_red", justify="center", width=26,
-    )
-
-    table.add_row(
-        "Model",
-        f"[bright_magenta]{LLM_MODEL}[/bright_magenta]",
-        f"[bright_red]{BASELINE_LLM_MODEL}[/bright_red]",
-    )
-    table.add_row(
-        "Graph Tools",
-        "[green]✓ 9 deterministic tools[/green]",
-        "[red]✗ None[/red]",
-    )
-    table.add_row(
-        "Response Time",
-        f"{mode_c_data.get('time', '?')}s",
-        f"{baseline_data.get('time', '?')}s",
-    )
-    table.add_row(
-        "Validation Gate",
-        "[green]✓ Structural guarantee[/green]" if mode_c_data.get("validated") else "[yellow]attempted[/yellow]",
-        "[red]✗ None[/red]",
-    )
-    table.add_row(
-        "Auto-Apply + Test",
-        "[green]✓ Sandbox verified[/green]" if mode_c_data.get("tests_passed") else "[yellow]attempted[/yellow]",
-        "[red]✗ None[/red]",
-    )
-    table.add_row(
-        "Structural Coverage",
-        "[green]✓ Exhaustive (graph)[/green]",
-        "[red]✗ Guess from training data[/red]",
-    )
-    table.add_row(
-        "Edit Blocks Generated",
-        str(mode_c_data.get("edits", 0)),
-        "0 (prose only)",
-    )
-
-    console.print(table)
-    console.print()
-    console.print(Panel(
-        f"[bold]The Question:[/bold] Can a [bright_magenta]smaller model + code graph[/bright_magenta] "
-        f"outperform a [bright_red]larger model running blind[/bright_red]?\n\n"
-        f"• [bright_magenta]{LLM_MODEL}[/bright_magenta] uses Repo-Insight's graph pipeline: "
-        f"blast radius analysis, validation gate, and surgical edits.\n"
-        f"• [bright_red]{BASELINE_LLM_MODEL}[/bright_red] gets the same prompt but has to guess "
-        f"which files need changing from training data alone.\n\n"
-        f"[bold green]Run '--score' to get quantitative Precision/Recall/F1 proof.[/bold green]",
-        title="[bold bright_blue]🏆 Why Structure Beats Scale[/bold bright_blue]",
-        border_style="bright_blue",
-        padding=(1, 2),
-    ))
 
 
 def main() -> None:
@@ -551,7 +372,7 @@ def main() -> None:
         --path PATH     : Path to repo to ingest. Default: ./target_repo
         --ingest        : Flag. If set, run ingestion before demo.
         --prompt TEXT   : Run a specific prompt directly (skip interactive selection).
-        --mode {a,b,c,ab,abc} : Which mode to run. Default: ab.
+        --mode {b,c,bc} : Which mode to run. Default: b.
         --score         : Run quantitative scoring suite.
     """
     parser = argparse.ArgumentParser(
@@ -585,8 +406,8 @@ def main() -> None:
     parser.add_argument(
         "--mode",
         type=str,
-        default="ab",
-        help="Which mode(s) to run: a, b, c, ab, abc, fair. Default: ab",
+        default="b",
+        help="Which mode(s) to run:  b, c, bc, Default: b",
     )
     parser.add_argument(
         "--score",
@@ -661,7 +482,7 @@ def main() -> None:
         console.print("\n[bold cyan]📊 Running Scoring Suite...[/bold cyan]")
         try:
             graph = get_connection()
-            score_modes = ["a", "baseline", "b", "c"]
+            score_modes = ["b", "c"]
             report = run_scoring_suite(graph, Path(args.path).resolve(), modes=score_modes)
             print_scoring_report(report)
         except Exception as e:
@@ -669,46 +490,34 @@ def main() -> None:
         return
 
     # Step 3: Run the selected mode(s)
-    is_fair = args.mode == "fair"
     graph = None
-    if "b" in args.mode or "c" in args.mode or is_fair:
+    if "b" in args.mode or "c" in args.mode:
         try:
             graph = get_connection()
         except ConnectionError as e:
             console.print(f"[red]Cannot connect to FalkorDB: {e}[/red]")
-            if args.mode in ("b", "c", "fair"):
+            if args.mode in ("b", "c"):
                 sys.exit(1)
             else:
                 console.print("[yellow]Skipping graph modes due to connection error.[/yellow]")
 
-    mode_a_data = {}
+
     mode_b_data = {}
     mode_c_data = {}
-    baseline_data = {}
 
-    if is_fair:
-        # Fair Fight: Graph-Driven (Mode C) vs Blind Baseline
+    if "b" in args.mode and graph is not None:
+        mode_b_data = run_mode_b(selected_prompt, graph, console)
+
+    if "c" in args.mode and graph is not None:
         mode_c_data = run_mode_c(selected_prompt, args.path, graph, console)
-        baseline_data = run_baseline(selected_prompt, console)
-        _show_fair_fight_comparison(mode_c_data, baseline_data, console)
-    else:
-        if "a" in args.mode:
-            mode_a_data = run_mode_a(selected_prompt, console)
 
-        if "b" in args.mode and graph is not None:
-            mode_b_data = run_mode_b(selected_prompt, graph, console)
-
-        if "c" in args.mode and graph is not None:
-            mode_c_data = run_mode_c(selected_prompt, args.path, graph, console)
-
-        # Step 4: Comparison summary
-        if len(args.mode) > 1 and (mode_a_data or mode_b_data):
-            _show_comparison(
-                mode_a_data or {},
-                mode_b_data or {},
-                console,
-                mode_c_data=mode_c_data if mode_c_data else None,
-            )
+    # Step 4: Comparison summary
+    if len(args.mode) > 1 and mode_b_data:
+        _show_comparison(
+            mode_b_data,
+            console,
+            mode_c_data=mode_c_data if mode_c_data else None,
+        )
 
     console.print()
 

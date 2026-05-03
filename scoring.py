@@ -16,8 +16,7 @@ from typing import Optional
 import openai
 import falkordb
 
-from config import (SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
-                    BASELINE_SGLANG_BASE_URL, BASELINE_LLM_MODEL)
+from config import (SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL)
 
 logger = logging.getLogger(__name__)
 
@@ -168,12 +167,12 @@ def run_scoring_suite(
         tasks: Override tasks. Default: GROUND_TRUTH_TASKS.
     """
     if modes is None:
-        modes = ["a", "b", "c"]
+        modes = ["b", "c"]
     if tasks is None:
         tasks = GROUND_TRUTH_TASKS
 
     # Create clients — primary (for Repo-Insight modes) and baseline (for blind comparison)
-    baseline_client = None
+    
 
     # Collect all known files in the repo
     all_repo_files: set[str] = set()
@@ -184,8 +183,6 @@ def run_scoring_suite(
             pass
 
     client = openai.OpenAI(base_url=SGLANG_BASE_URL, api_key=SGLANG_API_KEY)
-    if "baseline" in modes:
-        baseline_client = openai.OpenAI(base_url=BASELINE_SGLANG_BASE_URL, api_key=SGLANG_API_KEY)
     report = ScoringReport()
 
     for task in tasks:
@@ -193,9 +190,7 @@ def run_scoring_suite(
         gt_files = task["ground_truth_files"]
 
         for mode in modes:
-            if mode == "a":
-                answer, elapsed = run_mode_a_for_scoring(prompt, client)
-            elif mode == "b":
+            if mode == "b":
                 from agent import run_repo_agent
                 start = time.time()
                 try:
@@ -214,15 +209,6 @@ def run_scoring_suite(
                 except Exception as e:
                     answer = f"Error: {e}"
                 elapsed = time.time() - start
-            elif mode == "baseline":
-                # "Fair fight" — stronger model, no graph tools
-                if baseline_client is None:
-                    baseline_client = openai.OpenAI(
-                        base_url=BASELINE_SGLANG_BASE_URL, api_key=SGLANG_API_KEY,
-                    )
-                answer, elapsed = run_mode_a_for_scoring(
-                    prompt, baseline_client, model=BASELINE_LLM_MODEL,
-                )
             else:
                 continue
 

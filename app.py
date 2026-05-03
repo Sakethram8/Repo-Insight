@@ -21,6 +21,7 @@ from agent import run_repo_agent
 from sandbox import SandboxManager
 from apply_changes import apply_to_original
 from tools import get_macro_architecture, get_class_architecture
+from watcher import start_watcher
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -121,6 +122,8 @@ if "original_path" not in st.session_state:
     st.session_state.original_path = None
 if "active_tab" not in st.session_state:
     st.session_state.active_tab = "chat"
+if "graph_watcher" not in st.session_state:
+    st.session_state.graph_watcher = None
 
 
 # ---------------------------------------------------------------------------
@@ -300,6 +303,9 @@ with st.sidebar:
             progress_bar.progress(100, text="✅ Graph ready")
             st.session_state.ingestion_report = report
             st.session_state.graph_ready = True
+            if st.session_state.graph_watcher:
+                st.session_state.graph_watcher.stop()
+            st.session_state.graph_watcher = start_watcher(st.session_state.original_path, get_db_graph())
             st.success(
                 f"✅ Sandbox [{manager.sandbox_id}]: "
                 f"{report.get('functions',0)} functions · "
@@ -325,11 +331,10 @@ with st.sidebar:
     st.markdown("### 🔧 Agent Mode")
     mode = st.radio(
         "Select pipeline",
-        options=["c", "b", "fair"],
+        options=["c", "b"],
         format_func=lambda x: {
             "c": "⚡ Mode C — Graph-Driven (6-Phase)",
             "b": "🔧 Mode B — Tool-Calling Agent",
-            "fair": "⚔️ Fair Fight — Graph vs. Blind",
         }[x],
         index=0,
         label_visibility="collapsed",
@@ -340,8 +345,6 @@ with st.sidebar:
         st.caption("Deterministic graph traversal → validated plan → auto-apply + test")
     elif mode == "b":
         st.caption("ReAct loop with graph tools (non-deterministic)")
-    elif mode == "fair":
-        st.caption(f"Graph-Driven ({LLM_MODEL}) vs. Blind ({BASELINE_LLM_MODEL})")
 
     st.divider()
 
