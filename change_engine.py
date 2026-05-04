@@ -861,9 +861,13 @@ class GraphDrivenEngine:
         try:
             parsed = json.loads(text)
             if isinstance(parsed, dict):
+                #Case A : {"items":[]} wrapper
                 for v in parsed.values():
                     if isinstance(v, list):
                         return v
+                #Case b : the dict itself IS a single plan item → wrap it
+                if "file" in parsed or "path" in parsed:
+                    return [parsed]
         except json.JSONDecodeError:
             pass
         logger.warning("Failed to extract JSON array. Cleaned text snippet: %s", text[:500])
