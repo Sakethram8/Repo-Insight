@@ -162,7 +162,24 @@ RULES:
 - Include 3+ lines of surrounding context for unique matching
 - One block per change region. Multiple blocks per file are fine.
 - Do NOT use line numbers. The system finds the text automatically.
-- Produce blocks for ALL files marked "modify" in the plan."""
+- Produce blocks for ALL files marked \"modify\" in the plan.
+- Do NOT write any explanation before or after the blocks. Output ONLY the FILE/SEARCH/REPLACE blocks.
+
+EXAMPLE (do not copy — use actual code from the source above):
+FILE: astropy/modeling/separable.py
+<<<<<<< SEARCH
+def _separable(transform):
+    if isinstance(transform, CompoundModel):
+        return _separable(transform.left) & _separable(transform.right)
+    return np.ones((transform.n_outputs, transform.n_inputs), dtype=np.int32)
+=======
+def _separable(transform):
+    if isinstance(transform, CompoundModel):
+        left = _separable(transform.left)
+        right = _separable(transform.right)
+        return _operators[transform.op](left, right)
+    return np.ones((transform.n_outputs, transform.n_inputs), dtype=np.int32)
+>>>>>>> REPLACE"""
 
 RETRY_PROMPT = """The changes you proposed failed testing. Here are the errors:
 
