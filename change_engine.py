@@ -787,28 +787,42 @@ class GraphDrivenEngine:
 
     def _extract_json_array(self, raw: str) -> list:
         """Parse a JSON array from text, tolerant of <think> blocks and markdown fences."""
+        import re, json
         # Strip Qwen3 <think>...</think> reasoning blocks
         text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-        # Strip markdown code fences
-        if text.startswith("```"):
-            lines = [l for l in text.splitlines() if not l.strip().startswith("```")]
-            text = "\n".join(lines).strip()
-        # Try direct parse
+        
+        # 1. Try to find JSON inside markdown fences
+        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(1))
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+
+        # 2. Try direct parse
         try:
             parsed = json.loads(text)
             if isinstance(parsed, list):
                 return parsed
         except json.JSONDecodeError:
             pass
-        # Try extracting first JSON array from text
-        match = re.search(r'\[.*\]', text, re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group())
-                if isinstance(parsed, list):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
+
+        # 3. Robust balanced array extraction (avoids greedy regex matching trailing garbage)
+        start_idx = text.find('[')
+        if start_idx != -1:
+            for end_idx in range(len(text), start_idx, -1):
+                if text[end_idx-1] == ']':
+                    try:
+                        parsed = json.loads(text[start_idx:end_idx])
+                        if isinstance(parsed, list):
+                            return parsed
+                    except json.JSONDecodeError:
+                        continue
+        
+        # 4. If all fails, log the raw text so we can debug
+        logger.warning("Failed to extract JSON array. Cleaned text snippet: %s", text[:500])
         return []
 
     def _parse_plan_json(self, raw: str) -> list[dict]:
