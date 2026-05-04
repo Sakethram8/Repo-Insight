@@ -481,7 +481,12 @@ class GraphDrivenEngine:
 
         # Extract planned files
         for item in plan_items:
+            if not isinstance(item, dict):
+                logger.warning("Skipping invalid plan item (not a dict): %s", item)
+                continue
             fp = item.get("file", "")
+            if not fp:
+                continue
             plan.planned_files.add(fp)
             plan.justifications[fp] = item.get("reason", "")
             plan.actions[fp] = item.get("action", "modify")
@@ -569,7 +574,12 @@ class GraphDrivenEngine:
             plan.justifications.clear()
             plan.actions.clear()
             for item in plan_items:
+                if not isinstance(item, dict):
+                    logger.warning("Skipping invalid force-coverage plan item (not a dict): %s", item)
+                    continue
                 fp = item.get("file", "")
+                if not fp:
+                    continue
                 plan.planned_files.add(fp)
                 plan.justifications[fp] = item.get("reason", "")
                 plan.actions[fp] = item.get("action", "modify")
