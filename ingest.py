@@ -213,7 +213,7 @@ def ingest_parsed_files(
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
     
     summaries: dict[str, str] = {}
-    BATCH_SIZE = 10
+    BATCH_SIZE = 50
     batches = []
     current_batch = []
     

@@ -331,6 +331,28 @@ class GraphDrivenEngine:
     # Phase 1: Seed Localization
     # ------------------------------------------------------------------
 
+    def _extract_json_array(self, raw: str) -> list:
+        import re, json
+        # Strip Qwen3 <think>...</think> blocks
+        text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        # Try direct parse
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        # Try extracting first JSON array from the text
+        match = re.search(r"\[.*\]", text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group())
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        return []
+
     def _localize_seeds(self, prompt: str) -> list[str]:
         """Use LLM + graph semantic search to identify entry points."""
         search_result = semantic_search(prompt, self.graph, top_k=10)
@@ -357,8 +379,8 @@ class GraphDrivenEngine:
             )
             raw = response.choices[0].message.content.strip()
             # Extract JSON array from response
-            seeds = json.loads(raw)
-            if isinstance(seeds, list):
+            seeds = self._extract_json_array(raw)
+            if seeds:
                 return [s for s in seeds if isinstance(s, str)]
         except Exception as e:
             logger.error("Seed localization LLM call failed: %s", e)

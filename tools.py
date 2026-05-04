@@ -175,7 +175,9 @@ def get_class_architecture(module_name: str, graph: falkordb.Graph, inherits_wei
 def get_source_code(fqn: str, graph: falkordb.Graph,
                     repo_root_override: str | None = None) -> dict:
     result = graph.query(
-        "MATCH (n:Function|Class) WHERE n.fqn = $fqn RETURN n.file_path, n.start_line, n.end_line LIMIT 1",
+        "MATCH (n:Function) WHERE n.fqn = $fqn RETURN n.file_path, n.start_line, n.end_line\n"
+        "UNION\n"
+        "MATCH (n:Class) WHERE n.fqn = $fqn RETURN n.file_path, n.start_line, n.end_line",
         {"fqn": fqn},
     )
     if len(result.result_set) == 0:
