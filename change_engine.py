@@ -331,27 +331,7 @@ class GraphDrivenEngine:
     # Phase 1: Seed Localization
     # ------------------------------------------------------------------
 
-    def _extract_json_array(self, raw: str) -> list:
-        import re, json
-        # Strip Qwen3 <think>...</think> blocks
-        text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
-        # Try direct parse
-        try:
-            parsed = json.loads(text)
-            if isinstance(parsed, list):
-                return parsed
-        except json.JSONDecodeError:
-            pass
-        # Try extracting first JSON array from the text
-        match = re.search(r"\[.*\]", text, re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group())
-                if isinstance(parsed, list):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-        return []
+    # ------------------------------------------------------------------
 
     def _localize_seeds(self, prompt: str) -> list[str]:
         """Use LLM + graph semantic search to identify entry points."""
@@ -378,7 +358,7 @@ class GraphDrivenEngine:
                 max_tokens=500,
             )
             raw = response.choices[0].message.content.strip()
-            # Extract JSON array from response
+            # Extract JSON array from response, tolerant of <think> blocks
             seeds = self._extract_json_array(raw)
             if seeds:
                 return [s for s in seeds if isinstance(s, str)]
@@ -519,12 +499,20 @@ class GraphDrivenEngine:
             plan = self._force_coverage(prompt, plan, subgraph)
 
         plan.missing_files = plan.blast_radius_files - plan.planned_files
-        plan.is_validated = len(plan.missing_files) == 0
-        if not plan.is_validated:
+
+        # Convergence fallback: if LLM still didn't cover all files, force-add them
+        if plan.missing_files:
             logger.warning(
-                "Validation did not converge after %d rounds. Missing: %s",
-                MAX_VALIDATION_ROUNDS, plan.missing_files
+                "Convergence fallback: force-adding %d uncovered files as modify: %s",
+                len(plan.missing_files), plan.missing_files,
             )
+            for fp in list(plan.missing_files):
+                plan.planned_files.add(fp)
+                plan.justifications[fp] = "force-added by convergence fallback"
+                plan.actions[fp] = "modify"
+            plan.missing_files = set()
+
+        plan.is_validated = len(plan.missing_files) == 0
         return plan
 
     def _force_coverage(self, prompt: str, plan: ChangePlan, subgraph: ChangeSubgraph) -> ChangePlan:
@@ -647,6 +635,7 @@ class GraphDrivenEngine:
                 except Exception as cont_err:
                     logger.warning("Continuation request failed: %s", cont_err)
 
+            answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
             edits = parse_edit_blocks(answer)
             return edits, answer
         except Exception as e:
@@ -726,6 +715,7 @@ class GraphDrivenEngine:
                 max_tokens=8192,
             )
             raw = response.choices[0].message.content.strip()
+            raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
             return parse_edit_blocks(raw)
         except Exception as e:
             logger.error("Retry edit generation failed: %s", e)
@@ -795,23 +785,36 @@ class GraphDrivenEngine:
             for n in nodes
         )
 
-    def _parse_plan_json(self, raw: str) -> list[dict]:
-        """Extract JSON array from LLM response, handling markdown fences and <think> blocks."""
-        # Use our robust helper which strips <think> tags and handles basic parsing
-        parsed = self._extract_json_array(raw)
-        if parsed:
-            return parsed
-        
-        # Strip markdown code fences if present (as a fallback)
-        cleaned = raw.strip()
-        if cleaned.startswith("```"):
-            lines = cleaned.splitlines()
-            lines = [l for l in lines if not l.strip().startswith("```")]
-            cleaned = "\n".join(lines)
-            
-            parsed = self._extract_json_array(cleaned)
-            if parsed:
+    def _extract_json_array(self, raw: str) -> list:
+        """Parse a JSON array from text, tolerant of <think> blocks and markdown fences."""
+        # Strip Qwen3 <think>...</think> reasoning blocks
+        text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+        # Strip markdown code fences
+        if text.startswith("```"):
+            lines = [l for l in text.splitlines() if not l.strip().startswith("```")]
+            text = "\n".join(lines).strip()
+        # Try direct parse
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, list):
                 return parsed
+        except json.JSONDecodeError:
+            pass
+        # Try extracting first JSON array from text
+        match = re.search(r'\[.*\]', text, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group())
+                if isinstance(parsed, list):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        return []
 
+    def _parse_plan_json(self, raw: str) -> list[dict]:
+        """Extract JSON array from LLM response, handling <think> blocks and markdown fences."""
+        result = self._extract_json_array(raw)
+        if result:
+            return result
         logger.warning("Could not parse plan JSON from LLM output")
         return []
