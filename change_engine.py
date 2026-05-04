@@ -786,14 +786,13 @@ class GraphDrivenEngine:
         )
 
     def _extract_json_array(self, raw: str) -> list:
-        """Parse a JSON array from text, tolerant of <think> blocks and markdown fences."""
+        """Parse a JSON array from text, tolerant of reasoning blocks and markdown fences."""
         import re, json
-        # Strip Qwen3 <think>...</think> reasoning blocks
+        # Strip Qwen3 <think>...</think> reasoning blocks if present
         text = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
         
-        # 1. Try to find JSON inside markdown fences
-        match = re.search(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL)
-        if match:
+        # 1. Try to find JSON inside ALL markdown fences
+        for match in re.finditer(r"```(?:json)?\s*(.*?)\s*```", text, re.DOTALL):
             try:
                 parsed = json.loads(match.group(1))
                 if isinstance(parsed, list):
@@ -809,13 +808,15 @@ class GraphDrivenEngine:
         except json.JSONDecodeError:
             pass
 
-        # 3. Robust balanced array extraction (avoids greedy regex matching trailing garbage)
-        start_idx = text.find('[')
-        if start_idx != -1:
-            for end_idx in range(len(text), start_idx, -1):
-                if text[end_idx-1] == ']':
+        # 3. Robust balanced array extraction (try all [ and ] combinations)
+        start_indices = [i for i, c in enumerate(text) if c == '[']
+        end_indices = [i for i, c in enumerate(text) if c == ']']
+        
+        for start_idx in start_indices:
+            for end_idx in reversed(end_indices):
+                if end_idx > start_idx:
                     try:
-                        parsed = json.loads(text[start_idx:end_idx])
+                        parsed = json.loads(text[start_idx:end_idx+1])
                         if isinstance(parsed, list):
                             return parsed
                     except json.JSONDecodeError:
