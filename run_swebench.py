@@ -210,7 +210,7 @@ def _run_instance(
             debug_path = debug_dir / f"{instance_id}.json"
             try:
                 import json as _json
-                with open(debug_path, "w", "encoding='utf-8") as _f:
+                with open(debug_path, "w", encoding="utf-8") as _f:
                     _json.dump({
                         "instance_id": instance_id,
                         "repo": repo,
