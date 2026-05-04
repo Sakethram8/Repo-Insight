@@ -469,7 +469,7 @@ class GraphDrivenEngine:
                         source_code_section=source_section,
                     ),
                 }],
-                max_tokens=2000,
+                max_tokens=8192,
             )
             raw = response.choices[0].message.content.strip()
             plan.raw_plan = raw
@@ -560,7 +560,7 @@ class GraphDrivenEngine:
                         missing_source=missing_src_text,
                     )},
                 ],
-                max_tokens=2000,
+                max_tokens=8192,
             )
             raw = response.choices[0].message.content.strip()
             plan_items = self._parse_plan_json(raw)
