@@ -115,7 +115,7 @@ def generate_summaries_batch(batch: list[tuple[str, str]]) -> dict[str, str]:
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=2000,
+            max_tokens=8192,
             temperature=0,
             response_format={"type": "json_object"},
         )
