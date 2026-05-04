@@ -94,7 +94,7 @@ Candidate entities from semantic search:
 
 Return a JSON array of the FQNs (fully qualified names) that are the PRIMARY targets. Only include nodes that directly need to be modified — not their dependents (we will find those automatically via graph traversal).
 
-Return ONLY the JSON array, nothing else. Example: ["parser.FunctionDef", "parser.parse_file"]"""
+Return ONLY the JSON array. Your entire response must start with [ and end with ]. No explanation, no prose, no markdown. Example: ["parser.FunctionDef", "parser.parse_file"]"""
 
 PLANNING_PROMPT = """You are a structural code change planner. You MUST plan changes that cover ALL affected files.
 
@@ -120,7 +120,7 @@ The following functions/classes are structurally connected to the change target:
 3. If a file needs no changes, set action to "no_change" and explain WHY.
 4. You MUST address every file in the blast radius. Missing files will be flagged.
 
-Return ONLY the JSON array."""
+Return ONLY the JSON array. Your entire response must start with [ and end with ]. No prose, no markdown fences, no explanation outside the array."""
 
 VALIDATION_PROMPT = """The dependency graph shows these files also depend on the code you're changing, but your plan didn't address them:
 
@@ -335,7 +335,7 @@ class GraphDrivenEngine:
 
     def _localize_seeds(self, prompt: str) -> list[str]:
         """Use LLM + graph semantic search to identify entry points."""
-        search_result = semantic_search(prompt, self.graph, top_k=10)
+        search_result = semantic_search(prompt, self.graph, top_k=20)
         candidates = search_result.get("results", [])
 
         if not candidates:
@@ -356,6 +356,7 @@ class GraphDrivenEngine:
                     ),
                 }],
                 max_tokens=500,
+                response_format={"type": "json_object"},
             )
             raw = response.choices[0].message.content.strip()
             # Extract JSON array from response, tolerant of <think> blocks
@@ -470,10 +471,15 @@ class GraphDrivenEngine:
                     ),
                 }],
                 max_tokens=8192,
+                response_format={"type": "json_object"},
             )
             raw = response.choices[0].message.content.strip()
             plan.raw_plan = raw
             plan_items = self._parse_plan_json(raw)
+            #If parsing produced nothing, return immediately
+            if not plan_items:
+                logger.warning("Phase 3: _parse_plan_json returned empty -auto-planning all blast-radius files")
+                plan_items = [{"file": f, "action": "modify", "reason" : "auto-fallback : JSON parse failed"} for f in plan.blast_radius_files]
         except Exception as e:
             logger.error("Planning LLM call failed: %s", e)
             # Fallback: plan all affected files for modification
@@ -484,12 +490,13 @@ class GraphDrivenEngine:
             if not isinstance(item, dict):
                 logger.warning("Skipping invalid plan item (not a dict): %s", item)
                 continue
-            fp = item.get("file", "")
+            fp = item.get("file", "") or item.get("path", "") or item.get("filename", "")
+            action=item.get("action", "") or item.get("type", "modify")
             if not fp:
                 continue
             plan.planned_files.add(fp)
             plan.justifications[fp] = item.get("reason", "")
-            plan.actions[fp] = item.get("action", "modify")
+            plan.actions[fp] = action
 
         # VALIDATION GATE: retry loop up to MAX_VALIDATION_ROUNDS
         MAX_VALIDATION_ROUNDS = 3
@@ -566,6 +573,7 @@ class GraphDrivenEngine:
                     )},
                 ],
                 max_tokens=8192,
+                response_format={"type": "json_object"},
             )
             raw = response.choices[0].message.content.strip()
             plan_items = self._parse_plan_json(raw)
@@ -833,12 +841,23 @@ class GraphDrivenEngine:
                         continue
         
         # 4. If all fails, log the raw text so we can debug
+        try:
+            parsed = json.loads(text)
+            if isinstance(parsed, dict):
+                for v in parsed.values():
+                    if isinstance(v, list):
+                        return v
+        except json.JSONDecodeError:
+            pass
         logger.warning("Failed to extract JSON array. Cleaned text snippet: %s", text[:500])
         return []
 
     def _parse_plan_json(self, raw: str) -> list[dict]:
         """Extract JSON array from LLM response, handling <think> blocks and markdown fences."""
         result = self._extract_json_array(raw)
+        # Unwrap [[{...}]] → [{...}] if the LLM double-wrapped the array
+        if result and isinstance(result[0], list):
+            result = result[0]
         if result:
             return result
         logger.warning("Could not parse plan JSON from LLM output")

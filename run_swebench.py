@@ -205,6 +205,29 @@ def _run_instance(
         if change_result.error:
             logger.warning("[%s] Pipeline error: %s", instance_id, change_result.error)
             result["error"] = change_result.error
+            debug_dir = output_dir / "debug"
+            debug_dir.mkdir(exist_ok=True)
+            debug_path = debug_dir / f"{instance_id}.json"
+            try:
+                import json as _json
+                with open(debug_path, "w", "encoding='utf-8") as _f:
+                    _json.dump({
+                        "instance_id": instance_id,
+                        "repo": repo,
+                        "seeds": change_result.seeds,
+                        "phases_completed": change_result.phases_completed,
+                        "plan_raw": change_result.plan.raw_plan if change_result.plan else None,
+                        "planned_files":list(change_result.plan.planned_files) if change_result.plan else [],
+                        "missing_files": list(change_result.plan.missing_files) if change_result.plan else [],
+                        "edit_count": len(change_result.edits),
+                        "answer": change_result.answer[:3000] if change_result.answer else None,
+                        "error": change_result.error,
+                        "timings": change_result.timings,
+                    }, _f, indent = 2, default=str)
+                logger.info("[%s] Debug info written to %s", instance_id, debug_path)
+            except Exception as _de:
+                logger.error("[%s] Failed to write debug info: %s", instance_id, _de)
+
 
         # -- Capture diff --
         diff = _capture_diff(repo_dir)
