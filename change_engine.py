@@ -796,28 +796,22 @@ class GraphDrivenEngine:
         )
 
     def _parse_plan_json(self, raw: str) -> list[dict]:
-        """Extract JSON array from LLM response, handling markdown fences."""
-        # Strip markdown code fences if present
+        """Extract JSON array from LLM response, handling markdown fences and <think> blocks."""
+        # Use our robust helper which strips <think> tags and handles basic parsing
+        parsed = self._extract_json_array(raw)
+        if parsed:
+            return parsed
+        
+        # Strip markdown code fences if present (as a fallback)
         cleaned = raw.strip()
         if cleaned.startswith("```"):
             lines = cleaned.splitlines()
             lines = [l for l in lines if not l.strip().startswith("```")]
             cleaned = "\n".join(lines)
-
-        try:
-            parsed = json.loads(cleaned)
-            if isinstance(parsed, list):
+            
+            parsed = self._extract_json_array(cleaned)
+            if parsed:
                 return parsed
-        except json.JSONDecodeError:
-            pass
-
-        # Try to find JSON array in the text
-        match = re.search(r'\[.*\]', cleaned, re.DOTALL)
-        if match:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                pass
 
         logger.warning("Could not parse plan JSON from LLM output")
         return []
