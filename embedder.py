@@ -23,7 +23,7 @@ def _get_model() -> SentenceTransformer:
         if torch.cuda.is_available():
             free_vram = torch.cuda.mem_get_info()[0] / 1e9
             device = "cuda" if free_vram > 2.0 else "cpu"
-            logger,info("Free VRAM: %.1fGB-using device: %s (ROCm), free_vram, device")
+            logger.info("Free VRAM: %.1fGB-using device: %s (ROCm), free_vram, device")
         else:
             device="cpu"
             logger.warning("ROCm/CUDA not available, using CPU for embeddings (slower)")
