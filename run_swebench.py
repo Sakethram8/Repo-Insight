@@ -185,6 +185,16 @@ def _run_instance(
 
         # -- Run pipeline --
         logger.info("[%s] Running 6-phase pipeline", instance_id)
+
+        #Hard-delete and recreate the graph to prevent key corruption cascade
+        import redis as _redis 
+        try:
+            _r= _redis.Redis(host="localhost", port=6379)
+            _r.execute_command("GRAPH.DELETE","repo_insight")
+            logger.info("[%s] FalkorDB graph deleted cleanly", instance_id)
+        except Exception as _e:
+            logger.warning("[%s] GRAPH.DELETE failed (may not exist yet): %s",instance_id,_e)
+
         graph = get_connection()
 
         # Flush stale nodes from previous instance to prevent cross-contamination

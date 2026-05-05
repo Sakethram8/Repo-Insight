@@ -9,6 +9,7 @@ from sentence_transformers import SentenceTransformer
 from config import EMBEDDING_MODEL
 import json
 import numpy as np
+import torch
 
 logger = logging.getLogger(__name__)
 
@@ -19,6 +20,13 @@ def _get_model() -> SentenceTransformer:
     """Lazy-load the embedding model exactly once per process."""
     global _model
     if _model is None:
+        if torch.cuda.is_available():
+            free_vram = torch.cuda.mem_get_info()[0] / 1e9
+            device = "cuda" if free_vram > 2.0 else "cpu"
+            logger,info("Free VRAM: %.1fGB-using device: %s (ROCm), free_vram, device")
+        else:
+            device="cpu"
+            logger.warning("ROCm/CUDA not available, using CPU for embeddings (slower)")
         _model = SentenceTransformer(EMBEDDING_MODEL)
     return _model
 

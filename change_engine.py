@@ -257,6 +257,14 @@ class GraphDrivenEngine:
                 "files_affected": len(result.subgraph.all_affected_files),
                 "source_files_loaded": len(result.subgraph.source_code),
             })
+            # Guard: if Phase 2 found nothing, the seeds are wrong — fail fast
+            if not result.subgraph.all_affected_files and not result.subgraph.source_code:
+                result.error = (
+                    f"Phase 2 found zero affected files for seeds: {result.seeds}. "
+                    "Semantic search likely returned wrong entry points. Aborting."
+                )
+                logger.error("[Phase 2 Guard] %s", result.error)
+                return result
 
             # Phase 3: Graph-Constrained Planning
             t3 = time.time()
@@ -268,6 +276,14 @@ class GraphDrivenEngine:
                 "missing_files": len(result.plan.missing_files),
                 "is_validated": result.plan.is_validated,
             })
+            # Guard: if plan is empty, don't waste time on Phase 4
+            if not result.plan.planned_files:
+                result.error = (
+                    "Phase 3 returned an empty plan (no files to modify). "
+                    "LLM likely returned {} or unparseable JSON. Aborting."
+                )
+                logger.error("[Phase 3 Guard] %s", result.error)
+                return result
 
             # Phase 4: Surgical Editing
             t4 = time.time()
@@ -352,7 +368,7 @@ class GraphDrivenEngine:
 
     def _localize_seeds(self, prompt: str) -> list[str]:
         """Use LLM + graph semantic search to identify entry points."""
-        search_result = semantic_search(prompt, self.graph, top_k=20)
+        search_result = semantic_search(prompt, self.graph, top_k=40)
         candidates = search_result.get("results", [])
 
         if not candidates:
@@ -366,12 +382,23 @@ class GraphDrivenEngine:
         try:
             response = self.client.chat.completions.create(
                 model=LLM_MODEL,
-                messages=[{
-                    "role": "user",
-                    "content": LOCALIZATION_PROMPT.format(
-                        prompt=prompt, candidates=candidates_text,
-                    ),
-                }],
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a code analysis expert. When a bug report mentions a crash "
+                            "with a traceback, always prefer seed nodes from the TRACEBACK FILE PATHS "
+                            "over test framework classes. The traceback shows where the bug IS, "
+                            "not where it was triggered from."
+                        )
+                    },
+                    {
+                        "role": "user",
+                        "content": LOCALIZATION_PROMPT.format(
+                            prompt=prompt, candidates=candidates_text,
+                        ),
+                    }
+                ],
                 max_tokens=500,
                 response_format={"type": "json_object"},
             )
