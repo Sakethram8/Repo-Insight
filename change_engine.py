@@ -34,6 +34,8 @@ from apply_changes import (
 )
 
 logger = logging.getLogger(__name__)
+#DISABLES THINKING
+_NO_THINK = {"chat_template_kwargs":{"enable_thinking":False}}
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -164,6 +166,7 @@ RULES:
 - Do NOT use line numbers. The system finds the text automatically.
 - Produce blocks for ALL files marked \"modify\" in the plan.
 - Do NOT write any explanation before or after the blocks. Output ONLY the FILE/SEARCH/REPLACE blocks.
+- Do NOT wrap blocks in markdown code fences (no ```python or ``` around them).
 
 EXAMPLE (do not copy — use actual code from the source above):
 FILE: astropy/modeling/separable.py
@@ -399,8 +402,9 @@ class GraphDrivenEngine:
                         ),
                     }
                 ],
-                max_tokens=500,
+                max_tokens=1024,
                 response_format={"type": "json_object"},
+                extra_body= _NO_THINK,
             )
             raw = response.choices[0].message.content.strip()
             # Extract JSON array from response, tolerant of <think> blocks
@@ -516,6 +520,7 @@ class GraphDrivenEngine:
                 }],
                 max_tokens=8192,
                 response_format={"type": "json_object"},
+                extra_body=_NO_THINK,
             )
             raw = response.choices[0].message.content.strip()
             plan.raw_plan = raw
@@ -618,6 +623,7 @@ class GraphDrivenEngine:
                 ],
                 max_tokens=8192,
                 response_format={"type": "json_object"},
+                extra_body=_NO_THINK,
             )
             raw = response.choices[0].message.content.strip()
             plan_items = self._parse_plan_json(raw)
@@ -671,6 +677,7 @@ class GraphDrivenEngine:
                     ),
                 }],
                 max_tokens=8192,
+                extra_body=_NO_THINK,
             )
             answer = response.choices[0].message.content.strip()
             
@@ -692,12 +699,14 @@ class GraphDrivenEngine:
                              "where you left off. Do not repeat blocks already written."},
                         ],
                         max_tokens=4096,
+                        extra_body=_NO_THINK,
                     )
                     answer += "\n" + continuation.choices[0].message.content.strip()
                 except Exception as cont_err:
                     logger.warning("Continuation request failed: %s", cont_err)
 
             answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+            answer = re.sub(r"```[a-zA-Z]*\n(.*?)```", r"\1", answer, flags=re.DOTALL).strip()
             edits = parse_edit_blocks(answer)
             return edits, answer
         except Exception as e:
@@ -775,9 +784,11 @@ class GraphDrivenEngine:
                     ),
                 }],
                 max_tokens=8192,
+                extra_body=_NO_THINK,
             )
             raw = response.choices[0].message.content.strip()
             raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
+            raw = re.sub(r"```[a-zA-Z]*\n(.*?)```", r"\1", raw, flags=re.DOTALL).strip()
             return parse_edit_blocks(raw)
         except Exception as e:
             logger.error("Retry edit generation failed: %s", e)
