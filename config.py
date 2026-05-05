@@ -22,14 +22,14 @@ EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")   # Sentence-
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))                # Output dimension for all-MiniLM-L6-v2
 
 IMPACT_RADIUS_MAX_DEPTH = int(os.getenv("IMPACT_RADIUS_MAX_DEPTH", "3"))
-BLAST_RADIUS_MAX_DEPTH = int(os.getenv("BLAST_RADIUS_MAX_DEPTH", "4"))
+BLAST_RADIUS_MAX_DEPTH = int(os.getenv("BLAST_RADIUS_MAX_DEPTH", "3"))
 IMPACT_RADIUS_WARN_THRESHOLD = int(os.getenv("IMPACT_RADIUS_WARN_THRESHOLD", "5"))
 AGENT_MAX_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", "10"))
 AGENT_TOOL_TIMEOUT_SECONDS = int(os.getenv("AGENT_TOOL_TIMEOUT_SECONDS", "30"))
 
 FLUSH_GRAPH_ON_INGEST = os.getenv("FLUSH_GRAPH_ON_INGEST", "false").lower() in ("true", "1", "yes")
 
-INGEST_CONCURRENCY = int(os.getenv("INGEST_CONCURRENCY", "50"))   # Max LLM threads for Node Summarization
+INGEST_CONCURRENCY = int(os.getenv("INGEST_CONCURRENCY", "8"))   # Max LLM threads for Node Summarization
 
 SKIP_DIRS = ["__pycache__", ".git", ".venv", "venv", "node_modules", "dist", "build"]
 TEST_COMMAND = os.getenv("TEST_COMMAND", "pytest tests/ -v --tb=short -q -m 'not integration'")
