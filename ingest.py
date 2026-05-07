@@ -184,9 +184,10 @@ def ingest_parsed_files(
         })
 
     for mod_name in import_modules:
-        if mod_name not in file_modules:
+        if mod_name and mod_name not in file_modules:
             module_nodes.append({"name": mod_name, "file_path": "", "embedding": None})
-            
+
+    module_nodes=[n for n in module_nodes if n.get("name")]        
     if module_nodes:
         graph.query(
             """UNWIND $nodes AS n
@@ -402,7 +403,7 @@ def ingest_parsed_files(
                 "tgt_name": imp.module,
                 "alias": imp.alias or "",
             })
-            
+    import_edges = [e for e in import_edges if e.get("src_name") and e.get("tgt_name") and e["tgt_name"] != "."]       
     if import_edges:
         graph.query(
             """UNWIND $edges AS e
