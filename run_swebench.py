@@ -32,6 +32,7 @@ from datasets import load_dataset
 from change_engine import GraphDrivenEngine, ChangeResult
 from ingest import get_connection
 from apply_changes import parse_edit_blocks, apply_edits
+import signal
 
 logger = logging.getLogger("swebench_harness")
 
@@ -80,7 +81,16 @@ def _setup_logging(log_dir: Path) -> logging.FileHandler:
     logger.info("Logging to %s", log_path)
     return fh
 
-
+def _hard_timeout(fn, seconds, *args, **kwargs):
+    """Kill the function with SIGALRM after `seconds`. Linux/macOS only."""
+    def _bail(signum, frame):
+        raise TimeoutError(f"Killed after {seconds}s")
+    signal.signal(signal.SIGALRM, _bail)
+    signal.alarm(seconds)
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        signal.alarm(0)
 def _clone_repo(repo: str, commit: str, dest: Path) -> None:
     """Shallow-clone a GitHub repo and check out a specific commit.
 
@@ -172,6 +182,18 @@ def _run_instance(
         repo_dir = tmp_root / "repo"
         logger.info("[%s] Cloning %s @ %s", instance_id, repo, base_commit[:10])
         _clone_repo(repo, base_commit, repo_dir)
+        # Skip repos that are too large — prevents 10,000s timeouts on astropy-scale repos
+        py_files = [
+            f for f in repo_dir.rglob("*.py")
+            if not any(p in {"tests", "test", "docs", "build", "__pycache__"}
+                    for p in f.parts)
+        ]
+        if len(py_files) > 600:
+            result["status"] = "skipped"
+            result["error"] = f"Repo too large: {len(py_files)} .py files (limit 600)"
+            logger.warning("[%s] Skipping — %d .py files exceeds size limit", instance_id, len(py_files))
+            return result
+
 
         # -- Run pipeline --
         logger.info("[%s] Running 6-phase pipeline", instance_id)
@@ -346,7 +368,22 @@ def main():
             "━━━ [%d/%d] %s ━━━",
             i, len(dataset), iid,
         )
-        result = _run_instance(instance, output_dir, args.skip_existing)
+        try:
+            result = _hard_timeout(
+                _run_instance, INSTANCE_TIMEOUT,
+                instance, output_dir, args.skip_existing
+            )
+        except TimeoutError:
+            logger.error("[%s] Hard wall-clock timeout after %ds", iid, INSTANCE_TIMEOUT)
+            result = {
+                "instance_id": iid,
+                "repo": instance["repo"],
+                "status": "timeout",
+                "patch_file": None,
+                "phases_completed": [],
+                "timing_s": float(INSTANCE_TIMEOUT),
+                "error": f"Timeout after {INSTANCE_TIMEOUT}s",
+            }
         results.append(result)
 
     # -- Summary --

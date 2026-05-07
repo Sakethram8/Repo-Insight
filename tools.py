@@ -76,7 +76,7 @@ def get_downstream_deps(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT
     cypher = (
         f"MATCH p = (src:Function {{fqn: $fqn}})-[:CALLS*1..{max_depth}]->(impacted:Function) "
         f"RETURN DISTINCT impacted.fqn, impacted.file_path, length(p) "
-        f"ORDER BY length(p) ASC LIMIT 50"
+        f"ORDER BY length(p) ASC"
     )
     result = graph.query(cypher, {"fqn": fqn})
     impacted = [{"fqn": r[0], "file_path": r[1], "distance": r[2]} for r in result.result_set]
@@ -95,7 +95,7 @@ def get_upstream_callers(fqn: str, graph: falkordb.Graph, max_depth: int = BLAST
     cypher = (
         f"MATCH p = (affected:Function)-[:CALLS*1..{max_depth}]->(target:Function {{fqn: $fqn}}) "
         f"RETURN DISTINCT affected.fqn, affected.file_path, length(p) "
-        f"ORDER BY length(p) ASC LIMIT 50"
+        f"ORDER BY length(p) ASC"
     )
     result = graph.query(cypher, {"fqn": fqn})
     affected = [{"fqn": r[0], "file_path": r[1], "distance": r[2]} for r in result.result_set]

@@ -194,7 +194,31 @@ The original source code of affected files:
 Please produce corrected SEARCH/REPLACE blocks that fix these errors.
 Use the same FILE: ... <<<<<<< SEARCH ... ======= ... >>>>>>> REPLACE format."""
 
+#Helper
+def _clean_seed(seed: str) -> str | None:
+    """
+    Validate and clean a seed FQN from Phase 1.
+    Rejects raw traceback lines and exception messages.
+    Extracts the function name if a traceback is detected.
+    """
+    if not seed or not isinstance(seed, str):
+        return None
 
+    # Detect traceback format: 'File "path.py", line N, in func_name'
+    traceback_match = re.search(r'\bin (\w+)\s*$', seed.split('\n')[0])
+    if 'File "' in seed and traceback_match:
+        # Extract just the function name — return it for re-resolution
+        return traceback_match.group(1)
+
+    # Reject multi-line strings (raw exceptions, stack traces)
+    if '\n' in seed:
+        return None
+
+    # Reject exception message patterns
+    if any(kw in seed for kw in ['raise ', 'Error:', 'Exception:', 'Traceback']):
+        return None
+
+    return seed
 # ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
@@ -410,7 +434,12 @@ class GraphDrivenEngine:
             # Extract JSON array from response, tolerant of <think> blocks
             seeds = self._extract_json_array(raw)
             if seeds:
-                return [s for s in seeds if isinstance(s, str)]
+                raw_seeds = [s for s in seeds if isinstance(s,str)]
+                #Clean each seed -reject tracebacks, extract function names
+                cleaned = [_clean_seed(s) for s in raw_seeds]
+                cleaned = [s for s in cleaned if s]
+                if cleaned:
+                    return cleaned
         except Exception as e:
             logger.error("Seed localization LLM call failed: %s", e)
 

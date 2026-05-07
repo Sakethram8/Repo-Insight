@@ -19,6 +19,17 @@ from config import (FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
 from parser import ParsedFile, parse_file, SKIP_DIRS
 from embedder import embed_text, embed_texts, build_embedding_text
 
+# Directories to skip during ingestion — no useful code here
+SKIP_DIRS = {
+    "tests", "test", "testing",
+    "build", "dist",
+    "__pycache__",
+    ".git", ".tox",
+    "benchmarks", "examples",
+    "migrations",          # Django migrations are auto-generated
+    "node_modules",
+}
+
 logger = logging.getLogger(__name__)
 _NO_THINK = {"chat_template_kwargs":{"enable_thinking":False}}
 
@@ -216,7 +227,7 @@ def ingest_parsed_files(
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
     
     summaries: dict[str, str] = {}
-    BATCH_SIZE = 50
+    BATCH_SIZE = 15
     batches = []
     current_batch = []
     
@@ -459,31 +470,60 @@ def ingest_parsed_files(
         )
 
     # Step 7: Jedi precision pass — upgrade call edges with precise FQN resolution
+    # jedi_upgraded = 0
+    # jedi_total = 0
+    # for pf in parsed_files:
+    #     if not pf.file_path.endswith(".py"):
+    #         continue
+    #     precise_edges = resolve_calls_with_jedi(pf, repo_root)
+    #     jedi_total += len(precise_edges)
+    #     jedi_edges = [
+    #         e for e in precise_edges if e["resolution"] == "jedi"
+    #     ]
+    #     jedi_upgraded += len(jedi_edges)
+    #     if jedi_edges:
+    #         graph.query(
+    #             """UNWIND $edges AS e
+    #                MATCH (caller:Function {fqn: e.caller_fqn})
+    #                MATCH (callee:Function {fqn: e.callee_fqn})
+    #                MERGE (caller)-[c:CALLS]->(callee)
+    #                SET c.line = e.line, c.file_path = e.file_path, c.resolution = 'jedi'""",
+    #             {"edges": jedi_edges},
+    #         )
+    # if jedi_total > 0:
+    #     logger.info(
+    #         "Jedi precision pass: %d/%d call edges upgraded to precise FQN resolution",
+    #         jedi_upgraded, jedi_total,
+    #     )
+    # Step 7: Jedi precision pass — parallelized across files
     jedi_upgraded = 0
     jedi_total = 0
-    for pf in parsed_files:
+
+    def _resolve_one_file(pf):
         if not pf.file_path.endswith(".py"):
-            continue
-        precise_edges = resolve_calls_with_jedi(pf, repo_root)
-        jedi_total += len(precise_edges)
-        jedi_edges = [
-            e for e in precise_edges if e["resolution"] == "jedi"
-        ]
-        jedi_upgraded += len(jedi_edges)
-        if jedi_edges:
-            graph.query(
-                """UNWIND $edges AS e
-                   MATCH (caller:Function {fqn: e.caller_fqn})
-                   MATCH (callee:Function {fqn: e.callee_fqn})
-                   MERGE (caller)-[c:CALLS]->(callee)
-                   SET c.line = e.line, c.file_path = e.file_path, c.resolution = 'jedi'""",
-                {"edges": jedi_edges},
-            )
-    if jedi_total > 0:
-        logger.info(
-            "Jedi precision pass: %d/%d call edges upgraded to precise FQN resolution",
-            jedi_upgraded, jedi_total,
-        )
+            return []
+        try:
+            return resolve_calls_with_jedi(pf, repo_root)
+        except Exception as e:
+            logger.warning("Jedi failed for %s: %s", pf.file_path, e)
+            return []
+
+    with ThreadPoolExecutor(max_workers=8) as jedi_pool:
+        futures = [jedi_pool.submit(_resolve_one_file, pf) for pf in parsed_files]
+        for future in as_completed(futures):
+            precise_edges = future.result()
+            jedi_total += len(precise_edges)
+            jedi_edges = [e for e in precise_edges if e["resolution"] == "jedi"]
+            jedi_upgraded += len(jedi_edges)
+            if jedi_edges:
+                graph.query(
+                    """UNWIND $edges AS e
+                    MATCH (caller:Function {fqn: e.caller_fqn})
+                    MATCH (callee:Function {fqn: e.callee_fqn})
+                    MERGE (caller)-[c:CALLS]->(callee)
+                    SET c.line = e.line, c.file_path = e.file_path, c.resolution = 'jedi'""",
+                    {"edges": jedi_edges},
+                )
 
 
 def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
@@ -553,6 +593,18 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
             "UNWIND $fps AS fp MATCH (s:FileState {file_path: fp}) DELETE s",
             {"fps": files_to_delete},
         )
+    # Remove call edges pointing to functions whose files no longer exist in the graph
+    try:
+        graph.query("""
+            MATCH (a:Function)-[r:CALLS]->(b:Function)
+            WHERE NOT EXISTS {
+                MATCH (fs:FileState {file_path: b.file_path})
+            }
+            DELETE r
+        """)
+        logger.debug("Orphan edge pruning complete")
+    except Exception as e:
+        logger.warning("Orphan edge pruning failed (non-fatal): %s", e)
 
     if on_progress:
         on_progress("Scanning", 0, len(files_to_parse), f"{len(files_to_parse)} files found")
