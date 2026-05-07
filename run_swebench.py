@@ -30,7 +30,7 @@ from typing import Optional
 from datasets import load_dataset
 
 from change_engine import GraphDrivenEngine, ChangeResult
-from ingest import run_ingestion, get_connection
+from ingest import get_connection
 from apply_changes import parse_edit_blocks, apply_edits
 
 logger = logging.getLogger("swebench_harness")
@@ -173,16 +173,6 @@ def _run_instance(
         logger.info("[%s] Cloning %s @ %s", instance_id, repo, base_commit[:10])
         _clone_repo(repo, base_commit, repo_dir)
 
-        # -- Ingest --
-        logger.info("[%s] Ingesting codebase into FalkorDB", instance_id)
-        ingestion_report = run_ingestion(str(repo_dir))
-        logger.info(
-            "[%s] Ingestion complete: %s",
-            instance_id,
-            json.dumps({k: v for k, v in ingestion_report.items()
-                        if isinstance(v, (int, float, str))}, default=str),
-        )
-
         # -- Run pipeline --
         logger.info("[%s] Running 6-phase pipeline", instance_id)
 
@@ -198,16 +188,13 @@ def _run_instance(
         graph = get_connection()
 
         # Flush stale nodes from previous instance to prevent cross-contamination
-        try:
-            graph.query("MATCH (n) DETACH DELETE n")
-        except Exception:
-            pass
+        
 
         engine = GraphDrivenEngine(repo_root=repo_dir, graph=graph)
 
         change_result: ChangeResult = engine.run(
             user_prompt=problem,
-            skip_apply=False,
+            skip_apply=True,
         )
 
         result["phases_completed"] = change_result.phases_completed
