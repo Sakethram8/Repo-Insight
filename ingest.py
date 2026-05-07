@@ -20,6 +20,7 @@ from parser import ParsedFile, parse_file, SKIP_DIRS
 from embedder import embed_text, embed_texts, build_embedding_text
 
 logger = logging.getLogger(__name__)
+_NO_THINK = {"chat_template_kwargs":{"enable_thinking":False}}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -118,6 +119,7 @@ def generate_summaries_batch(batch: list[tuple[str, str]]) -> dict[str, str]:
             max_tokens=8192,
             temperature=0,
             response_format={"type": "json_object"},
+            extra_body=_NO_THINK
         )
         content = response.choices[0].message.content
 
@@ -187,7 +189,7 @@ def ingest_parsed_files(
         if mod_name and mod_name not in file_modules:
             module_nodes.append({"name": mod_name, "file_path": "", "embedding": None})
 
-    module_nodes=[n for n in module_nodes if n.get("name")]        
+    module_nodes=[n for n in module_nodes if n.get("name") and n["name"].strip() not in ("",".")]        
     if module_nodes:
         graph.query(
             """UNWIND $nodes AS n
