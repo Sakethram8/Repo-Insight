@@ -172,7 +172,10 @@ def extract_source_code(file_path: Path, start_line: int, end_line: int) -> str:
 # ---------------------------------------------------------------------------
 # Core ingestion
 # ---------------------------------------------------------------------------
-
+def _bulk_write(graph: falkordb.Graph, query: str, nodes: list[dict], chunk_size: int = 500) -> None:
+    """Write nodes in chunks to avoid FalkorDB timeouts on large UNWIND."""
+    for i in range(0, len(nodes), chunk_size):
+        graph.query(query, {"nodes": nodes[i:i + chunk_size]})
 def ingest_parsed_files(
     parsed_files: list[ParsedFile],
     graph: falkordb.Graph,
@@ -210,13 +213,13 @@ def ingest_parsed_files(
 
     module_nodes=[n for n in module_nodes if n.get("name") and n["name"].strip() not in ("",".")]        
     if module_nodes:
-        graph.query(
+        _bulk_write(graph,
             """UNWIND $nodes AS n
                MERGE (m:Module {name: n.name})
                SET m.file_path = n.file_path
                WITH m, n WHERE n.file_path <> "" AND n.embedding IS NOT NULL
                SET m.embedding = n.embedding""",
-            {"nodes": module_nodes},
+            module_nodes,            
         )
 
     # Prepare for AI summaries
@@ -321,7 +324,7 @@ def ingest_parsed_files(
             node["embedding"] = json.dumps(class_embeddings[i])
 
     if class_nodes:
-        graph.query(
+        _bulk_write(graph,
             """UNWIND $nodes AS n
                MERGE (c:Class {fqn: n.fqn})
                SET c.name = n.name,
@@ -331,7 +334,7 @@ def ingest_parsed_files(
                    c.docstring = n.docstring,
                    c.summary = n.summary,
                    c.embedding = n.embedding""",
-            {"nodes": class_nodes},
+            class_nodes,
         )
 
     # Step 3: Upsert Function nodes
@@ -361,7 +364,7 @@ def ingest_parsed_files(
             node["embedding"] = json.dumps(func_embeddings[i])
             
     if func_nodes:
-        graph.query(
+        _bulk_write(graph,
             """UNWIND $nodes AS n
                MERGE (f:Function {fqn: n.fqn})
                SET f.name = n.name,
@@ -377,7 +380,7 @@ def ingest_parsed_files(
                    f.params = n.params,
                    f.decorators = n.decorators,
                    f.return_annotation = n.return_annotation""",
-            {"nodes": func_nodes},
+            func_nodes,
         )
 
     # Step 4: Create DEFINED_IN and INHERITS_FROM edges
