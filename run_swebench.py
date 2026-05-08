@@ -28,7 +28,7 @@ from pathlib import Path
 from typing import Optional
 
 from datasets import load_dataset
-
+from config import FALKORDB_HOST, FALKORDB_PORT
 from change_engine import GraphDrivenEngine, ChangeResult
 from ingest import get_connection
 from apply_changes import parse_edit_blocks, apply_edits
@@ -189,7 +189,7 @@ def _run_instance(
         #Hard-delete and recreate the graph to prevent key corruption cascade
         import redis as _redis 
         try:
-            _r= _redis.Redis(host="localhost", port=6379)
+            _r= _redis.Redis(host=FALKORDB_HOST, port=FALKORDB_PORT)
             _r.execute_command("GRAPH.DELETE","repo_insight")
             logger.info("[%s] FalkorDB graph deleted cleanly", instance_id)
         except Exception as _e:
