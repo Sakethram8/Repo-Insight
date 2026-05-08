@@ -509,7 +509,7 @@ def ingest_parsed_files(
             logger.warning("Jedi failed for %s: %s", pf.file_path, e)
             return []
 
-    with ThreadPoolExecutor(max_workers=8) as jedi_pool:
+    with ThreadPoolExecutor(max_workers=INGEST_CONCURRENCY) as jedi_pool:
         futures = [jedi_pool.submit(_resolve_one_file, pf) for pf in parsed_files]
         for future in as_completed(futures):
             precise_edges = future.result()
