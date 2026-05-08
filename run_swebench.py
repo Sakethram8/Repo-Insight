@@ -182,19 +182,6 @@ def _run_instance(
         repo_dir = tmp_root / "repo"
         logger.info("[%s] Cloning %s @ %s", instance_id, repo, base_commit[:10])
         _clone_repo(repo, base_commit, repo_dir)
-        # Skip repos that are too large — prevents 10,000s timeouts on astropy-scale repos
-        py_files = [
-            f for f in repo_dir.rglob("*.py")
-            if not any(p in {"tests", "test", "docs", "build", "__pycache__"}
-                    for p in f.parts)
-        ]
-        if len(py_files) > 600:
-            result["status"] = "skipped"
-            result["error"] = f"Repo too large: {len(py_files)} .py files (limit 600)"
-            logger.warning("[%s] Skipping — %d .py files exceeds size limit", instance_id, len(py_files))
-            return result
-
-
         # -- Run pipeline --
         logger.info("[%s] Running 6-phase pipeline", instance_id)
 
