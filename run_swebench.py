@@ -203,7 +203,7 @@ def _run_instance(
 
         change_result: ChangeResult = engine.run(
             user_prompt=problem,
-            skip_apply=True,
+            skip_apply=False,
         )
 
         result["phases_completed"] = change_result.phases_completed

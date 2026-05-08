@@ -514,7 +514,7 @@ class GraphDrivenEngine:
         # Fetch source code for all affected nodes
         for fqn in list(seen_fqns):
             if fqn not in subgraph.source_code:
-                if fqn_depths.get(fqn, 0) <= 2:
+                if fqn_depths.get(fqn, 0) <= 3:
                     src = get_source_code(fqn, self.graph, repo_root_override=str(self.repo_root))
                     if src.get("found"):
                         subgraph.source_code[fqn] = src.get("source", "")

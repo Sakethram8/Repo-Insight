@@ -20,15 +20,15 @@ from parser import ParsedFile, parse_file, SKIP_DIRS
 from embedder import embed_text, embed_texts, build_embedding_text
 
 # Directories to skip during ingestion — no useful code here
-SKIP_DIRS = {
-    "tests", "test", "testing",
-    "build", "dist",
-    "__pycache__",
-    ".git", ".tox",
-    "benchmarks", "examples",
-    "migrations",          # Django migrations are auto-generated
-    "node_modules",
-}
+# SKIP_DIRS = {
+#     "tests", "test", "testing",
+#     "build", "dist",
+#     "__pycache__",
+#     ".git", ".tox",
+#     "benchmarks", "examples",
+#     "migrations",          # Django migrations are auto-generated
+#     "node_modules",
+# }
 
 logger = logging.getLogger(__name__)
 _NO_THINK = {"chat_template_kwargs":{"enable_thinking":False}}
@@ -468,33 +468,6 @@ def ingest_parsed_files(
                SET c.line = e.line, c.file_path = e.file_path, c.resolution = 'tree-sitter'""",
             {"edges": call_edges},
         )
-
-    # Step 7: Jedi precision pass — upgrade call edges with precise FQN resolution
-    # jedi_upgraded = 0
-    # jedi_total = 0
-    # for pf in parsed_files:
-    #     if not pf.file_path.endswith(".py"):
-    #         continue
-    #     precise_edges = resolve_calls_with_jedi(pf, repo_root)
-    #     jedi_total += len(precise_edges)
-    #     jedi_edges = [
-    #         e for e in precise_edges if e["resolution"] == "jedi"
-    #     ]
-    #     jedi_upgraded += len(jedi_edges)
-    #     if jedi_edges:
-    #         graph.query(
-    #             """UNWIND $edges AS e
-    #                MATCH (caller:Function {fqn: e.caller_fqn})
-    #                MATCH (callee:Function {fqn: e.callee_fqn})
-    #                MERGE (caller)-[c:CALLS]->(callee)
-    #                SET c.line = e.line, c.file_path = e.file_path, c.resolution = 'jedi'""",
-    #             {"edges": jedi_edges},
-    #         )
-    # if jedi_total > 0:
-    #     logger.info(
-    #         "Jedi precision pass: %d/%d call edges upgraded to precise FQN resolution",
-    #         jedi_upgraded, jedi_total,
-    #     )
     # Step 7: Jedi precision pass — parallelized across files
     jedi_upgraded = 0
     jedi_total = 0
