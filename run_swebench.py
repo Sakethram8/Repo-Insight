@@ -370,7 +370,7 @@ def main():
             i, len(dataset), iid,
         )
         try:
-            result = __run_instance(instance, output_dir, args.skip_existing)
+            result = _run_instance(instance, output_dir, args.skip_existing)
         except TimeoutError:
             logger.error("[%s] Hard wall-clock timeout after %ds", iid, INSTANCE_TIMEOUT)
             result = {
