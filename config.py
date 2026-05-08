@@ -6,7 +6,7 @@ try:
 except ImportError:
     pass
 
-FALKORDB_HOST = os.getenv("FALKORDB_HOST", "localhost")
+FALKORDB_HOST = os.getenv("FALKORDB_HOST", "172.17.0.1")
 FALKORDB_PORT = int(os.getenv("FALKORDB_PORT", "6379"))
 GRAPH_NAME = os.getenv("GRAPH_NAME", "repo_insight")
 
