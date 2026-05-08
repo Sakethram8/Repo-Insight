@@ -15,6 +15,7 @@ import falkordb
 import openai
 import os as _os
 import signal as _signal
+import concurrent.futures as _cf
 SKIP_SUMMARIES = _os.getenv("SKIP_SUMMARIES", "false").lower() in ("true", "1")
 from config import (FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
                     FLUSH_GRAPH_ON_INGEST, SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
@@ -687,7 +688,24 @@ except ImportError:
     logger.info("Jedi not installed; using tree-sitter fallback for call resolution")
 
 
+JEDI_FILE_TIMEOUT = int(_os.getenv("JEDI_FILE_TIMEOUT", "5"))
 def resolve_calls_with_jedi(
+    parsed_file: "ParsedFile",
+    repo_root: Path,
+) -> list[dict]:
+    """Wrap jedi resolution with a hard per-file timeout."""
+    try:
+        with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
+            fut = _ex.submit(_resolve_calls_with_jedi_inner, parsed_file, repo_root)
+            return fut.result(timeout=JEDI_FILE_TIMEOUT)
+    except _cf.TimeoutError:
+        logger.debug("Jedi timed out on %s after %ds — skipping", parsed_file.file_path, JEDI_FILE_TIMEOUT)
+        return []
+    except Exception as e:
+        logger.debug("Jedi failed on %s: %s", parsed_file.file_path, e)
+        return []
+
+def _resolve_calls_with_jedi_inner(
     parsed_file: "ParsedFile",
     repo_root: Path,
 ) -> list[dict]:
