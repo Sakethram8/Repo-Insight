@@ -13,6 +13,8 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import falkordb
 import openai
+import os as _os
+SKIP_SUMMARIES = _os.getenv("SKIP_SUMMARIES", "false").lower() in ("true", "1")
 from config import (FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
                     FLUSH_GRAPH_ON_INGEST, SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
                     INGEST_CONCURRENCY)
@@ -104,18 +106,27 @@ def create_indices(graph: falkordb.Graph) -> None:
 
 import json
 
-def generate_summaries_batch(batch: list[tuple[str, str]]) -> dict[str, str]:
+def generate_summaries_batch(batch: list[tuple[str, str, str, str]]) -> dict[str, str]:
     """Generate 1-2 sentence AI summaries for a batch of functions/classes.
-    batch: list of (id_string, code_string)
+    batch: list of (id_string, sig_or_code, docstring, has_docstring)
     Returns: dict mapping id_string to summary
     """
     if not batch:
         return {}
     try:
         client = _get_summary_client()
-        prompt_parts = ["Summarize what each of these functions/classes does in 1-2 sentences.\nReturn ONLY a valid JSON object mapping the ID to the summary string, like {\"id1\": \"summary1\"}.\nDo NOT include any explanation, markdown, or code fences.\n\n"]
-        for idx, code in batch:
-            prompt_parts.append(f"--- ID: {idx} ---\n{code[:1000]}\n")
+        prompt_parts = [
+            "Summarize what each of these functions/classes does in 1-2 sentences.\n"
+            "Return ONLY a valid JSON object mapping the ID to the summary string.\n"
+            "No markdown, no explanation, no code fences.\n\n"
+        ]
+        for idx, content, docstring, has_docstring in batch:
+            if has_docstring:
+                # Docstring present — signature + docstring is sufficient
+                prompt_parts.append(f"--- ID: {idx} ---\n{content}\nDocstring: {docstring[:300]}\n")
+            else:
+                # No docstring — send truncated code body for accuracy
+                prompt_parts.append(f"--- ID: {idx} ---\n{content[:600]}\n")
 
         prompt = "".join(prompt_parts)
         response = client.chat.completions.create(
@@ -127,20 +138,17 @@ def generate_summaries_batch(batch: list[tuple[str, str]]) -> dict[str, str]:
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=8192,
+            max_tokens=2048,
             temperature=0,
             response_format={"type": "json_object"},
-            extra_body=_NO_THINK
+            extra_body=_NO_THINK,
         )
         content = response.choices[0].message.content
-
         if not content or not content.strip():
             logger.error("Batch summary: empty model content")
             return {}
-
         raw = content.strip()
         logger.debug("Batch summary raw content (first 300): %s", raw[:300])
-
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
@@ -227,23 +235,43 @@ def ingest_parsed_files(
     from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
     
     summaries: dict[str, str] = {}
-    BATCH_SIZE = 15
-    batches = []
-    current_batch = []
-    
-    for item in items_to_summarize:
-        idx = f"{item[2]}::{item[1].name}::{item[1].start_line}"
-        code = item[4]
-        if len(code.strip()) > 0:
-            current_batch.append((idx, code))
-            if len(current_batch) >= BATCH_SIZE:
-                batches.append(current_batch)
-                current_batch = []
-        else:
-            summaries[idx] = ""
 
-    if current_batch:
-        batches.append(current_batch)
+    if SKIP_SUMMARIES:
+        logger.info("SKIP_SUMMARIES=true — skipping LLM summarization")
+        for item in items_to_summarize:
+            idx = f"{item[2]}::{item[1].name}::{item[1].start_line}"
+            summaries[idx] = ""
+        batches = []
+    else:
+        BATCH_SIZE = 60  # raised from 15 — adaptive input keeps tokens manageable
+        batches = []
+        current_batch = []
+
+        for item in items_to_summarize:
+            kind, entity, file_path, mod_name, code = item
+            idx = f"{file_path}::{entity.name}::{entity.start_line}"
+            docstring = (entity.docstring or "").strip()
+            has_docstring = len(docstring) > 10
+
+            if has_docstring:
+                # Signature + docstring — compact, accurate
+                params = ", ".join(entity.params) if hasattr(entity, "params") and entity.params else ""
+                sig = f"{entity.name}({params})"
+                content = sig
+            else:
+                # No docstring — need code body
+                content = code
+
+            if len(code.strip()) > 0:
+                current_batch.append((idx, content, docstring, has_docstring))
+                if len(current_batch) >= BATCH_SIZE:
+                    batches.append(current_batch)
+                    current_batch = []
+            else:
+                summaries[idx] = ""
+
+        if current_batch:
+            batches.append(current_batch)
 
     with Progress(
         SpinnerColumn(),

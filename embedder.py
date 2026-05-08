@@ -27,7 +27,7 @@ def _get_model() -> SentenceTransformer:
         else:
             device="cpu"
             logger.warning("ROCm/CUDA not available, using CPU for embeddings (slower)")
-        _model = SentenceTransformer(EMBEDDING_MODEL)
+        _model = SentenceTransformer(EMBEDDING_MODEL, device=device)
     return _model
 
 
@@ -36,7 +36,7 @@ def embed_text(text: str) -> list[float]:
     Embed a single string. Returns a list of floats of length EMBEDDING_DIM.
     """
     model = _get_model()
-    embedding = model.encode(text, convert_to_numpy=True)
+    embedding = model.encode(text, convert_to_numpy=True, batch_size=512, show_progress_bar=False)
     return embedding.tolist()
 
 
