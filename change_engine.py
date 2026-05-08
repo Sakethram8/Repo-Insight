@@ -873,10 +873,11 @@ class GraphDrivenEngine:
             except Exception:
                 pass
 
-    def _format_source_section(self, subgraph: ChangeSubgraph) -> str:
+    def _format_source_section(self, subgraph: ChangeSubgraph, max_chars_per_fn: int = 3000) -> str:
         parts = []
         for fqn, src in sorted(subgraph.source_code.items()):
-            parts.append(f"### {fqn}\n```python\n{src}\n```")
+            display = src if len(src) <= max_chars_per_fn else src[:max_chars_per_fn] + "\n# ... (truncated)"
+            parts.append(f"### {fqn}\n```python\n{display}\n```")
         return "\n\n".join(parts) if parts else "(no source code available)"
 
     def _format_node_list(self, nodes: list[dict]) -> str:

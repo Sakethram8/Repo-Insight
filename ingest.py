@@ -255,9 +255,12 @@ def ingest_parsed_files(
 
             if has_docstring:
                 # Signature + docstring — compact, accurate
-                params = ", ".join(entity.params) if hasattr(entity, "params") and entity.params else ""
-                sig = f"{entity.name}({params})"
-                content = sig
+                if hasattr(entity, "params") and entity.params:
+                    params = ",".join(entity.params)
+                    sig = f"{entity.name}({params})"
+                else:
+                    sig = entity.name
+                content=sig
             else:
                 # No docstring — need code body
                 content = code
