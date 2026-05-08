@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import falkordb
 import openai
 import os as _os
+import signal as _signal
 SKIP_SUMMARIES = _os.getenv("SKIP_SUMMARIES", "false").lower() in ("true", "1")
 from config import (FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
                     FLUSH_GRAPH_ON_INGEST, SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
@@ -70,7 +71,7 @@ def get_connection() -> falkordb.Graph:
     last_err: Exception | None = None
     for attempt in range(_MAX_CONNECT_RETRIES):
         try:
-            db = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT)
+            db = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT, socket_timeout=None,socket_connect_timeout=10)
             return db.select_graph(GRAPH_NAME)
         except Exception as e:
             last_err = e
@@ -175,7 +176,21 @@ def extract_source_code(file_path: Path, start_line: int, end_line: int) -> str:
 def _bulk_write(graph: falkordb.Graph, query: str, nodes: list[dict], chunk_size: int = 500) -> None:
     """Write nodes in chunks to avoid FalkorDB timeouts on large UNWIND."""
     for i in range(0, len(nodes), chunk_size):
-        graph.query(query, {"nodes": nodes[i:i + chunk_size]})
+        _write_no_alarm(graph, query, {"nodes": nodes[i:i + chunk_size]})
+def _write_no_alarm(graph, query, params):
+    """Perform a graph write with SIGALRM temporarily disabled."""
+    # signal.alarm is only available on Unix. Gracefully fallback if on Windows.
+    try:
+        prev = _signal.alarm(0)   # pause alarm
+    except AttributeError:
+        prev = 0
+
+    try:
+        graph.query(query, params)
+    finally:
+        if prev > 0:
+            _signal.alarm(prev)  # restore remaining time
+
 def ingest_parsed_files(
     parsed_files: list[ParsedFile],
     graph: falkordb.Graph,
@@ -407,7 +422,7 @@ def ingest_parsed_files(
                 inherits_edges.append({"cfqn": class_fqn, "base_name": base})
 
     if func_to_class:
-        graph.query(
+        _write_no_alarm(graph,
             """UNWIND $edges AS e
                MATCH (f:Function {fqn: e.fqn})
                MATCH (c:Class {fqn: e.cfqn})
@@ -415,7 +430,7 @@ def ingest_parsed_files(
             {"edges": func_to_class},
         )
     if func_to_mod:
-        graph.query(
+        _write_no_alarm(graph,
             """UNWIND $edges AS e
                MATCH (f:Function {fqn: e.fqn})
                MATCH (m:Module {name: e.mname})
@@ -423,7 +438,7 @@ def ingest_parsed_files(
             {"edges": func_to_mod},
         )
     if class_to_mod:
-        graph.query(
+        _write_no_alarm(graph,
             """UNWIND $edges AS e
                MATCH (c:Class {fqn: e.cfqn})
                MATCH (m:Module {name: e.mname})
@@ -431,7 +446,7 @@ def ingest_parsed_files(
             {"edges": class_to_mod},
         )
     if inherits_edges:
-        graph.query(
+        _write_no_alarm(graph,
             """UNWIND $edges AS e
                MATCH (c:Class {fqn: e.cfqn})
                MATCH (base:Class {name: e.base_name})
@@ -452,7 +467,7 @@ def ingest_parsed_files(
             })
     import_edges = [e for e in import_edges if e.get("src_name") and e.get("tgt_name") and e["tgt_name"] != "."]       
     if import_edges:
-        graph.query(
+        _write_no_alarm(graph,
             """UNWIND $edges AS e
                MATCH (src:Module {name: e.src_name})
                MATCH (tgt:Module {name: e.tgt_name})
@@ -492,7 +507,7 @@ def ingest_parsed_files(
             })
             
     if call_edges:
-        graph.query(
+        _write_no_alarm(graph,
             """UNWIND $edges AS e
                MATCH (caller:Function {fqn: e.caller_fqn})
                MATCH (callee:Function)
@@ -523,7 +538,7 @@ def ingest_parsed_files(
             jedi_edges = [e for e in precise_edges if e["resolution"] == "jedi"]
             jedi_upgraded += len(jedi_edges)
             if jedi_edges:
-                graph.query(
+                _write_no_alarm(graph,
                     """UNWIND $edges AS e
                     MATCH (caller:Function {fqn: e.caller_fqn})
                     MATCH (callee:Function {fqn: e.callee_fqn})
