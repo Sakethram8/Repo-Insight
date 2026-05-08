@@ -238,6 +238,7 @@ class GraphDrivenEngine:
         user_prompt: str,
         on_phase: Optional[callable] = None,
         skip_apply: bool = False,
+        _skip_phase0: bool = False,
     ) -> ChangeResult:
         """Execute the full 6-phase pipeline.
 
@@ -257,9 +258,12 @@ class GraphDrivenEngine:
             })
 
             # Phase 0: Graph Construction
-            t0 = time.time()
-            result.ingestion_report = self._ensure_graph_fresh()
-            result.timings["phase_0_graph"] = time.time() - t0
+            if _skip_phase0:
+                result.ingestion_report = {"skipped": True, "reason":"pre-ingested by harness"}
+            else:
+                t0 = time.time()
+                result.ingestion_report = self._ensure_graph_fresh()
+                result.timings["phase_0_graph"] = time.time() - t0
             result.phases_completed.append("Phase 0: Graph Construction")
             self._notify("phase_0", result.ingestion_report)
 

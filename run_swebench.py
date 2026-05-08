@@ -42,7 +42,8 @@ logger = logging.getLogger("swebench_harness")
 
 INSTANCE_TIMEOUT = 300  # seconds per instance
 CLONE_TIMEOUT = 120     # seconds for git clone + checkout
-INGEST_TIMEOUT = 180    # seconds for graph ingestion
+INGEST_TIMEOUT = 600   # seconds for graph ingestion
+PIPELINE_TIMEOUT=600
 
 # Repo URL templates for known SWE-bench orgs
 _REPO_URL_TEMPLATE = "https://github.com/{repo}.git"
@@ -201,10 +202,23 @@ def _run_instance(
 
         engine = GraphDrivenEngine(repo_root=repo_dir, graph=graph)
 
-        change_result: ChangeResult = engine.run(
-            user_prompt=problem,
-            skip_apply=False,
-        )
+        # Phase 0: ingestion — separate timeout, no LLM involved
+        logger.info("[%s] Phase 0: ingesting graph (timeout=%ds)", instance_id, INGEST_TIMEOUT)
+        _hard_timeout(engine._ensure_graph_fresh, INGEST_TIMEOUT)
+
+        # Phases 1-5: LLM phases — tighter timeout
+        logger.info("[%s] Phases 1-5: running pipeline (timeout=%ds)", instance_id, PIPELINE_TIMEOUT)
+
+        def _run_phases():
+            return engine.run(
+                user_prompt=problem,
+                skip_apply=False,
+                _skip_phase0=True,   # ingestion already done above
+            )
+
+        change_result: ChangeResult = _hard_timeout(_run_phases, PIPELINE_TIMEOUT)
+
+        
 
         result["phases_completed"] = change_result.phases_completed
 
@@ -356,10 +370,7 @@ def main():
             i, len(dataset), iid,
         )
         try:
-            result = _hard_timeout(
-                _run_instance, INSTANCE_TIMEOUT,
-                instance, output_dir, args.skip_existing
-            )
+            result = __run_instance(instance, output_dir, args.skip_existing)
         except TimeoutError:
             logger.error("[%s] Hard wall-clock timeout after %ds", iid, INSTANCE_TIMEOUT)
             result = {
