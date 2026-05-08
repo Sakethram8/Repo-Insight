@@ -42,7 +42,7 @@ logger = logging.getLogger("swebench_harness")
 
 INSTANCE_TIMEOUT = 300  # seconds per instance
 CLONE_TIMEOUT = 120     # seconds for git clone + checkout
-INGEST_TIMEOUT = 600   # seconds for graph ingestion
+INGEST_TIMEOUT = 0   # seconds for graph ingestion
 PIPELINE_TIMEOUT=600
 
 # Repo URL templates for known SWE-bench orgs
