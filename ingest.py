@@ -621,7 +621,7 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
         graph.query("""
             MATCH (a:Function)-[r:CALLS]->(b:Function)
             WHERE NOT EXISTS {
-                MATCH (fs:FileState {file_path: b.file_path})
+                MATCH (fs:FileState) WHERE  fs.file_path = b.file_path
             }
             DELETE r
         """)
