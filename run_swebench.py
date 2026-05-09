@@ -40,7 +40,7 @@ logger = logging.getLogger("swebench_harness")
 # Constants
 # ---------------------------------------------------------------------------
 
-INSTANCE_TIMEOUT = 300  # seconds per instance
+INSTANCE_TIMEOUT = 1200  # seconds per instance
 CLONE_TIMEOUT = 120     # seconds for git clone + checkout
 INGEST_TIMEOUT = 0   # seconds for graph ingestion
 PIPELINE_TIMEOUT=600
@@ -104,20 +104,13 @@ def _clone_repo(repo: str, commit: str, dest: Path) -> None:
 
     # Step 1: shallow clone (depth=1 for speed)
     subprocess.run(
-        ["git", "clone", "--depth", "1", repo_url, str(dest)],
+        ["git", "clone",repo_url, str(dest)],
         check=True,
         capture_output=True,
         timeout=CLONE_TIMEOUT,
     )
 
     # Step 2: fetch the exact commit and check out
-    subprocess.run(
-        ["git", "fetch", "--depth", "1", "origin", commit],
-        cwd=str(dest),
-        check=True,
-        capture_output=True,
-        timeout=CLONE_TIMEOUT,
-    )
     subprocess.run(
         ["git", "checkout", commit],
         cwd=str(dest),

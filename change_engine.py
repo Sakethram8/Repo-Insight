@@ -239,6 +239,7 @@ class GraphDrivenEngine:
         on_phase: Optional[callable] = None,
         skip_apply: bool = False,
         _skip_phase0: bool = False,
+        on_event=None,
     ) -> ChangeResult:
         """Execute the full 6-phase pipeline.
 
@@ -299,7 +300,7 @@ class GraphDrivenEngine:
 
             # Phase 3: Graph-Constrained Planning
             t3 = time.time()
-            result.plan = self._plan_with_validation(user_prompt, result.subgraph)
+            result.plan = self._plan_with_validation(user_prompt, result.subgraph, on_event=on_event)
             result.timings["phase_3_plan"] = time.time() - t3
             result.phases_completed.append("Phase 3: Graph-Constrained Planning")
             self._notify("phase_3", {
@@ -329,7 +330,7 @@ class GraphDrivenEngine:
             if not skip_apply and result.edits:
                 t5 = time.time()
                 result.apply_result, result.test_result, result.post_edit_analysis = (
-                    self._apply_and_verify(result.edits, user_prompt, result.subgraph)
+                    self._apply_and_verify(result.edits, user_prompt, result.subgraph, on_event=on_event)
                 )
                 result.timings["phase_5_verify"] = time.time() - t5
                 result.phases_completed.append("Phase 5: Verified Apply")
@@ -529,7 +530,7 @@ class GraphDrivenEngine:
     # Phase 3: Graph-Constrained Planning + Validation Gate
     # ------------------------------------------------------------------
 
-    def _plan_with_validation(self, prompt: str, subgraph: ChangeSubgraph) -> ChangePlan:
+    def _plan_with_validation(self, prompt: str, subgraph: ChangeSubgraph, on_event=None) -> ChangePlan:
         """Get LLM change plan and validate it against blast radius."""
         plan = ChangePlan()
         plan.blast_radius_files = set(subgraph.all_affected_files)
@@ -586,6 +587,8 @@ class GraphDrivenEngine:
             plan.missing_files = plan.blast_radius_files - plan.planned_files
             if not plan.missing_files:
                 break
+            if on_event:
+                on_event("phase_3_recovery", f"LLM Missed {(plan.missing_files)}blast-radius file(s). Graph engine intercepting and forcing recovery (Round {round_num + 1})")
             logger.info(
                 "Validation round %d: %d files still missing, forcing coverage",
                 round_num + 1, len(plan.missing_files)
@@ -756,6 +759,7 @@ class GraphDrivenEngine:
         prompt: str,
         subgraph: ChangeSubgraph,
         max_retries: int = 2,
+        on_event=None,
     ) -> tuple[Optional[ApplyResult], Optional[RunResult], Optional[dict]]:
         """Apply edits directly to repo_root (already sandboxed), run tests, retry on failure."""
         current_edits = edits
@@ -794,6 +798,11 @@ class GraphDrivenEngine:
             # Tests failed — retry with error feedback
             if attempt < max_retries:
                 logger.info("Tests failed, retrying (attempt %d/%d)", attempt, max_retries)
+                if on_event:
+                    on_event(
+                        "phase_5_retry", 
+                        f"Sandbox tests failed! Graph engine captured pytest output and is forcing LLM to self-correct (Attempt {attempt})..."
+                    )
                 current_edits = self._retry_edits(prompt, subgraph, test_result)
                 if not current_edits:
                     return apply_result, test_result, None

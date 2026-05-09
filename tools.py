@@ -73,10 +73,14 @@ def get_callees(fqn: str, graph: falkordb.Graph) -> dict:
 
 def get_downstream_deps(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT_RADIUS_MAX_DEPTH) -> dict:
     max_depth = int(max_depth)
+    # Added WHERE clause to avoid traversing through massive hub nodes (in-degree > 50)
+    # Added LIMIT to prevent memory spikes
     cypher = (
         f"MATCH p = (src:Function {{fqn: $fqn}})-[:CALLS*1..{max_depth}]->(impacted:Function) "
+        f"WHERE ALL(n IN nodes(p)[1..-1] WHERE size((n)<-[:CALLS]-()) < 50) "
         f"RETURN DISTINCT impacted.fqn, impacted.file_path, length(p) "
-        f"ORDER BY length(p) ASC"
+        f"ORDER BY length(p) ASC "
+        f"LIMIT 300"
     )
     result = graph.query(cypher, {"fqn": fqn})
     impacted = [{"fqn": r[0], "file_path": r[1], "distance": r[2]} for r in result.result_set]
@@ -85,17 +89,20 @@ def get_downstream_deps(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT
         "direction": "downstream",
         "depth": max_depth,
         "impacted_count": len(impacted),
-        "warning": len(impacted) > IMPACT_RADIUS_WARN_THRESHOLD,
+        "warning": len(impacted) >= IMPACT_RADIUS_WARN_THRESHOLD,
         "impacted": impacted,
     }
 
 
 def get_upstream_callers(fqn: str, graph: falkordb.Graph, max_depth: int = BLAST_RADIUS_MAX_DEPTH) -> dict:
     max_depth = int(max_depth)
+    # Prevent traversal through hub nodes and cap the return size
     cypher = (
         f"MATCH p = (affected:Function)-[:CALLS*1..{max_depth}]->(target:Function {{fqn: $fqn}}) "
+        f"WHERE ALL(n IN nodes(p)[1..-1] WHERE size((n)<-[:CALLS]-()) < 50) "
         f"RETURN DISTINCT affected.fqn, affected.file_path, length(p) "
-        f"ORDER BY length(p) ASC"
+        f"ORDER BY length(p) ASC "
+        f"LIMIT 300"
     )
     result = graph.query(cypher, {"fqn": fqn})
     affected = [{"fqn": r[0], "file_path": r[1], "distance": r[2]} for r in result.result_set]
@@ -104,7 +111,7 @@ def get_upstream_callers(fqn: str, graph: falkordb.Graph, max_depth: int = BLAST
         "direction": "upstream",
         "depth": max_depth,
         "affected_count": len(affected),
-        "warning": len(affected) > IMPACT_RADIUS_WARN_THRESHOLD,
+        "warning": len(affected) >= IMPACT_RADIUS_WARN_THRESHOLD,
         "affected": affected,
     }
 

@@ -268,7 +268,10 @@ def build_macro_viz(graph, min_weight=1, max_nodes=100):
 
     return nodes, edges
 
-
+def handle_engine_event(event_type: str, message: str):
+    import streamlit as st
+    # Render a highly visible warning inside the current st.status container
+    st.warning(f"🤖 **Engine Intervention:** {message}", icon="⚡")
 # ---------------------------------------------------------------------------
 # Sidebar
 # ---------------------------------------------------------------------------
@@ -494,12 +497,24 @@ with tab_chat:
                     graph = get_db_graph()
                     sandbox_path = st.session_state.sandbox_path
                     original_path = st.session_state.original_path or Path(repo_path).resolve()
+                    def handle_engine_event(event_type: str, message: str):
+                        # Write to the expanding status container
+                        phase_status.write(f"⚡ **Engine Intervention:** {message}")
+                        # Also flash a warning on the main UI
+                        st.warning(f"🤖 **Engine Intervention:** {message}", icon="⚡")
+
                     engine = GraphDrivenEngine(
                         original_path, graph,
                         sandbox_path=sandbox_path if sandbox_path != original_path else None
                     )
                     start = time.time()
-                    result = engine.run(prompt, on_phase=_on_phase)
+                    
+                    # 2. Pass BOTH callbacks to the engine
+                    result = engine.run(
+                        prompt, 
+                        on_phase=_on_phase,
+                        on_event=handle_engine_event
+                    )
                     elapsed = time.time() - start
 
                     phase_status.update(label=f"✅ Pipeline complete ({elapsed:.1f}s)", state="complete")
