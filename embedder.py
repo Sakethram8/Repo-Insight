@@ -114,7 +114,7 @@ logger = logging.getLogger(__name__)
 
 EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "http://127.0.0.1:30001")
 EMBED_MODEL    = os.getenv("EMBED_MODEL", "woodx/Qwen3-Embedding-0.6B-SGLang")
-_BATCH_SIZE    = 512   # max texts per HTTP request
+_BATCH_SIZE    = 128   # max texts per HTTP request
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
