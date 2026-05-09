@@ -7,18 +7,18 @@
 #   python -m sglang.launch_server --model-path Qwen/Qwen3-8B --port 30000
 #   python -m sglang.launch_server --model-path Qwen/Qwen3-Coder-Next --port 30001
 
+# Repo-Insight Docker Compose
 services:
   falkordb:
     image: falkordb/falkordb:latest
     container_name: repo-insight-falkordb
     ports:
-      - "6379:6379" # Redis protocol (FalkorDB client)
-      - "8001:8001" # FalkorDB Browser UI
+      - "6379:6379"
+      - "8001:8001"
     volumes:
       - falkordb_data:/data
     command: >
       redis-server --save 60 1 --dir /data --loadmodule /opt/falkordb/falkordb.so
-
     restart: unless-stopped
     healthcheck:
       test: [ "CMD", "redis-cli", "ping" ]
@@ -39,16 +39,17 @@ services:
       - SGLANG_BASE_URL=${SGLANG_BASE_URL}
       - EMBED_BASE_URL=${EMBED_BASE_URL}
       - SGLANG_API_KEY=${SGLANG_API_KEY:-EMPTY}
-      - LLM_MODEL=${LLM_MODEL:-Qwen/Qwen3-8B}
-      - BASELINE_SGLANG_BASE_URL=${BASELINE_SGLANG_BASE_URL:-http://host.docker.internal:30001/v1}
-      - BASELINE_LLM_MODEL=${BASELINE_LLM_MODEL:-Qwen/Qwen3-Coder-30B-A3B-Instruct}
+      - LLM_MODEL=${LLM_MODEL:-Qwen/Qwen3.6-35B-A3B}
+      - SKIP_SUMMARIES=${SKIP_SUMMARIES:-true}
+      - SKIP_SANDBOX_TESTS=${SKIP_SANDBOX_TESTS:-true}
     depends_on:
       falkordb:
         condition: service_healthy
     restart: unless-stopped
-    # Mount repo for ingestion (override with your target repo)
     volumes:
       - ${REPO_PATH:-.}:/workspace:ro
+      - ./patches:/app/patches
+      - ./logs:/app/logs
     extra_hosts:
       - "host.docker.internal:host-gateway"
 
