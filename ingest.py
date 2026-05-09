@@ -140,7 +140,7 @@ def generate_summaries_batch(batch: list[tuple[str, str, str, str]]) -> dict[str
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=2048,
+            max_tokens=8192,
             temperature=0,
             response_format={"type": "json_object"},
             extra_body=_NO_THINK,
@@ -695,12 +695,13 @@ def resolve_calls_with_jedi(
     repo_root: Path,
 ) -> list[dict]:
     """Wrap jedi resolution with a hard per-file timeout."""
+    timeout=300
     try:
         with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
             fut = _ex.submit(_resolve_calls_with_jedi_inner, parsed_file, repo_root)
-            return fut.result(timeout=JEDI_FILE_TIMEOUT)
+            return fut.result(timeout=timeout)
     except _cf.TimeoutError:
-        logger.debug("Jedi timed out on %s after %ds — skipping", parsed_file.file_path, JEDI_FILE_TIMEOUT)
+        logger.debug("Jedi timed out on %s after %ds — skipping", parsed_file.file_path, timeout)
         return []
     except Exception as e:
         logger.debug("Jedi failed on %s: %s", parsed_file.file_path, e)
