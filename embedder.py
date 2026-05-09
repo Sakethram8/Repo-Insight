@@ -126,7 +126,7 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
         resp = requests.post(
             f"{EMBED_BASE_URL}/v1/embeddings",
             json={"model": EMBED_MODEL, "input": batch},
-            timeout=120,
+            timeout=600,
         )
         resp.raise_for_status()
         data = resp.json()["data"]
