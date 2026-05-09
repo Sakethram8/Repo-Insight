@@ -609,20 +609,21 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
     # Batch delete instead of per-file loop (2.4)
     if files_to_delete:
         graph.query(
-            "UNWIND $fps AS fp MATCH (n {file_path: fp}) DETACH DELETE n",
+            "UNWIND $fps AS fp MATCH (n) WHERE n.file_path = fp DETACH DELETE n",
             {"fps": files_to_delete},
         )
         graph.query(
-            "UNWIND $fps AS fp MATCH (s:FileState {file_path: fp}) DELETE s",
+            "UNWIND $fps AS fp MATCH (s:FileState) WHERE s.file_path = fp DELETE s",
             {"fps": files_to_delete},
         )
     # Remove call edges pointing to functions whose files no longer exist in the graph
     try:
         graph.query("""
             MATCH (a:Function)-[r:CALLS]->(b:Function)
-            WHERE NOT EXISTS {
-                MATCH (fs:FileState) WHERE  fs.file_path = b.file_path
-            }
+            OPTIONAL MATCH (fs:FileState)
+            WHERE fs.file_path = b.file_path
+            WITH r, fs
+            WHERE fs IS NULL
             DELETE r
         """)
         logger.debug("Orphan edge pruning complete")
@@ -787,7 +788,7 @@ def reingest_files(
     # Delete old nodes for these files
     if file_paths:
         graph.query(
-            "UNWIND $fps AS fp MATCH (n {file_path: fp}) DETACH DELETE n",
+            "UNWIND $fps AS fp MATCH (n) WHERE n.file_path = fp DETACH DELETE n",
             {"fps": file_paths},
         )
 
