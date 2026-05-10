@@ -377,15 +377,18 @@ class GraphDrivenEngine:
         """Build or refresh the code graph. Skips ingestion if no files have changed."""
         from config import SKIP_DIRS
 
-        # Compute fingerprint from all .py file mtimes
-        current_mtimes = {}
+        # Fingerprint from content hashes — not mtimes.
+        # git checkout resets every file's mtime to now, so mtime-based
+        # fingerprints always differ between clones even for identical content.
+        from ingest import _file_content_hash
+        current_hashes = {}
         for f in sorted(self.original_root.rglob("*.py")):
             parts = f.relative_to(self.original_root).parts
             if not any(p in SKIP_DIRS for p in parts):
                 rel = str(f.relative_to(self.original_root))
-                current_mtimes[rel] = f.stat().st_mtime
+                current_hashes[rel] = _file_content_hash(f)
 
-        fingerprint = str(hash(frozenset(current_mtimes.items())))
+        fingerprint = str(hash(frozenset(current_hashes.items())))
 
         # Check stored fingerprint in graph Meta node
         stored = None

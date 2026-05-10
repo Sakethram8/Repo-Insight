@@ -173,6 +173,18 @@ def generate_summaries_batch(batch: list[tuple[str, str, str, str]]) -> dict[str
         return {}
 
 
+def _file_content_hash(file_path: Path) -> str:
+    """MD5 of file bytes — used instead of mtime for change detection.
+    git checkout sets every file's mtime to 'now', so mtime-based comparison
+    always marks every file as changed even when content is identical between
+    two commits. Content hash only changes when bytes actually change."""
+    import hashlib
+    try:
+        return hashlib.md5(file_path.read_bytes()).hexdigest()
+    except Exception:
+        return ""
+
+
 def extract_source_code(file_path: Path, start_line: int, end_line: int) -> str:
     """Read source lines from a file. Returns empty string on failure."""
     try:
@@ -598,12 +610,10 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
     except Exception:
         existing_states = {}
 
-    files_to_parse: list[tuple[Path, str, float]] = []
+    files_to_parse: list[tuple[Path, str, str]] = []   # (abs_path, rel_path, content_hash)
     current_files: set[str] = set()
-    # Supported languages. Architecture is language-agnostic (tree-sitter);
-    # expand this set as precision resolvers are added per language.
     INGEST_EXTENSIONS = {".py"}
-    
+
     all_source_files = sorted(
         f for ext in INGEST_EXTENSIONS
         for f in dir_path.rglob(f"*{ext}")
@@ -615,11 +625,12 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
 
         rel_path = str(source_file.relative_to(dir_path))
         current_files.add(rel_path)
-        mtime = source_file.stat().st_mtime
+        content_hash = _file_content_hash(source_file)
 
-        # Only parse if file changed or if FLUSH_GRAPH_ON_INGEST was True (which wipes existing_states)
-        if rel_path not in existing_states or existing_states[rel_path] != mtime:
-            files_to_parse.append((source_file, rel_path, mtime))
+        # Use content hash (not mtime) — git checkout resets mtimes on every
+        # clone so mtime always differs even when file content is identical.
+        if rel_path not in existing_states or existing_states[rel_path] != content_hash:
+            files_to_parse.append((source_file, rel_path, content_hash))
 
     deleted_files = set(existing_states.keys()) - current_files
     changed_files = [f[1] for f in files_to_parse]
@@ -652,13 +663,13 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
     if on_progress:
         on_progress("Scanning", 0, len(files_to_parse), f"{len(files_to_parse)} files found")
 
-    parsed_with_meta: list[tuple[ParsedFile, str, float]] = []
-    for i, (py_file, rel_path, mtime) in enumerate(files_to_parse):
+    parsed_with_meta: list[tuple[ParsedFile, str, str]] = []  # (parsed, rel_path, content_hash)
+    for i, (py_file, rel_path, content_hash) in enumerate(files_to_parse):
         if on_progress:
             on_progress("Parsing", i + 1, len(files_to_parse), rel_path)
         try:
             parsed = parse_file(py_file, dir_path)
-            parsed_with_meta.append((parsed, rel_path, mtime))
+            parsed_with_meta.append((parsed, rel_path, content_hash))
         except Exception as e:
             logger.warning("Failed to parse %s: %s", rel_path, e)
             continue
@@ -673,8 +684,10 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
             logger.error("Ingest failed: %s", e)
             raise
 
-        for _, rel_path, mtime in parsed_with_meta:
-            graph.query("MERGE (s:FileState {file_path: $fp}) SET s.mtime = $mtime", {"fp": rel_path, "mtime": mtime})
+        for _, rel_path, content_hash in parsed_with_meta:
+            # Store content hash in the mtime field (reusing existing schema/index).
+            graph.query("MERGE (s:FileState {file_path: $fp}) SET s.mtime = $h",
+                        {"fp": rel_path, "h": content_hash})
 
     # Summary
     try:

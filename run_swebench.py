@@ -149,8 +149,13 @@ def _run_instance(
     instance: dict,
     output_dir: Path,
     skip_existing: bool,
+    flush_graph: bool = True,
 ) -> dict:
     """Process a single SWE-bench instance. Returns a result dict.
+
+    flush_graph=True  → drop and recreate the graph (use when repo changes).
+    flush_graph=False → keep graph, rely on content-hash incremental update
+                        (use for consecutive instances of the same repo).
 
     The entire instance runs in a temporary directory that is cleaned
     up regardless of outcome.
@@ -201,14 +206,23 @@ def _run_instance(
         # -- Run pipeline --
         logger.info("[%s] Running 6-phase pipeline", instance_id)
 
-        graph = get_connection()
-
-        # Flush stale nodes from previous instance to prevent cross-contamination
-        logger.info("[%s] Flushing graph before ingestion", instance_id)
-        try:
-            graph.query("MATCH (n) DETACH DELETE n")
-        except Exception as _flush_err:
-            logger.warning("[%s] Graph flush failed (non-fatal): %s", instance_id, _flush_err)
+        if flush_graph:
+            # GRAPH.DELETE wipes nodes + edges + schema atomically.
+            # Required when switching repos — avoids schema corruption from
+            # leftover indices on a different codebase's node labels.
+            logger.info("[%s] Flushing graph (repo changed)", instance_id)
+            try:
+                _tmp_graph = get_connection()
+                _tmp_graph.delete()
+                logger.info("[%s] Graph dropped cleanly (GRAPH.DELETE)", instance_id)
+            except Exception as _flush_err:
+                logger.warning("[%s] Graph drop failed (non-fatal): %s", instance_id, _flush_err)
+            graph = get_connection()  # re-acquire — delete invalidates the object
+        else:
+            # Same repo as previous instance: keep graph, let content-hash
+            # incremental logic in run_ingestion re-ingest only changed files.
+            logger.info("[%s] Same repo — reusing graph (incremental update)", instance_id)
+            graph = get_connection()
 
         engine = GraphDrivenEngine(
             repo_root=repo_dir,
@@ -375,21 +389,33 @@ def main():
     else:
         dataset = list(dataset)
 
-    # Apply limit
+    # Sort by repo so consecutive instances share the same codebase.
+    # The graph is only flushed when the repo changes, and content-hash
+    # incremental logic means only the ~5-15 files that actually changed
+    # between commits are re-ingested. For Django (86 instances) this
+    # turns 86 full builds into 1 full build + 85 incremental updates.
+    dataset = sorted(dataset, key=lambda x: x["repo"])
+
+    # Apply limit AFTER sorting so the limit covers a contiguous repo group
     if args.limit and len(dataset) > args.limit:
         dataset = dataset[:args.limit]
         logger.info("Limited to %d instances", len(dataset))
 
     # -- Run --
     results = []
+    prev_repo: str | None = None
     for i, instance in enumerate(dataset, 1):
         iid = instance["instance_id"]
+        current_repo = instance["repo"]
+        flush = current_repo != prev_repo   # only flush when repo changes
+        prev_repo = current_repo
         logger.info(
             "━━━ [%d/%d] %s ━━━",
             i, len(dataset), iid,
         )
         try:
-            result = _run_instance(instance, output_dir, args.skip_existing)
+            result = _run_instance(instance, output_dir, args.skip_existing,
+                                   flush_graph=flush)
         except TimeoutError:
             logger.error("[%s] Hard wall-clock timeout after %ds", iid, INSTANCE_TIMEOUT)
             result = {
