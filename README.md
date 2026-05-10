@@ -1,6 +1,6 @@
 <div align="center">
   <a href="https://git.io/typing-svg">
-    <img src="https://readme-typing-svg.demolab.com?font=DM+Sans&weight=800&size=42&pause=1000&color=6366F1&center=true&width=600&height=70&lines=REPO-INSIGHT;GRAPH-DRIVEN+CODING+AGENT;AUTONOMOUS+BLAST-RADIUS+ANALYSIS" alt="Typing SVG">
+    <img src="https://readme-typing-svg.demolab.com?font=DM+Sans&weight=800&size=36&pause=1000&color=6366F1&center=true&width=800&height=70&lines=REPO-INSIGHT;GRAPH-DRIVEN+CODING+AGENT;AUTONOMOUS+BLAST-RADIUS+ANALYSIS" alt="Typing SVG">
   </a>
   <h3><i>Eliminate RAG cascade failures. Prove change impact deterministically. Edit autonomously.</i></h3>
   <p><b>A Deterministic, Structural Knowledge Graph Agent for Multi-File Refactoring</b></p>
@@ -21,6 +21,7 @@
 Standard RAG-based coding agents rely heavily on semantic similarity to fetch context. This is fundamentally the wrong primitive for codebase modifications. 
 
 If you ask an agent to *"rename the user authentication function,"* vector search easily finds the file where the function is defined. However, it completely misses the five disparate files upstream that call that function, because **"call site usage"** shares little semantic similarity with the functional intent of the change.
+
 ❌ BLIND RAG CASCADE FAILURE:
 [User Request: Rename Auth] ──> Semantic Search retrieves auth.py perfectly.
 │
