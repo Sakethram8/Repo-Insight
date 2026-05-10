@@ -17,6 +17,7 @@ import os as _os
 import signal as _signal
 import concurrent.futures as _cf
 SKIP_SUMMARIES = _os.getenv("SKIP_SUMMARIES", "false").lower() in ("true", "1")
+SKIP_JEDI = _os.getenv("SKIP_JEDI", "false").lower() in ("true", "1")
 from config import (FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
                     FLUSH_GRAPH_ON_INGEST, SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
                     INGEST_CONCURRENCY, SUMMARIZATION_BATCH_SIZE)
@@ -577,30 +578,33 @@ def ingest_parsed_files(
     jedi_upgraded = 0
     jedi_total = 0
 
-    def _resolve_one_file(pf):
-        if not pf.file_path.endswith(".py"):
-            return []
-        try:
-            return resolve_calls_with_jedi(pf, repo_root)
-        except Exception as e:
-            logger.warning("Jedi failed for %s: %s", pf.file_path, e)
-            return []
+    if SKIP_JEDI:
+        logger.info("SKIP_JEDI=true — skipping Jedi call resolution pass")
+    else:
+        def _resolve_one_file(pf):
+            if not pf.file_path.endswith(".py"):
+                return []
+            try:
+                return resolve_calls_with_jedi(pf, repo_root)
+            except Exception as e:
+                logger.warning("Jedi failed for %s: %s", pf.file_path, e)
+                return []
 
-    with ThreadPoolExecutor(max_workers=INGEST_CONCURRENCY) as jedi_pool:
-        futures = [jedi_pool.submit(_resolve_one_file, pf) for pf in parsed_files]
-        for future in as_completed(futures):
-            precise_edges = future.result()
-            jedi_total += len(precise_edges)
-            jedi_edges = [e for e in precise_edges if e["resolution"] == "jedi"]
-            jedi_upgraded += len(jedi_edges)
-            if jedi_edges:
-                _bulk_write(graph,
-                    """UNWIND $edges AS e
-                    MATCH (caller:Function {fqn: e.caller_fqn})
-                    MATCH (callee:Function {fqn: e.callee_fqn})
-                    MERGE (caller)-[c:CALLS]->(callee)
-                    SET c.line = e.line, c.file_path = e.file_path, c.resolution = 'jedi'""",
-                    jedi_edges, chunk_size=100, param="edges")
+        with ThreadPoolExecutor(max_workers=INGEST_CONCURRENCY) as jedi_pool:
+            futures = [jedi_pool.submit(_resolve_one_file, pf) for pf in parsed_files]
+            for future in as_completed(futures):
+                precise_edges = future.result()
+                jedi_total += len(precise_edges)
+                jedi_edges = [e for e in precise_edges if e["resolution"] == "jedi"]
+                jedi_upgraded += len(jedi_edges)
+                if jedi_edges:
+                    _bulk_write(graph,
+                        """UNWIND $edges AS e
+                        MATCH (caller:Function {fqn: e.caller_fqn})
+                        MATCH (callee:Function {fqn: e.callee_fqn})
+                        MERGE (caller)-[c:CALLS]->(callee)
+                        SET c.line = e.line, c.file_path = e.file_path, c.resolution = 'jedi'""",
+                        jedi_edges, chunk_size=100, param="edges")
 
 
 def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
