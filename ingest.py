@@ -147,7 +147,7 @@ def generate_summaries_batch(batch: list[tuple[str, str, str, str]]) -> dict[str
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=8192,
+            max_tokens=512,   # 15 summaries × ~30 tokens each; 8192 was saturating KV cache
             temperature=0,
             response_format={"type": "json_object"},
             extra_body=_NO_THINK,
@@ -327,10 +327,12 @@ def ingest_parsed_files(
         TimeElapsedColumn(),
     ) as progress:
         task_id = progress.add_task("[cyan]Generating AI Node Summaries...", total=len(batches))
-        # Per-batch summary timeout: 120s each × INGEST_CONCURRENCY parallel,
-        # total wall-clock budget = batches / concurrency × 120s + margin.
-        _summary_total_timeout = max(300, len(batches) * 120 // max(INGEST_CONCURRENCY, 1))
-        with ThreadPoolExecutor(max_workers=INGEST_CONCURRENCY) as executor:
+        # Summary concurrency is capped at 4 regardless of INGEST_CONCURRENCY.
+        # 16 concurrent 35B requests saturate the KV cache and serialise
+        # execution — 4 parallel requests gives the model room to batch properly.
+        _SUMMARY_CONCURRENCY = min(INGEST_CONCURRENCY, 4)
+        _summary_total_timeout = max(300, len(batches) * 30 // max(_SUMMARY_CONCURRENCY, 1))
+        with ThreadPoolExecutor(max_workers=_SUMMARY_CONCURRENCY) as executor:
             future_to_batch = {
                 executor.submit(generate_summaries_batch, batch): batch
                 for batch in batches
