@@ -77,7 +77,9 @@ def get_connection() -> falkordb.Graph:
     last_err: Exception | None = None
     for attempt in range(_MAX_CONNECT_RETRIES):
         try:
-            db = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT, socket_timeout=60,socket_connect_timeout=10)
+            db = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT,
+                                   socket_timeout=None,      # no per-query limit — SIGALRM handles overall timeout
+                                   socket_connect_timeout=10)
             return db.select_graph(GRAPH_NAME)
         except Exception as e:
             last_err = e
@@ -183,10 +185,11 @@ def extract_source_code(file_path: Path, start_line: int, end_line: int) -> str:
 # ---------------------------------------------------------------------------
 # Core ingestion
 # ---------------------------------------------------------------------------
-def _bulk_write(graph: falkordb.Graph, query: str, nodes: list[dict], chunk_size: int = 500) -> None:
-    """Write nodes in chunks to avoid FalkorDB timeouts on large UNWIND."""
-    for i in range(0, len(nodes), chunk_size):
-        _write_no_alarm(graph, query, {"nodes": nodes[i:i + chunk_size]})
+def _bulk_write(graph: falkordb.Graph, query: str, items: list[dict],
+                chunk_size: int = 500, param: str = "nodes") -> None:
+    """Write items in chunks to avoid memory pressure on large UNWIND."""
+    for i in range(0, len(items), chunk_size):
+        _write_no_alarm(graph, query, {param: items[i:i + chunk_size]})
 def _write_no_alarm(graph, query, params):
     """Perform a graph write with SIGALRM temporarily disabled."""
     # signal.alarm is only available on Unix. Gracefully fallback if on Windows.
@@ -444,37 +447,33 @@ def ingest_parsed_files(
                 inherits_edges.append({"cfqn": class_fqn, "base_name": base})
 
     if func_to_class:
-        _write_no_alarm(graph,
+        _bulk_write(graph,
             """UNWIND $edges AS e
                MATCH (f:Function {fqn: e.fqn})
                MATCH (c:Class {fqn: e.cfqn})
                MERGE (f)-[:DEFINED_IN]->(c)""",
-            {"edges": func_to_class},
-        )
+            func_to_class, chunk_size=500, param="edges")
     if func_to_mod:
-        _write_no_alarm(graph,
+        _bulk_write(graph,
             """UNWIND $edges AS e
                MATCH (f:Function {fqn: e.fqn})
                MATCH (m:Module {name: e.mname})
                MERGE (f)-[:DEFINED_IN]->(m)""",
-            {"edges": func_to_mod},
-        )
+            func_to_mod, chunk_size=500, param="edges")
     if class_to_mod:
-        _write_no_alarm(graph,
+        _bulk_write(graph,
             """UNWIND $edges AS e
                MATCH (c:Class {fqn: e.cfqn})
                MATCH (m:Module {name: e.mname})
                MERGE (c)-[:DEFINED_IN]->(m)""",
-            {"edges": class_to_mod},
-        )
+            class_to_mod, chunk_size=500, param="edges")
     if inherits_edges:
-        _write_no_alarm(graph,
+        _bulk_write(graph,
             """UNWIND $edges AS e
                MATCH (c:Class {fqn: e.cfqn})
                MATCH (base:Class {name: e.base_name})
                MERGE (c)-[:INHERITS_FROM]->(base)""",
-            {"edges": inherits_edges},
-        )
+            inherits_edges, chunk_size=500, param="edges")
 
     # Step 5: Create IMPORTS edges
     import_edges: list[dict] = []
@@ -489,14 +488,13 @@ def ingest_parsed_files(
             })
     import_edges = [e for e in import_edges if e.get("src_name") and e.get("tgt_name") and e["tgt_name"] != "."]       
     if import_edges:
-        _write_no_alarm(graph,
+        _bulk_write(graph,
             """UNWIND $edges AS e
                MATCH (src:Module {name: e.src_name})
                MATCH (tgt:Module {name: e.tgt_name})
                MERGE (src)-[i:IMPORTS]->(tgt)
                SET i.alias = e.alias""",
-            {"edges": import_edges},
-        )
+            import_edges, chunk_size=500, param="edges")
 
     # Step 6: Create CALLS edges
     # Build a set of known imported modules per source module for scoped matching
@@ -529,7 +527,9 @@ def ingest_parsed_files(
             })
             
     if call_edges:
-        _write_no_alarm(graph,
+        # chunk_size=200: this query has a complex WHERE + module scope list per edge,
+        # so smaller chunks keep each UNWIND fast and well within socket timeout.
+        _bulk_write(graph,
             """UNWIND $edges AS e
                MATCH (caller:Function {fqn: e.caller_fqn})
                MATCH (callee:Function)
@@ -537,8 +537,7 @@ def ingest_parsed_files(
                  AND callee.module_name IN e.scope_modules
                MERGE (caller)-[c:CALLS]->(callee)
                SET c.line = e.line, c.file_path = e.file_path, c.resolution = 'tree-sitter'""",
-            {"edges": call_edges},
-        )
+            call_edges, chunk_size=200, param="edges")
     # Step 7: Jedi precision pass — parallelized across files
     jedi_upgraded = 0
     jedi_total = 0
@@ -560,14 +559,13 @@ def ingest_parsed_files(
             jedi_edges = [e for e in precise_edges if e["resolution"] == "jedi"]
             jedi_upgraded += len(jedi_edges)
             if jedi_edges:
-                _write_no_alarm(graph,
+                _bulk_write(graph,
                     """UNWIND $edges AS e
                     MATCH (caller:Function {fqn: e.caller_fqn})
                     MATCH (callee:Function {fqn: e.callee_fqn})
                     MERGE (caller)-[c:CALLS]->(callee)
                     SET c.line = e.line, c.file_path = e.file_path, c.resolution = 'jedi'""",
-                    {"edges": jedi_edges},
-                )
+                    jedi_edges, chunk_size=100, param="edges")
 
 
 def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
