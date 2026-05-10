@@ -43,7 +43,7 @@ class TestGenerateSummariesBatch:
         mock_client.chat.completions.create.return_value = mock_response
         mock_client_factory.return_value = mock_client
 
-        result = generate_summaries_batch([("123", "def add(a, b): return a + b")])
+        result = generate_summaries_batch([("123", "def add(a, b): return a + b", "", False)])
         assert result == {"123": "This function adds two numbers."}
 
     @patch("ingest._get_summary_client")

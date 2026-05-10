@@ -25,7 +25,7 @@ EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
 
 # --- Engine & Change Logic (Required by change_engine.py) ---
 IMPACT_RADIUS_MAX_DEPTH = int(os.getenv("IMPACT_RADIUS_MAX_DEPTH", "3"))
-BLAST_RADIUS_MAX_DEPTH = int(os.getenv("BLAST_RADIUS_MAX_DEPTH", "3"))
+BLAST_RADIUS_MAX_DEPTH = int(os.getenv("BLAST_RADIUS_MAX_DEPTH", "4"))
 IMPACT_RADIUS_WARN_THRESHOLD = int(os.getenv("IMPACT_RADIUS_WARN_THRESHOLD", "5"))
 AGENT_MAX_ITERATIONS = int(os.getenv("AGENT_MAX_ITERATIONS", "10"))
 AGENT_TOOL_TIMEOUT_SECONDS = int(os.getenv("AGENT_TOOL_TIMEOUT_SECONDS", "30"))

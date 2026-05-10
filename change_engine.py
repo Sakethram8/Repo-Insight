@@ -1024,9 +1024,7 @@ class GraphDrivenEngine:
                 for v in parsed.values():
                     if isinstance(v, list):
                         return v
-                #Case b : the dict itself IS a single plan item → wrap it
-                if "file" in parsed or "path" in parsed:
-                    return [parsed]
+                # Single dict that is not an array wrapper — not a valid plan array
         except json.JSONDecodeError:
             pass
         logger.warning("Failed to extract JSON array. Cleaned text snippet: %s", text[:500])

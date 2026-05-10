@@ -42,7 +42,7 @@ logger = logging.getLogger("swebench_harness")
 
 INSTANCE_TIMEOUT = 1200  # seconds per instance
 CLONE_TIMEOUT = 120     # seconds for git clone + checkout
-INGEST_TIMEOUT = 900    # seconds for graph ingestion (0 disables alarm — use a real value)
+INGEST_TIMEOUT = 3600   # 1 hour — astropy summaries alone take ~15min, Jedi ~10min
 PIPELINE_TIMEOUT = 1200  # increased from 600 — thinking mode adds 60-150s per LLM call
 
 # Repo URL templates for known SWE-bench orgs
@@ -207,17 +207,24 @@ def _run_instance(
         logger.info("[%s] Running 6-phase pipeline", instance_id)
 
         if flush_graph:
-            # GRAPH.DELETE wipes nodes + edges + schema atomically.
-            # Required when switching repos — avoids schema corruption from
-            # leftover indices on a different codebase's node labels.
+            # Use raw Redis DEL to remove the graph key entirely — this wipes
+            # nodes, edges AND the FalkorDB schema atomically, regardless of
+            # falkordb Python client version. graph.delete() may not exist in
+            # falkordb==1.0.3, and MATCH(n) DETACH DELETE n leaves the schema
+            # intact causing "Attempted to access undefined attribute" errors.
             logger.info("[%s] Flushing graph (repo changed)", instance_id)
             try:
-                _tmp_graph = get_connection()
-                _tmp_graph.delete()
-                logger.info("[%s] Graph dropped cleanly (GRAPH.DELETE)", instance_id)
+                import redis as _redis
+                _r = _redis.Redis(
+                    host=FALKORDB_HOST, port=FALKORDB_PORT,
+                    socket_timeout=None, socket_connect_timeout=10,
+                )
+                deleted = _r.delete(GRAPH_NAME)
+                logger.info("[%s] Graph key deleted via Redis DEL (keys removed: %d)",
+                            instance_id, deleted)
             except Exception as _flush_err:
-                logger.warning("[%s] Graph drop failed (non-fatal): %s", instance_id, _flush_err)
-            graph = get_connection()  # re-acquire — delete invalidates the object
+                logger.warning("[%s] Redis DEL failed (non-fatal): %s", instance_id, _flush_err)
+            graph = get_connection()  # fresh empty graph
         else:
             # Same repo as previous instance: keep graph, let content-hash
             # incremental logic in run_ingestion re-ingest only changed files.

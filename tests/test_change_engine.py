@@ -348,9 +348,10 @@ class TestPlanWithValidation:
         self.engine.client.chat.completions.create.side_effect = [mock_resp1, mock_resp2]
 
         plan = self.engine._plan_with_validation("test prompt", subgraph)
-        # c.py is still missing after force_coverage
-        assert plan.is_validated is False
-        assert "c.py" in plan.missing_files
+        # The convergence fallback force-adds c.py and marks the plan as validated
+        assert plan.is_validated is True
+        assert "c.py" in plan.planned_files
+        assert plan.missing_files == set()
 
 
 # ---------------------------------------------------------------------------
@@ -446,11 +447,16 @@ class TestEnsureGraphFresh:
         engine.graph = MagicMock()
         
         # Manually compute what _ensure_graph_fresh would compute for original_root
-        current_mtimes = {}
+        # (uses content hashes since commit f6df223 — mtime is unreliable across clones)
+        from ingest import _file_content_hash
+        from config import SKIP_DIRS
+        current_hashes = {}
         for f in sorted(original_root.rglob("*.py")):
-            rel = str(f.relative_to(original_root))
-            current_mtimes[rel] = f.stat().st_mtime
-        expected_fp = str(hash(frozenset(current_mtimes.items())))
+            parts = f.relative_to(original_root).parts
+            if not any(p in SKIP_DIRS for p in parts):
+                rel = str(f.relative_to(original_root))
+                current_hashes[rel] = _file_content_hash(f)
+        expected_fp = str(hash(frozenset(current_hashes.items())))
 
         mock_res = MagicMock()
         mock_res.result_set = [[expected_fp]]
@@ -485,7 +491,7 @@ class TestRetryEdits:
         
         engine.client.chat.completions.create.assert_called_once()
         kwargs = engine.client.chat.completions.create.call_args[1]
-        assert kwargs.get("max_tokens") == 8192
+        assert kwargs.get("max_tokens") == 32768
         assert len(edits) == 1
 
     def test_retry_returns_empty_on_llm_failure(self):

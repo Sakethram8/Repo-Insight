@@ -142,7 +142,7 @@ def _fuzzy_apply(content: str, search_text: str, replace_text: str,
         # appears somewhere in the first 3 lines of this window
         if first_sig_line:
             window_start = "".join(content_lines[i:i+3])
-            if first_sig_line not in window_start:
+            if " ".join(first_sig_line.split()) not in " ".join(window_start.split()):
                 continue
 
         window = [l.rstrip() for l in content_lines[i:i + search_len]]

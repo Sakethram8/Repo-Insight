@@ -277,3 +277,8 @@ def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
 
     scored.sort(key=lambda x: x["score"], reverse=True)
     return {"query": query, "results": scored[:top_k]}
+
+
+# Aliases used by mcp_server.py
+get_impact_radius = get_downstream_deps
+get_blast_radius = get_upstream_callers
