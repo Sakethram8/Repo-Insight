@@ -93,27 +93,37 @@ def _hard_timeout(fn, seconds, *args, **kwargs):
     finally:
         signal.alarm(0)
 def _clone_repo(repo: str, commit: str, dest: Path) -> None:
-    """Shallow-clone a GitHub repo and check out a specific commit.
+    """Fetch a single commit from GitHub with minimal data transfer.
 
-    Uses a two-step approach: shallow clone default branch, then fetch
-    the exact commit. This minimises download size while guaranteeing
-    we can check out arbitrary SHAs.
+    Uses git-init + fetch-by-SHA rather than a full clone. This avoids
+    the shallow-clone trap where `git checkout <old-sha>` fails with
+    exit 128 because the commit isn't in the truncated local history.
+    GitHub supports fetching arbitrary SHAs on public repos.
     """
     repo_url = _REPO_URL_TEMPLATE.format(repo=repo)
-    logger.debug("Cloning %s @ %s → %s", repo_url, commit[:10], dest)
+    logger.debug("Fetching %s @ %s → %s", repo_url, commit[:10], dest)
 
-    # Step 1: shallow clone (depth=1 keeps download small; SWEbench commits are
-    # reachable via fetch in step 2)
+    dest.mkdir(parents=True, exist_ok=True)
+
+    # Step 1: empty repo + remote
+    subprocess.run(["git", "init", str(dest)],
+                   check=True, capture_output=True, timeout=10)
+    subprocess.run(["git", "remote", "add", "origin", repo_url],
+                   cwd=str(dest), check=True, capture_output=True, timeout=10)
+
+    # Step 2: fetch exactly this one commit — depth=1 means no parent history,
+    # so only the tree at this SHA is downloaded (no full repo history needed).
     subprocess.run(
-        ["git", "clone", "--depth", "1", "--no-single-branch", repo_url, str(dest)],
+        ["git", "fetch", "--depth=1", "origin", commit],
+        cwd=str(dest),
         check=True,
         capture_output=True,
         timeout=CLONE_TIMEOUT,
     )
 
-    # Step 2: fetch the exact commit and check out
+    # Step 3: check out the fetched commit
     subprocess.run(
-        ["git", "checkout", commit],
+        ["git", "checkout", "FETCH_HEAD"],
         cwd=str(dest),
         check=True,
         capture_output=True,
