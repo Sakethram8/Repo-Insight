@@ -135,7 +135,7 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
                 # /v1/embeddings (OpenAI-compat). Use /encode — confirmed working.
                 resp = requests.post(
                     f"{EMBED_BASE_URL}/encode",
-                    json={"model": EMBED_MODEL, "input": batch},
+                    json={"model": EMBED_MODEL, "text": batch},
                     timeout=_EMBED_TIMEOUT,
                 )
                 resp.raise_for_status()
