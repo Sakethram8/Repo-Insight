@@ -19,7 +19,7 @@ import concurrent.futures as _cf
 SKIP_SUMMARIES = _os.getenv("SKIP_SUMMARIES", "false").lower() in ("true", "1")
 from config import (FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
                     FLUSH_GRAPH_ON_INGEST, SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
-                    INGEST_CONCURRENCY)
+                    INGEST_CONCURRENCY, SUMMARIZATION_BATCH_SIZE)
 from parser import ParsedFile, parse_file, SKIP_DIRS
 from embedder import embed_text, embed_texts, build_embedding_text
 
@@ -55,7 +55,12 @@ def _get_summary_client() -> openai.OpenAI:
     """Lazy-initialise a single OpenAI client for the summary generator."""
     global _summary_client
     if _summary_client is None:
-        _summary_client = openai.OpenAI(base_url=SGLANG_BASE_URL, api_key=SGLANG_API_KEY)
+        import httpx
+        _summary_client = openai.OpenAI(
+            base_url=SGLANG_BASE_URL,
+            api_key=SGLANG_API_KEY,
+            timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=5.0),
+        )
     return _summary_client
 
 
@@ -72,7 +77,7 @@ def get_connection() -> falkordb.Graph:
     last_err: Exception | None = None
     for attempt in range(_MAX_CONNECT_RETRIES):
         try:
-            db = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT, socket_timeout=None,socket_connect_timeout=10)
+            db = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT, socket_timeout=60,socket_connect_timeout=10)
             return db.select_graph(GRAPH_NAME)
         except Exception as e:
             last_err = e
@@ -156,7 +161,11 @@ def generate_summaries_batch(batch: list[tuple[str, str, str, str]]) -> dict[str
         except json.JSONDecodeError:
             if raw.startswith("```"):
                 raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            return json.loads(raw)
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError as e:
+                logger.error("Batch summary: JSON still invalid after stripping fences: %s", e)
+                return {}
     except Exception as e:
         logger.error("Batch summary generation failed: %s", e)
         return {}
@@ -262,7 +271,7 @@ def ingest_parsed_files(
             summaries[idx] = ""
         batches = []
     else:
-        BATCH_SIZE = 60  # raised from 15 — adaptive input keeps tokens manageable
+        BATCH_SIZE = SUMMARIZATION_BATCH_SIZE  # use config value (default 15)
         batches = []
         current_batch = []
 
@@ -303,17 +312,29 @@ def ingest_parsed_files(
         TimeElapsedColumn(),
     ) as progress:
         task_id = progress.add_task("[cyan]Generating AI Node Summaries...", total=len(batches))
+        # Per-batch summary timeout: 120s each × INGEST_CONCURRENCY parallel,
+        # total wall-clock budget = batches / concurrency × 120s + margin.
+        _summary_total_timeout = max(300, len(batches) * 120 // max(INGEST_CONCURRENCY, 1))
         with ThreadPoolExecutor(max_workers=INGEST_CONCURRENCY) as executor:
             future_to_batch = {
                 executor.submit(generate_summaries_batch, batch): batch
                 for batch in batches
             }
-            for future in as_completed(future_to_batch):
-                batch_result = future.result()
-                if batch_result:
-                    for idx_str, summary in batch_result.items():
-                        summaries[idx_str] = summary
-                progress.advance(task_id)
+            try:
+                for future in as_completed(future_to_batch, timeout=_summary_total_timeout):
+                    batch_result = future.result()
+                    if batch_result:
+                        for idx_str, summary in batch_result.items():
+                            summaries[idx_str] = summary
+                    progress.advance(task_id)
+            except TimeoutError:
+                logger.warning(
+                    "Summary generation timed out after %ds — continuing with partial summaries "
+                    "(%d/%d batches completed)",
+                    _summary_total_timeout,
+                    sum(1 for f in future_to_batch if f.done()),
+                    len(future_to_batch),
+                )
 
     # Step 2: Upsert Class nodes
     class_nodes: list[dict] = []
@@ -695,7 +716,7 @@ def resolve_calls_with_jedi(
     repo_root: Path,
 ) -> list[dict]:
     """Wrap jedi resolution with a hard per-file timeout."""
-    timeout=300
+    timeout = JEDI_FILE_TIMEOUT  # was hardcoded to 300, ignoring the env var
     try:
         with _cf.ThreadPoolExecutor(max_workers=1) as _ex:
             fut = _ex.submit(_resolve_calls_with_jedi_inner, parsed_file, repo_root)

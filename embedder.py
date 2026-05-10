@@ -112,27 +112,47 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-EMBED_BASE_URL = os.getenv("EMBED_BASE_URL", "http://127.0.0.1:30001")
-EMBED_MODEL    = os.getenv("EMBED_MODEL", "woodx/Qwen3-Embedding-0.6B-SGLang")
-_BATCH_SIZE    = 128   # max texts per HTTP request
+EMBED_BASE_URL  = os.getenv("EMBED_BASE_URL", "http://127.0.0.1:30001")
+EMBED_MODEL     = os.getenv("EMBED_MODEL", "woodx/Qwen3-Embedding-0.6B-SGLang")
+_BATCH_SIZE     = 128   # max texts per HTTP request
+_EMBED_TIMEOUT  = 120   # seconds per batch (was 600 — reduced to surface hangs early)
+_EMBED_RETRIES  = 3     # retry attempts per batch on transient errors
 
 
 def embed_texts(texts: list[str]) -> list[list[float]]:
     if not texts:
         return []
     all_embeddings: list[list[float]] = []
-    for i in range(0, len(texts), _BATCH_SIZE):
+    total_batches = (len(texts) + _BATCH_SIZE - 1) // _BATCH_SIZE
+    logger.info("Starting embedding of %d texts in %d batches via %s",
+                len(texts), total_batches, EMBED_BASE_URL)
+    for batch_idx, i in enumerate(range(0, len(texts), _BATCH_SIZE)):
         batch = texts[i : i + _BATCH_SIZE]
-        resp = requests.post(
-            f"{EMBED_BASE_URL}/v1/embeddings",
-            json={"model": EMBED_MODEL, "input": batch},
-            timeout=600,
-        )
-        resp.raise_for_status()
-        data = resp.json()["data"]
-        data.sort(key=lambda x: x["index"])
-        all_embeddings.extend(d["embedding"] for d in data)
-    logger.info("Embedded %d texts via SGLang embedding server", len(texts))
+        logger.debug("Embedding batch %d/%d (%d texts)...", batch_idx + 1, total_batches, len(batch))
+        last_err = None
+        for attempt in range(1, _EMBED_RETRIES + 1):
+            try:
+                resp = requests.post(
+                    f"{EMBED_BASE_URL}/v1/embeddings",
+                    json={"model": EMBED_MODEL, "input": batch},
+                    timeout=_EMBED_TIMEOUT,
+                )
+                resp.raise_for_status()
+                data = resp.json()["data"]
+                data.sort(key=lambda x: x["index"])
+                all_embeddings.extend(d["embedding"] for d in data)
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                logger.warning("Embedding batch %d/%d attempt %d/%d failed: %s",
+                               batch_idx + 1, total_batches, attempt, _EMBED_RETRIES, e)
+        if last_err is not None:
+            raise RuntimeError(
+                f"Embedding batch {batch_idx + 1}/{total_batches} failed after "
+                f"{_EMBED_RETRIES} attempts: {last_err}"
+            ) from last_err
+    logger.info("Completed embedding of %d texts (%d batches)", len(texts), total_batches)
     return all_embeddings
 
 

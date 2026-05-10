@@ -96,13 +96,12 @@ def get_downstream_deps(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT
 
 def get_upstream_callers(fqn: str, graph: falkordb.Graph, max_depth: int = BLAST_RADIUS_MAX_DEPTH) -> dict:
     max_depth = int(max_depth)
-    # Prevent traversal through hub nodes and cap the return size
+    # Traverse UPSTREAM: find all callers that transitively call fqn
+    # Arrow is reversed vs get_downstream_deps — (caller)-[:CALLS*..]->(target)
     cypher = (
-        f"MATCH p = (affected:Function)-[:CALLS*1..{max_depth}]->(target:Function {{fqn: $fqn}}) "
-        f"WHERE ALL(n IN nodes(p)[1..-1] WHERE size((n)<-[:CALLS]-()) < 50) "
-        f"RETURN DISTINCT affected.fqn, affected.file_path, length(p) "
-        f"ORDER BY length(p) ASC "
-        f"LIMIT 300"
+        f"MATCH p = (caller:Function)-[:CALLS*1..{max_depth}]->(src:Function {{fqn: $fqn}}) "
+        f"RETURN DISTINCT caller.fqn, caller.file_path, length(p) "
+        f"ORDER BY length(p) ASC LIMIT 300"
     )
     result = graph.query(cypher, {"fqn": fqn})
     affected = [{"fqn": r[0], "file_path": r[1], "distance": r[2]} for r in result.result_set]
@@ -235,60 +234,42 @@ def _get_cached_embedding(fqn: str, embedding_json: str) -> tuple[float, ...]:
 def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
     query_embedding = embed_text(query)
 
-    # Calculate in-degree to rank core utilities higher
-    func_query = """
-    MATCH (f:Function) WHERE f.embedding IS NOT NULL
-    OPTIONAL MATCH ()-[c:CALLS]->(f)
-    RETURN 'Function', f.fqn, f.file_path, f.summary, f.embedding, count(c) as in_degree
-    """
-    func_results = graph.query(func_query)
+    # Fetch ONLY necessary strings without computing heavy global joins
+    func_results = graph.query("MATCH (f:Function) WHERE f.embedding IS NOT NULL RETURN 'Function', f.fqn, f.file_path, f.summary, f.embedding")
+    class_results = graph.query("MATCH (c:Class) WHERE c.embedding IS NOT NULL RETURN 'Class', c.fqn, c.file_path, c.summary, c.embedding")
 
-    class_query = """
-    MATCH (c:Class) WHERE c.embedding IS NOT NULL
-    OPTIONAL MATCH ()-[i:INHERITS_FROM]->(c)
-    RETURN 'Class', c.fqn, c.file_path, c.summary, c.embedding, count(i) as in_degree
-    """
-    class_results = graph.query(class_query)
-
-    module_query = """
-    MATCH (m:Module) WHERE m.embedding IS NOT NULL
-    OPTIONAL MATCH ()-[d:DEFINED_IN]->(m)
-    RETURN 'Module', m.name, m.file_path, 'Module definition', m.embedding, count(d) as in_degree
-    """
-    module_results = graph.query(module_query)
-
-    all_rows = list(func_results.result_set) + list(class_results.result_set) + list(module_results.result_set)
-
-    # Filter rows with valid embeddings and deserialize via lru_cache
+    all_rows = list(func_results.result_set) + list(class_results.result_set)
     valid_rows = []
+    
     for row in all_rows:
-        label, fqn, file_path, summary, embedding_str, in_degree = row
-        if not embedding_str or not fqn:
-            continue
+        label, fqn, file_path, summary, embedding_str = row
+        if not embedding_str or not fqn: continue
         try:
             emb = list(_get_cached_embedding(fqn, embedding_str))
             valid_rows.append((row, emb))
-        except (json.JSONDecodeError, TypeError):
-            logger.warning("Failed to parse embedding for %s", fqn)
+        except Exception:
             continue
 
-    if not valid_rows:
-        return {"query": query, "results": []}
+    if not valid_rows: return {"query": query, "results": []}
 
-    # Vectorized cosine similarity via NumPy
     matrix = np.array([emb for _, emb in valid_rows], dtype=np.float32)
     q_vec = np.array(query_embedding, dtype=np.float32)
-    norms = np.linalg.norm(matrix, axis=1)
-    q_norm = np.linalg.norm(q_vec)
-    scores = (matrix @ q_vec) / (norms * q_norm + 1e-8)
+    scores = (matrix @ q_vec) / (np.linalg.norm(matrix, axis=1) * np.linalg.norm(q_vec) + 1e-8)
 
-    # Apply in-degree re-ranking bonus
+    # Pick top 50 raw candidates first to minimize database overhead
+    top_indices = np.argsort(scores)[::-1][:50]
+    
     scored = []
-    for i, (row, _emb) in enumerate(valid_rows):
-        label, fqn, file_path, summary, _embedding_str, in_degree = row
-        base_score = float(scores[i])
-        weight = 0.05
-        final_score = base_score + (math.log(in_degree + 1) * weight)
+    for idx in top_indices:
+        row = valid_rows[idx][0]
+        label, fqn, file_path, summary, _ = row
+        base_score = float(scores[idx])
+        
+        # Query degree individually ONLY for top candidates
+        deg_res = graph.query("MATCH ()-[r:CALLS]->(n) WHERE n.fqn = $fqn RETURN count(r)", {"fqn": fqn})
+        in_degree = deg_res.result_set[0][0] if deg_res.result_set else 0
+        
+        final_score = base_score + (math.log(in_degree + 1) * 0.05)
         scored.append({
             "label": label, "fqn": fqn, "file_path": file_path,
             "summary": summary, "in_degree": in_degree, "score": round(final_score, 4),

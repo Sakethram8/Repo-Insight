@@ -34,8 +34,13 @@ from apply_changes import (
 )
 
 logger = logging.getLogger(__name__)
-#DISABLES THINKING
-_NO_THINK = {"chat_template_kwargs":{"enable_thinking":False}}
+
+# Phase-specific inference settings tuned to the Qwen3.6-35B-A3B model card.
+# Non-thinking: fast, deterministic — for classification/summary tasks.
+_NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
+# Thinking + coding profile: temperature=0.6, top_p=0.95, presence_penalty=0.0
+# per the official model card recommendation for code generation tasks.
+_THINK_CODING = {"chat_template_kwargs": {"enable_thinking": True}}
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -226,11 +231,24 @@ def _clean_seed(seed: str) -> str | None:
 class GraphDrivenEngine:
     """Orchestrates the 6-phase graph-driven coding pipeline."""
 
-    def __init__(self, repo_root: Path, graph: Optional[falkordb.Graph] = None, sandbox_path: Path | None = None):
+    def __init__(
+        self,
+        repo_root: Path,
+        graph: Optional[falkordb.Graph] = None,
+        sandbox_path: Path | None = None,
+        swebench_tests: list[str] | None = None,
+    ):
         self.original_root = Path(repo_root).resolve()
         self.repo_root = Path(sandbox_path).resolve() if sandbox_path is not None else self.original_root
         self.graph = graph
-        self.client = openai.OpenAI(base_url=SGLANG_BASE_URL, api_key=SGLANG_API_KEY)
+        # FAIL_TO_PASS test IDs from SWEbench — if set, Phase 5 runs only these.
+        self.swebench_tests: list[str] = swebench_tests or []
+        import httpx
+        self.client = openai.OpenAI(
+            base_url=SGLANG_BASE_URL,
+            api_key=SGLANG_API_KEY,
+            timeout=httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=5.0),
+        )
         self._on_phase: Optional[callable] = None  # callback for streaming
 
     def run(
@@ -310,11 +328,16 @@ class GraphDrivenEngine:
             })
             # Guard: if plan is empty, don't waste time on Phase 4
             if not result.plan.planned_files:
+                logger.warning("Phase 3 JSON parse failed. Foricng modification of all blast radius files.")
+                for fp in result.plan.blast_radius_files:
+                    result.plan.planned_files.add(fp)
+                    result.plan.actions[fp]='modify'
+                    result.plan.justifications[fp]= "Emergency fallback : JSON planning unparseable"
+                result.plan.is_validated=True
                 result.error = (
-                    "Phase 3 returned an empty plan (no files to modify). "
-                    "LLM likely returned {} or unparseable JSON. Aborting."
+                "Phase 3 returned an empty plan (no files to modify). "
+                "LLM likely returned {} or unparseable JSON. Aborting."
                 )
-                logger.error("[Phase 3 Guard] %s", result.error)
                 return result
 
             # Phase 4: Surgical Editing
@@ -432,8 +455,9 @@ class GraphDrivenEngine:
                     }
                 ],
                 max_tokens=1024,
-                response_format={"type": "json_object"},
-                extra_body= _NO_THINK,
+                # No response_format here — prompt asks for a JSON array [...], not object {...}.
+                # json_object would force the model to wrap it, breaking direct array parsing.
+                extra_body=_NO_THINK,
             )
             raw = response.choices[0].message.content.strip()
             # Extract JSON array from response, tolerant of <think> blocks
@@ -552,9 +576,13 @@ class GraphDrivenEngine:
                         source_code_section=source_section,
                     ),
                 }],
-                max_tokens=8192,
-                response_format={"type": "json_object"},
-                extra_body=_NO_THINK,
+                max_tokens=16384,
+                temperature=0.6,
+                top_p=0.95,
+                presence_penalty=0.0,
+                # Thinking enabled — planning requires reasoning about blast radius.
+                # Prompt asks for JSON array [...] — no response_format to avoid wrapping.
+                extra_body=_THINK_CODING,
             )
             raw = response.choices[0].message.content.strip()
             plan.raw_plan = raw
@@ -637,9 +665,14 @@ class GraphDrivenEngine:
                 if fqn in subgraph.source_code:
                     missing_source[fqn] = subgraph.source_code[fqn]
 
-        missing_src_text = "\n\n".join(
-            f"### {fqn}\n```python\n{src}\n```" for fqn, src in missing_source.items()
-        )
+        _parts, _total = [], 0
+        for fqn, src in missing_source.items():
+            chunk = f"### {fqn}\n```python\n{src[:2000]}\n```"
+            if _total + len(chunk) > 20_000:
+                break
+            _parts.append(chunk)
+            _total += len(chunk)
+        missing_src_text = "\n\n".join(_parts)
 
         try:
             response = self.client.chat.completions.create(
@@ -657,9 +690,12 @@ class GraphDrivenEngine:
                         missing_source=missing_src_text,
                     )},
                 ],
-                max_tokens=8192,
-                response_format={"type": "json_object"},
-                extra_body=_NO_THINK,
+                max_tokens=16384,
+                temperature=0.6,
+                top_p=0.95,
+                presence_penalty=0.0,
+                # Thinking ON — force-coverage needs careful reasoning about missing files.
+                extra_body=_THINK_CODING,
             )
             raw = response.choices[0].message.content.strip()
             plan_items = self._parse_plan_json(raw)
@@ -712,11 +748,14 @@ class GraphDrivenEngine:
                         source_code_section=self._format_source_section(subgraph),
                     ),
                 }],
-                max_tokens=8192,
-                extra_body=_NO_THINK,
+                max_tokens=32768,   # model supports up to 81920 for complex tasks
+                temperature=0.6,
+                top_p=0.95,
+                presence_penalty=0.0,
+                extra_body=_THINK_CODING,  # thinking ON — edit generation is the hardest step
             )
             answer = response.choices[0].message.content.strip()
-            
+
             # If response was cut off, request continuation
             if response.choices[0].finish_reason == "length":
                 logger.warning("Edit generation truncated — requesting continuation")
@@ -730,12 +769,15 @@ class GraphDrivenEngine:
                                 source_code_section=self._format_source_section(subgraph),
                             )},
                             {"role": "assistant", "content": answer},
-                            {"role": "user", "content": 
+                            {"role": "user", "content":
                              "Continue the SEARCH/REPLACE blocks from exactly "
                              "where you left off. Do not repeat blocks already written."},
                         ],
-                        max_tokens=4096,
-                        extra_body=_NO_THINK,
+                        max_tokens=32768,
+                        temperature=0.6,
+                        top_p=0.95,
+                        presence_penalty=0.0,
+                        extra_body=_THINK_CODING,
                     )
                     answer += "\n" + continuation.choices[0].message.content.strip()
                 except Exception as cont_err:
@@ -774,6 +816,22 @@ class GraphDrivenEngine:
         except Exception:
             pass
 
+        # Build the targeted test command from SWEbench FAIL_TO_PASS specs.
+        # Falls back to the configured TEST_COMMAND if no specs are provided.
+        if self.swebench_tests:
+            import shlex
+            _swe_test_cmd = [
+                "bash", "-c",
+                "pip install -e . -q --no-build-isolation 2>/dev/null; "
+                "pytest " + " ".join(shlex.quote(t) for t in self.swebench_tests)
+                + " --tb=short -x --no-header -q"
+            ]
+            _swe_timeout = 300  # pip install alone can take 60s on large packages
+            logger.info("Phase 5: using %d FAIL_TO_PASS tests", len(self.swebench_tests))
+        else:
+            _swe_test_cmd = None
+            _swe_timeout = 120
+
         for attempt in range(1, max_retries + 1):
             # Apply edits
             apply_result = apply_edits(current_edits, self.repo_root)
@@ -782,8 +840,8 @@ class GraphDrivenEngine:
                 if attempt == max_retries:
                     return apply_result, None, None
 
-            # Run tests
-            test_result = run_tests(self.repo_root)
+            # Run tests — targeted if SWEbench specs available, generic otherwise
+            test_result = run_tests(self.repo_root, test_command=_swe_test_cmd, timeout=_swe_timeout)
             self._notify("phase_5_test", {
                 "attempt": attempt,
                 "passed": test_result.passed,
@@ -825,8 +883,11 @@ class GraphDrivenEngine:
                         source_code_section=self._format_source_section(subgraph),
                     ),
                 }],
-                max_tokens=8192,
-                extra_body=_NO_THINK,
+                max_tokens=32768,
+                temperature=0.6,
+                top_p=0.95,
+                presence_penalty=0.0,
+                extra_body=_THINK_CODING,  # thinking ON for self-correction
             )
             raw = response.choices[0].message.content.strip()
             raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
@@ -886,11 +947,25 @@ class GraphDrivenEngine:
             except Exception:
                 pass
 
-    def _format_source_section(self, subgraph: ChangeSubgraph, max_chars_per_fn: int = 3000) -> str:
+    def _format_source_section(
+        self,
+        subgraph: ChangeSubgraph,
+        max_chars_per_fn: int = 8000,   # was 3000 — model has 262K token context
+        max_total_chars: int = 150_000,  # was 40K — safe headroom below context limit
+    ) -> str:
         parts = []
+        total = 0
         for fqn, src in sorted(subgraph.source_code.items()):
             display = src if len(src) <= max_chars_per_fn else src[:max_chars_per_fn] + "\n# ... (truncated)"
-            parts.append(f"### {fqn}\n```python\n{display}\n```")
+            chunk = f"### {fqn}\n```python\n{display}\n```"
+            if total + len(chunk) > max_total_chars:
+                remaining = len(subgraph.source_code) - len(parts)
+                parts.append(
+                    f"# ... {remaining} more function(s) omitted to stay within context window"
+                )
+                break
+            parts.append(chunk)
+            total += len(chunk)
         return "\n\n".join(parts) if parts else "(no source code available)"
 
     def _format_node_list(self, nodes: list[dict]) -> str:

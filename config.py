@@ -11,12 +11,16 @@ FALKORDB_HOST = os.getenv("FALKORDB_HOST", "172.17.0.1")
 FALKORDB_PORT = int(os.getenv("FALKORDB_PORT", "6379"))
 GRAPH_NAME = os.getenv("GRAPH_NAME", "repo_insight")
 
-SGLANG_BASE_URL = os.getenv("SGLANG_BASE_URL", "http://rocm:30000/v1") 
+SGLANG_BASE_URL = os.getenv("SGLANG_BASE_URL", "http://rocm:30000/v1")
 SGLANG_API_KEY = os.getenv("SGLANG_API_KEY", "EMPTY")
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3.6-35B-A3B")
 
+# Baseline model for "fair fight" comparison (defaults to same server/model)
+BASELINE_SGLANG_BASE_URL = os.getenv("BASELINE_SGLANG_BASE_URL", SGLANG_BASE_URL)
+BASELINE_LLM_MODEL = os.getenv("BASELINE_LLM_MODEL", LLM_MODEL)
+
 # --- Embeddings ---
-EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "all-MiniLM-L6-v2")
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "woodx/Qwen3-Embedding-0.6B-SGLang")
 EMBEDDING_DIM = int(os.getenv("EMBEDDING_DIM", "384"))
 
 # --- Engine & Change Logic (Required by change_engine.py) ---

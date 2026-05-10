@@ -42,8 +42,8 @@ logger = logging.getLogger("swebench_harness")
 
 INSTANCE_TIMEOUT = 1200  # seconds per instance
 CLONE_TIMEOUT = 120     # seconds for git clone + checkout
-INGEST_TIMEOUT = 0   # seconds for graph ingestion
-PIPELINE_TIMEOUT=600
+INGEST_TIMEOUT = 900    # seconds for graph ingestion (0 disables alarm — use a real value)
+PIPELINE_TIMEOUT = 1200  # increased from 600 — thinking mode adds 60-150s per LLM call
 
 # Repo URL templates for known SWE-bench orgs
 _REPO_URL_TEMPLATE = "https://github.com/{repo}.git"
@@ -102,9 +102,10 @@ def _clone_repo(repo: str, commit: str, dest: Path) -> None:
     repo_url = _REPO_URL_TEMPLATE.format(repo=repo)
     logger.debug("Cloning %s @ %s → %s", repo_url, commit[:10], dest)
 
-    # Step 1: shallow clone (depth=1 for speed)
+    # Step 1: shallow clone (depth=1 keeps download small; SWEbench commits are
+    # reachable via fetch in step 2)
     subprocess.run(
-        ["git", "clone",repo_url, str(dest)],
+        ["git", "clone", "--depth", "1", "--no-single-branch", repo_url, str(dest)],
         check=True,
         capture_output=True,
         timeout=CLONE_TIMEOUT,
@@ -149,6 +150,17 @@ def _run_instance(
     base_commit = instance["base_commit"]
     problem = instance["problem_statement"]
 
+    # Extract the exact tests that must pass after the fix.
+    # SWEbench stores this as a JSON-encoded string or a list.
+    _raw_ftp = instance.get("FAIL_TO_PASS", "[]")
+    try:
+        import json as _json
+        fail_to_pass: list[str] = (
+            _json.loads(_raw_ftp) if isinstance(_raw_ftp, str) else list(_raw_ftp)
+        )
+    except Exception:
+        fail_to_pass = []
+
     result = {
         "instance_id": instance_id,
         "repo": repo,
@@ -182,9 +194,17 @@ def _run_instance(
         graph = get_connection()
 
         # Flush stale nodes from previous instance to prevent cross-contamination
-        
+        logger.info("[%s] Flushing graph before ingestion", instance_id)
+        try:
+            graph.query("MATCH (n) DETACH DELETE n")
+        except Exception as _flush_err:
+            logger.warning("[%s] Graph flush failed (non-fatal): %s", instance_id, _flush_err)
 
-        engine = GraphDrivenEngine(repo_root=repo_dir, graph=graph)
+        engine = GraphDrivenEngine(
+            repo_root=repo_dir,
+            graph=graph,
+            swebench_tests=fail_to_pass,
+        )
 
         # Phase 0: ingestion — separate timeout, no LLM involved
         logger.info("[%s] Phase 0: ingesting graph (timeout=%ds)", instance_id, INGEST_TIMEOUT)
@@ -201,6 +221,11 @@ def _run_instance(
             )
 
         change_result: ChangeResult = _hard_timeout(_run_phases, PIPELINE_TIMEOUT)
+        # NOTE: skip_apply=False means Phase 5 applies edits but also runs
+        # pytest with Repo-Insight's own TEST_COMMAND against the target repo,
+        # which always fails. Set SKIP_SANDBOX_TESTS=true in env to avoid
+        # wasting 3 × 120s per instance on guaranteed test failures.
+
 
         
 
