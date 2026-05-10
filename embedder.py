@@ -128,18 +128,22 @@ def embed_texts(texts: list[str]) -> list[list[float]]:
                 len(texts), total_batches, EMBED_BASE_URL)
     for batch_idx, i in enumerate(range(0, len(texts), _BATCH_SIZE)):
         batch = texts[i : i + _BATCH_SIZE]
-        logger.debug("Embedding batch %d/%d (%d texts)...", batch_idx + 1, total_batches, len(batch))
         last_err = None
         for attempt in range(1, _EMBED_RETRIES + 1):
             try:
+                # SGLang embedding servers expose /encode (native) and sometimes
+                # /v1/embeddings (OpenAI-compat). Use /encode — confirmed working.
                 resp = requests.post(
-                    f"{EMBED_BASE_URL}/v1/embeddings",
+                    f"{EMBED_BASE_URL}/encode",
                     json={"model": EMBED_MODEL, "input": batch},
                     timeout=_EMBED_TIMEOUT,
                 )
                 resp.raise_for_status()
-                data = resp.json()["data"]
-                data.sort(key=lambda x: x["index"])
+                raw = resp.json()
+                # /encode returns a plain list; /v1/embeddings returns {"data": [...]}
+                data = raw if isinstance(raw, list) else raw["data"]
+                if not isinstance(raw, list):
+                    data.sort(key=lambda x: x["index"])
                 all_embeddings.extend(d["embedding"] for d in data)
                 last_err = None
                 break

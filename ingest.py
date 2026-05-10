@@ -95,6 +95,19 @@ def get_connection() -> falkordb.Graph:
     )
 
 
+def drop_graph() -> None:
+    """Delete the graph key via raw Redis DEL — removes nodes, edges AND schema.
+    FalkorDB.delete() does not exist in falkordb==1.0.3; this always works."""
+    import redis as _redis
+    try:
+        r = _redis.Redis(host=FALKORDB_HOST, port=FALKORDB_PORT,
+                         socket_timeout=None, socket_connect_timeout=10)
+        removed = r.delete(GRAPH_NAME)
+        logger.info("Graph key deleted (Redis DEL, keys removed: %d)", removed)
+    except Exception as e:
+        logger.warning("drop_graph failed (non-fatal): %s", e)
+
+
 def create_indices(graph: falkordb.Graph) -> None:
     """Create FalkorDB indices for fast lookups. Idempotent."""
     index_queries = [
@@ -147,14 +160,22 @@ def generate_summaries_batch(batch: list[tuple[str, str, str, str]]) -> dict[str
                 },
                 {"role": "user", "content": prompt},
             ],
-            max_tokens=512,   # 15 summaries × ~30 tokens each; 8192 was saturating KV cache
+            max_tokens=512,
             temperature=0,
-            response_format={"type": "json_object"},
+            # response_format={"type": "json_object"} removed — causes empty content
+            # with enable_thinking=false on this SGLang version. We parse JSON manually.
             extra_body=_NO_THINK,
         )
         content = response.choices[0].message.content
-        if not content or not content.strip():
-            logger.error("Batch summary: empty model content")
+        # Some SGLang versions return None when thinking blocks absorb all output
+        if not content:
+            rc = getattr(response.choices[0].message, "reasoning_content", None)
+            content = rc or ""
+        # Strip any <think>...</think> blocks before JSON parsing
+        import re as _re
+        content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
+        if not content:
+            logger.error("Batch summary: empty model content after stripping thinking")
             return {}
         raw = content.strip()
         logger.debug("Batch summary raw content (first 300): %s", raw[:300])

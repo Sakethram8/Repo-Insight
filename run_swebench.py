@@ -207,24 +207,10 @@ def _run_instance(
         logger.info("[%s] Running 6-phase pipeline", instance_id)
 
         if flush_graph:
-            # Use raw Redis DEL to remove the graph key entirely — this wipes
-            # nodes, edges AND the FalkorDB schema atomically, regardless of
-            # falkordb Python client version. graph.delete() may not exist in
-            # falkordb==1.0.3, and MATCH(n) DETACH DELETE n leaves the schema
-            # intact causing "Attempted to access undefined attribute" errors.
             logger.info("[%s] Flushing graph (repo changed)", instance_id)
-            try:
-                import redis as _redis
-                _r = _redis.Redis(
-                    host=FALKORDB_HOST, port=FALKORDB_PORT,
-                    socket_timeout=None, socket_connect_timeout=10,
-                )
-                deleted = _r.delete(GRAPH_NAME)
-                logger.info("[%s] Graph key deleted via Redis DEL (keys removed: %d)",
-                            instance_id, deleted)
-            except Exception as _flush_err:
-                logger.warning("[%s] Redis DEL failed (non-fatal): %s", instance_id, _flush_err)
-            graph = get_connection()  # fresh empty graph
+            from ingest import drop_graph
+            drop_graph()
+            graph = get_connection()
         else:
             # Same repo as previous instance: keep graph, let content-hash
             # incremental logic in run_ingestion re-ingest only changed files.
