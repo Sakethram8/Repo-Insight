@@ -190,16 +190,27 @@ def canonicalize_fqn(fqn: str, reexport_map: dict[str, str]) -> str:
     """
     if not reexport_map:
         return fqn
-    parts = fqn.split(".")
-    for i in range(len(parts), 0, -1):
-        prefix = ".".join(parts[:i])
-        if prefix in reexport_map:
-            canonical_prefix = reexport_map[prefix]
-            suffix = ".".join(parts[i:])
-            result = f"{canonical_prefix}.{suffix}" if suffix else canonical_prefix
-            # One more pass handles chained re-exports (A → B → C)
-            return canonicalize_fqn(result, reexport_map)
-    return fqn
+    seen = {fqn}
+    current = fqn
+    for _ in range(16):   # max 16 hops — handles chains, prevents infinite loops
+        parts = current.split(".")
+        matched = False
+        for i in range(len(parts), 0, -1):
+            prefix = ".".join(parts[:i])
+            if prefix in reexport_map:
+                canonical_prefix = reexport_map[prefix]
+                suffix = ".".join(parts[i:])
+                candidate = f"{canonical_prefix}.{suffix}" if suffix else canonical_prefix
+                if candidate == current or candidate in seen:
+                    # Cycle or self-reference — stop here
+                    return current
+                seen.add(candidate)
+                current = candidate
+                matched = True
+                break
+        if not matched:
+            break
+    return current
 
 
 # ---------------------------------------------------------------------------
