@@ -433,8 +433,8 @@ class TestEnsureGraphFresh:
 
         engine._ensure_graph_fresh()
 
-        # Ensure run_ingestion was called with sandbox path
-        mock_ingest.assert_called_once_with(str(sandbox_root))
+        # Ensure run_ingestion was called with sandbox path (graph_name kwarg also present)
+        mock_ingest.assert_called_once_with(str(sandbox_root), graph_name=None)
 
     def test_skips_ingestion_when_fingerprint_matches(self, tmp_path):
         original_root = tmp_path / "original"

@@ -233,11 +233,13 @@ class GraphDrivenEngine:
         sandbox_path: Path | None = None,
         swebench_tests: list[str] | None = None,
         index: Optional[GraphIndex] = None,
+        graph_name: Optional[str] = None,
     ):
         self.original_root = Path(repo_root).resolve()
         self.repo_root = Path(sandbox_path).resolve() if sandbox_path is not None else self.original_root
         self.graph = graph
         self.index = index  # Optional in-memory adjacency cache — speeds up Phase 2
+        self.graph_name = graph_name  # None → use config GRAPH_NAME
         # FAIL_TO_PASS test IDs from SWEbench — if set, Phase 5 runs only these.
         self.swebench_tests: list[str] = swebench_tests or []
         import httpx
@@ -515,8 +517,8 @@ class GraphDrivenEngine:
             return {"skipped": True, "reason": "no file changes detected", "fingerprint": fingerprint}
 
         # Run ingestion and store new fingerprint
-        report = run_ingestion(str(self.repo_root))
-        self.graph = get_connection()
+        report = run_ingestion(str(self.repo_root), graph_name=self.graph_name)
+        self.graph = get_connection(self.graph_name)
 
         try:
             self.graph.query(

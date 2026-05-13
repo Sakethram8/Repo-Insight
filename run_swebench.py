@@ -180,6 +180,7 @@ def _run_instance(
     output_dir: Path,
     skip_existing: bool,
     flush_graph: bool = True,
+    graph_name: str | None = None,
 ) -> dict:
     """Process a single SWE-bench instance. Returns a result dict.
 
@@ -241,18 +242,17 @@ def _run_instance(
         if flush_graph:
             logger.info("[%s] Flushing graph (repo changed)", instance_id)
             from ingest import drop_graph
-            drop_graph()
-            graph = get_connection()
+            drop_graph(graph_name)
+            graph = get_connection(graph_name)
         else:
-            # Same repo as previous instance: keep graph, let content-hash
-            # incremental logic in run_ingestion re-ingest only changed files.
             logger.info("[%s] Same repo — reusing graph (incremental update)", instance_id)
-            graph = get_connection()
+            graph = get_connection(graph_name)
 
         engine = GraphDrivenEngine(
             repo_root=repo_dir,
             graph=graph,
             swebench_tests=fail_to_pass,
+            graph_name=graph_name,
         )
 
         # Phase 0: ingestion — separate timeout, no LLM involved
@@ -373,6 +373,106 @@ def _run_instance(
 
 
 # ---------------------------------------------------------------------------
+# Sequential and parallel runners
+# ---------------------------------------------------------------------------
+
+def _run_sequential(
+    dataset: list,
+    output_dir: Path,
+    skip_existing: bool,
+    graph_name: str | None = None,
+) -> list[dict]:
+    """Process instances one at a time, reusing the graph across same-repo runs."""
+    results = []
+    prev_repo: str | None = None
+    prev_commit: str | None = None
+
+    for i, instance in enumerate(dataset, 1):
+        iid = instance["instance_id"]
+        current_repo = instance["repo"]
+        base_commit = instance["base_commit"]
+        flush = (current_repo != prev_repo) or (base_commit != prev_commit)
+        prev_repo = current_repo
+        prev_commit = base_commit
+
+        logger.info("━━━ [%d/%d] %s ━━━", i, len(dataset), iid)
+        try:
+            result = _run_instance(instance, output_dir, skip_existing,
+                                   flush_graph=flush, graph_name=graph_name)
+        except TimeoutError:
+            logger.error("[%s] Hard wall-clock timeout after %ds", iid, INSTANCE_TIMEOUT)
+            result = {
+                "instance_id": iid, "repo": instance["repo"],
+                "status": "timeout", "patch_file": None,
+                "phases_completed": [], "timing_s": float(INSTANCE_TIMEOUT),
+                "error": f"Timeout after {INSTANCE_TIMEOUT}s",
+                "syntax_valid": None, "syntax_error": None,
+            }
+        results.append(result)
+
+    return results
+
+
+def _worker_chunk(args_tuple: tuple) -> list[dict]:
+    """Entry point for a parallel worker process — processes a contiguous chunk."""
+    worker_id, chunk, output_dir_str, skip_existing = args_tuple
+    from config import GRAPH_NAME
+    graph_name = f"{GRAPH_NAME}_w{worker_id}"
+    output_dir = Path(output_dir_str)
+    # Re-configure logging in the worker process
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    logger.info("Worker %d starting: %d instances, graph=%s", worker_id, len(chunk), graph_name)
+    return _run_sequential(chunk, output_dir, skip_existing, graph_name=graph_name)
+
+
+def _run_parallel(
+    dataset: list,
+    output_dir: Path,
+    skip_existing: bool,
+    n_workers: int,
+) -> list[dict]:
+    """Split dataset into contiguous chunks and process in parallel worker processes.
+
+    Contiguous split (not round-robin) keeps same-repo instances together in each
+    worker so the graph-reuse optimisation still applies within each worker.
+    """
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    chunk_size = (len(dataset) + n_workers - 1) // n_workers
+    chunks = [dataset[i : i + chunk_size] for i in range(0, len(dataset), chunk_size)]
+
+    worker_args = [
+        (i, chunk, str(output_dir), skip_existing)
+        for i, chunk in enumerate(chunks)
+        if chunk
+    ]
+
+    logger.info(
+        "Parallel mode: %d workers, chunk sizes: %s",
+        len(worker_args),
+        [len(w[1]) for w in worker_args],
+    )
+
+    all_results: list[dict] = []
+    with ProcessPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_worker_chunk, wa): wa[0] for wa in worker_args}
+        for future in as_completed(futures):
+            worker_id = futures[future]
+            try:
+                chunk_results = future.result()
+                all_results.extend(chunk_results)
+                logger.info("Worker %d finished: %d results", worker_id, len(chunk_results))
+            except Exception as e:
+                logger.error("Worker %d failed: %s", worker_id, e, exc_info=True)
+
+    return all_results
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -409,6 +509,12 @@ def main():
         type=str,
         default="./logs",
         help="Directory for log files (default: ./logs)",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel worker processes, each with its own FalkorDB graph (default: 1)",
     )
     args = parser.parse_args()
 
@@ -447,37 +553,13 @@ def main():
         logger.info("Limited to %d instances", len(dataset))
 
     # -- Run --
-    results = []
-    prev_repo: str | None = None
-    prev_commit: str | None = None
-    for i, instance in enumerate(dataset, 1):
-        iid = instance["instance_id"]
-        current_repo = instance["repo"]
-        base_commit_outer = instance["base_commit"]
-        # Flush whenever repo OR commit changes — same repo at a different commit
-        # can have deleted files whose ghost nodes would otherwise stay in the graph.
-        flush = (current_repo != prev_repo) or (base_commit_outer != prev_commit)
-        prev_repo = current_repo
-        prev_commit = base_commit_outer
-        logger.info(
-            "━━━ [%d/%d] %s ━━━",
-            i, len(dataset), iid,
-        )
-        try:
-            result = _run_instance(instance, output_dir, args.skip_existing,
-                                   flush_graph=flush)
-        except TimeoutError:
-            logger.error("[%s] Hard wall-clock timeout after %ds", iid, INSTANCE_TIMEOUT)
-            result = {
-                "instance_id": iid,
-                "repo": instance["repo"],
-                "status": "timeout",
-                "patch_file": None,
-                "phases_completed": [],
-                "timing_s": float(INSTANCE_TIMEOUT),
-                "error": f"Timeout after {INSTANCE_TIMEOUT}s",
-            }
-        results.append(result)
+    n_workers = max(1, args.workers)
+    logger.info("Running with %d worker(s)", n_workers)
+
+    if n_workers == 1:
+        results = _run_sequential(dataset, output_dir, args.skip_existing, graph_name=None)
+    else:
+        results = _run_parallel(dataset, output_dir, args.skip_existing, n_workers)
 
     # -- Summary --
     total = len(results)

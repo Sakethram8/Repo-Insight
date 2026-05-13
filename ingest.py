@@ -11,7 +11,7 @@ import os
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional
+from typing import Any, Optional
 import falkordb
 import os as _os
 import signal as _signal
@@ -58,15 +58,20 @@ _MAX_CONNECT_RETRIES = 3
 _CONNECT_BACKOFF_BASE = 1.0  # seconds
 
 
-def get_connection() -> falkordb.Graph:
-    """Connect to FalkorDB with exponential-backoff retry."""
+def get_connection(graph_name: str | None = None) -> falkordb.Graph:
+    """Connect to FalkorDB with exponential-backoff retry.
+
+    graph_name overrides the GRAPH_NAME config — used by parallel SWE-bench
+    workers so each worker has its own isolated graph namespace.
+    """
+    name = graph_name or GRAPH_NAME
     last_err: Exception | None = None
     for attempt in range(_MAX_CONNECT_RETRIES):
         try:
             db = falkordb.FalkorDB(host=FALKORDB_HOST, port=FALKORDB_PORT,
-                                   socket_timeout=None,      # no per-query limit — SIGALRM handles overall timeout
+                                   socket_timeout=None,
                                    socket_connect_timeout=10)
-            return db.select_graph(GRAPH_NAME)
+            return db.select_graph(name)
         except Exception as e:
             last_err = e
             wait = _CONNECT_BACKOFF_BASE * (2 ** attempt)
@@ -81,14 +86,14 @@ def get_connection() -> falkordb.Graph:
     )
 
 
-def drop_graph() -> None:
-    """Delete the graph key via raw Redis DEL — removes nodes, edges AND schema.
-    FalkorDB.delete() does not exist in falkordb==1.0.3; this always works."""
+def drop_graph(graph_name: str | None = None) -> None:
+    """Delete the graph key via raw Redis DEL — removes nodes, edges AND schema."""
     import redis as _redis
+    name = graph_name or GRAPH_NAME
     try:
         r = _redis.Redis(host=FALKORDB_HOST, port=FALKORDB_PORT,
                          socket_timeout=None, socket_connect_timeout=10)
-        removed = r.delete(GRAPH_NAME)
+        removed = r.delete(name)
         logger.info("Graph key deleted (Redis DEL, keys removed: %d)", removed)
     except Exception as e:
         logger.warning("drop_graph failed (non-fatal): %s", e)
@@ -545,7 +550,7 @@ def ingest_parsed_files(
         logger.info("Jedi upgraded %d additional CALLS edges", jedi_upgraded)
 
 
-def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
+def run_ingestion(directory_path: str, *, on_progress=None, graph_name: str | None = None) -> dict:
     """Run full ingestion pipeline: parse, summarise, embed, and write to graph.
 
     Returns a summary dict with counts of all entities ingested.
@@ -554,7 +559,7 @@ def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
     if not dir_path.exists():
         raise FileNotFoundError(f"Directory not found: {directory_path}")
 
-    graph = get_connection()
+    graph = get_connection(graph_name)
 
     if FLUSH_GRAPH_ON_INGEST:
         try:
@@ -685,6 +690,17 @@ except ImportError:
     _JEDI_AVAILABLE = False
     logger.info("Jedi not installed; using tree-sitter fallback for call resolution")
 
+# Shared jedi.Project cache — one project per repo_root, reused across all files
+# in the same ingestion run. Creating a Project is expensive (~100ms+); sharing it
+# cuts Jedi startup cost from O(files) to O(1) per repo.
+_jedi_project_cache: dict[str, Any] = {}
+
+def _get_jedi_project(repo_root: Path) -> Any:
+    key = str(repo_root)
+    if key not in _jedi_project_cache:
+        _jedi_project_cache[key] = _jedi.Project(path=key)
+    return _jedi_project_cache[key]
+
 
 JEDI_FILE_TIMEOUT = int(_os.getenv("JEDI_FILE_TIMEOUT", "5"))
 def resolve_calls_with_jedi(
@@ -720,9 +736,16 @@ def _resolve_calls_with_jedi_inner(
     if not file_path.exists() or file_path.suffix != ".py":
         return []
 
+    # Skip test files — they rarely contain the target code, and Jedi spends
+    # most of its time resolving mock/fixture chains that don't become graph edges.
+    rel_parts = Path(parsed_file.file_path).parts
+    if any(p in ("tests", "test", "testing") or p.startswith("test_")
+           for p in rel_parts):
+        return []
+
     try:
         source = file_path.read_text(encoding="utf-8")
-        project = _jedi.Project(path=str(repo_root))
+        project = _get_jedi_project(repo_root)   # cached — not recreated per file
         script = _jedi.Script(source, path=str(file_path), project=project)
     except Exception as e:
         logger.debug("Jedi init failed for %s: %s", parsed_file.file_path, e)
