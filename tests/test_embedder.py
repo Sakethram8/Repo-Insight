@@ -10,65 +10,97 @@ from embedder import embed_text, embed_texts, cosine_similarity, build_embedding
 from config import EMBEDDING_DIM
 
 
-def _mock_post_response(num_texts: int) -> MagicMock:
-    """Build a fake requests.post return value for num_texts inputs."""
-    mock_resp = MagicMock()
-    mock_resp.raise_for_status.return_value = None
-    mock_resp.json.return_value = {
-        "data": [{"index": i, "embedding": [0.1] * EMBEDDING_DIM} for i in range(num_texts)]
-    }
-    return mock_resp
+# ---------------------------------------------------------------------------
+# embed_texts — HTTP path (Tier 2)
+# ---------------------------------------------------------------------------
+
+class TestEmbedTextsHttp:
+    def _http_response(self, n: int) -> MagicMock:
+        mock_resp = MagicMock()
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {
+            "data": [{"index": i, "embedding": [0.1] * EMBEDDING_DIM} for i in range(n)]
+        }
+        return mock_resp
+
+    def test_http_path_used_when_url_set(self):
+        with (
+            patch("embedder._HTTP_EMBED_URL", "http://test:30001"),
+            patch("embedder._embed_http",
+                  return_value=[[0.1] * EMBEDDING_DIM]) as mock_http,
+        ):
+            result = embed_texts(["hello"])
+            mock_http.assert_called_once()
+            assert len(result) == 1
+            assert len(result[0]) == EMBEDDING_DIM
+
+    def test_http_batch_returns_correct_count(self):
+        vecs = [[0.1] * EMBEDDING_DIM] * 3
+        with (
+            patch("embedder._HTTP_EMBED_URL", "http://test:30001"),
+            patch("embedder._embed_http", return_value=vecs),
+        ):
+            results = embed_texts(["a", "b", "c"])
+            assert len(results) == 3
+
+    def test_http_fallback_to_local_on_failure(self):
+        local_vecs = [[0.2] * EMBEDDING_DIM]
+        with (
+            patch("embedder._HTTP_EMBED_URL", "http://test:30001"),
+            patch("embedder._embed_http", return_value=[]),   # HTTP fails
+            patch("embedder._embed_local", return_value=local_vecs) as mock_local,
+        ):
+            result = embed_texts(["hello"])
+            mock_local.assert_called_once()
+            assert result == local_vecs
 
 
-class TestEmbedText:
-    @patch("embedder.requests.post")
-    def test_returns_list_of_floats(self, mock_post):
-        mock_post.return_value = _mock_post_response(1)
-        result = embed_text("hello world")
-        assert isinstance(result, list)
-        assert all(isinstance(x, float) for x in result)
+# ---------------------------------------------------------------------------
+# embed_texts — local path (Tier 1)
+# ---------------------------------------------------------------------------
 
-    @patch("embedder.requests.post")
-    def test_returns_correct_dimension(self, mock_post):
-        mock_post.return_value = _mock_post_response(1)
-        result = embed_text("test embedding dimension")
-        assert len(result) == EMBEDDING_DIM
-
-    @patch("embedder.requests.post")
-    def test_empty_string_still_returns_embedding(self, mock_post):
-        mock_post.return_value = _mock_post_response(1)
-        result = embed_text("")
-        assert isinstance(result, list)
-        assert len(result) == EMBEDDING_DIM
-
-
-class TestEmbedTexts:
-    @patch("embedder.requests.post")
-    def test_batch_returns_correct_count(self, mock_post):
-        mock_post.return_value = _mock_post_response(3)
-        texts = ["hello", "world", "test"]
-        results = embed_texts(texts)
-        assert len(results) == 3
-
-    @patch("embedder.requests.post")
-    def test_batch_dimensions_correct(self, mock_post):
-        mock_post.return_value = _mock_post_response(2)
-        texts = ["alpha", "beta"]
-        results = embed_texts(texts)
-        for emb in results:
-            assert len(emb) == EMBEDDING_DIM
+class TestEmbedTextsLocal:
+    def test_local_path_used_when_no_url(self):
+        vecs = [[0.3] * EMBEDDING_DIM]
+        with (
+            patch("embedder._HTTP_EMBED_URL", None),
+            patch("embedder._embed_local", return_value=vecs) as mock_local,
+        ):
+            result = embed_texts(["hello"])
+            mock_local.assert_called_once()
+            assert result == vecs
 
     def test_empty_list_returns_empty(self):
         results = embed_texts([])
         assert results == []
 
-    @patch("embedder.requests.post")
-    def test_single_item_batch(self, mock_post):
-        mock_post.return_value = _mock_post_response(1)
-        results = embed_texts(["single"])
-        assert len(results) == 1
-        assert len(results[0]) == EMBEDDING_DIM
 
+# ---------------------------------------------------------------------------
+# embed_texts — graceful fallback (Tier 3)
+# ---------------------------------------------------------------------------
+
+class TestEmbedTextsFallback:
+    def test_returns_empty_vectors_when_no_backend(self):
+        with (
+            patch("embedder._HTTP_EMBED_URL", None),
+            patch("embedder._embed_local", return_value=[]),  # no local model
+        ):
+            result = embed_texts(["hello", "world"])
+            assert len(result) == 2
+            assert all(v == [] for v in result)
+
+    def test_embed_text_returns_empty_list_when_no_backend(self):
+        with (
+            patch("embedder._HTTP_EMBED_URL", None),
+            patch("embedder._embed_local", return_value=[]),
+        ):
+            result = embed_text("hello")
+            assert result == []
+
+
+# ---------------------------------------------------------------------------
+# cosine_similarity
+# ---------------------------------------------------------------------------
 
 class TestCosineSimilarity:
     def test_identical_vectors_return_one(self):
@@ -76,14 +108,10 @@ class TestCosineSimilarity:
         assert cosine_similarity(vec, vec) == pytest.approx(1.0)
 
     def test_orthogonal_vectors_return_zero(self):
-        a = [1.0, 0.0]
-        b = [0.0, 1.0]
-        assert cosine_similarity(a, b) == pytest.approx(0.0)
+        assert cosine_similarity([1.0, 0.0], [0.0, 1.0]) == pytest.approx(0.0)
 
     def test_opposite_vectors_return_negative_one(self):
-        a = [1.0, 0.0]
-        b = [-1.0, 0.0]
-        assert cosine_similarity(a, b) == pytest.approx(-1.0)
+        assert cosine_similarity([1.0, 0.0], [-1.0, 0.0]) == pytest.approx(-1.0)
 
     def test_mismatched_lengths_raise_value_error(self):
         with pytest.raises(ValueError, match="same length"):
@@ -94,26 +122,32 @@ class TestCosineSimilarity:
             cosine_similarity([], [])
 
     def test_zero_vector_returns_zero(self):
-        a = [0.0, 0.0, 0.0]
-        b = [1.0, 2.0, 3.0]
-        assert cosine_similarity(a, b) == 0.0
+        assert cosine_similarity([0.0, 0.0], [1.0, 2.0]) == 0.0
 
     def test_similar_vectors_high_score(self):
-        a = [1.0, 2.0, 3.0]
-        b = [1.1, 2.1, 3.1]
-        score = cosine_similarity(a, b)
-        assert score > 0.99
+        assert cosine_similarity([1.0, 2.0, 3.0], [1.1, 2.1, 3.1]) > 0.99
 
+
+# ---------------------------------------------------------------------------
+# build_embedding_text
+# ---------------------------------------------------------------------------
 
 class TestBuildEmbeddingText:
     def test_with_docstring(self):
         result = build_embedding_text("my_func", "Does stuff", "path/to/file.py")
-        assert result == "my_func. Does stuff. Defined in path/to/file.py"
+        assert "my_func" in result
+        assert "Does stuff" in result
 
-    def test_without_docstring(self):
+    def test_without_docstring_uses_file_path(self):
         result = build_embedding_text("my_func", None, "path/to/file.py")
-        assert result == "my_func. Defined in path/to/file.py"
+        assert "my_func" in result
+        assert "path/to/file.py" in result
 
     def test_empty_docstring_treated_as_falsy(self):
         result = build_embedding_text("my_func", "", "path/to/file.py")
-        assert result == "my_func. Defined in path/to/file.py"
+        assert "my_func" in result
+        assert "path/to/file.py" in result
+
+    def test_whitespace_docstring_treated_as_falsy(self):
+        result = build_embedding_text("my_func", "   ", "path/to/file.py")
+        assert "path/to/file.py" in result

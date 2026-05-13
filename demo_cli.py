@@ -314,6 +314,82 @@ def run_mode_c(query: str, repo_path: str, graph: falkordb.Graph, console: Conso
     return mode_c_data
 
 
+def run_mode_d(ref: str, repo_path: str, graph: falkordb.Graph, console: Console) -> dict:
+    """Mode D: git-diff entry — automatically fix what broke since a git ref."""
+    from change_engine import GraphDrivenEngine
+
+    console.print()
+    console.print(f"[bold bright_cyan]━━━ MODE D: Git-Diff Auto-Fix (ref: {ref}) ━━━[/bold bright_cyan]")
+    console.print()
+
+    mode_d_data = {"time": 0, "answer": "", "error": None, "phases": [], "edits": 0}
+
+    phase_table = Table(
+        title="[bold cyan]Git-Diff Pipeline (Live)[/bold cyan]",
+        show_header=True, header_style="bold magenta",
+    )
+    phase_table.add_column("Phase", style="cyan", width=40)
+    phase_table.add_column("Status", style="green", width=15)
+    phase_table.add_column("Details", style="yellow", max_width=40)
+
+    def _on_phase(phase: str, data: dict) -> None:
+        labels = {
+            "phase_0": "Phase 0: Git Diff Impact",
+            "phase_1": "Phase 1: Seeds from Git Diff",
+            "phase_2": "Phase 2: Structural Expansion",
+            "phase_3": "Phase 3: Graph-Constrained Planning",
+            "phase_4": "Phase 4: Surgical Editing",
+            "phase_5": "Phase 5: Verified Apply",
+        }
+        label = labels.get(phase, phase)
+        detail = ""
+        if phase == "phase_0":
+            detail = f"{data.get('total_at_risk', '?')} at-risk callers"
+        elif phase == "phase_1":
+            seeds = data.get("seeds", [])
+            detail = f"{len(seeds)} seeds from diff"
+        elif phase == "phase_2":
+            detail = f"{data.get('blast_radius_count', '?')} blast nodes"
+        elif phase == "phase_3":
+            detail = f"validated={data.get('is_validated')}"
+            mode_d_data["edits"] = data.get("edit_blocks", 0)
+        elif phase == "phase_4":
+            detail = f"{data.get('edit_blocks', 0)} SEARCH/REPLACE blocks"
+            mode_d_data["edits"] = data.get("edit_blocks", 0)
+        phase_table.add_row(label, "✓ Done", detail)
+
+    try:
+        from rich.live import Live
+        engine = GraphDrivenEngine(Path(repo_path).resolve(), graph)
+        start = time.time()
+
+        with Live(phase_table, console=console, refresh_per_second=4):
+            result = engine.run_from_diff(ref=ref, on_phase=_on_phase)
+
+        elapsed = time.time() - start
+        mode_d_data["time"] = round(elapsed, 1)
+        mode_d_data["answer"] = result.answer
+        mode_d_data["phases"] = result.phases_completed
+
+        console.print()
+        console.print(Panel(
+            result.answer if result.answer else "(no answer generated)",
+            title=f"[bold bright_cyan]MODE D: Git-Diff Auto-Fix ({ref})[/bold bright_cyan]",
+            subtitle=f"[dim]{elapsed:.1f}s | {mode_d_data['edits']} edits[/dim]",
+            border_style="bright_cyan",
+            padding=(1, 2),
+        ))
+
+        if result.error:
+            console.print(f"[red]Error: {result.error}[/red]")
+
+    except Exception as e:
+        mode_d_data["error"] = str(e)
+        console.print(Panel(f"[red]Error in Mode D: {e}[/red]", title="MODE D: Error", border_style="red"))
+
+    return mode_d_data
+
+
 def _show_comparison(mode_b_data: dict, console: Console,
                      mode_c_data: dict = None) -> None:
     """Show a quantitative comparison table between modes."""
@@ -407,12 +483,18 @@ def main() -> None:
         "--mode",
         type=str,
         default="b",
-        help="Which mode(s) to run:  b, c, bc, Default: b",
+        help="Which mode(s) to run: b, c, bc, d. Default: b. Mode d = git-diff auto-fix.",
     )
     parser.add_argument(
         "--score",
         action="store_true",
         help="Run quantitative scoring suite (precision/recall/F1)",
+    )
+    parser.add_argument(
+        "--ref",
+        type=str,
+        default="HEAD",
+        help="Git ref for Mode D (git-diff entry mode). Default: HEAD",
     )
 
     args = parser.parse_args()
@@ -510,6 +592,10 @@ def main() -> None:
 
     if "c" in args.mode and graph is not None:
         mode_c_data = run_mode_c(selected_prompt, args.path, graph, console)
+
+    if "d" in args.mode and graph is not None:
+        run_mode_d(args.ref, args.path, graph, console)
+        return  # Mode D is standalone — no comparison table
 
     # Step 4: Comparison summary
     if len(args.mode) > 1 and mode_b_data:

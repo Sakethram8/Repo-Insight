@@ -1,0 +1,75 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "repo-insight"
+version = "0.2.0"
+description = "Graph-driven code analysis and surgical change engine for Python repositories"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Sakethram", email = "sakethram8@gmail.com" }]
+keywords = ["code-analysis", "graph", "refactoring", "llm", "mcp"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+
+# Core runtime deps — always required
+dependencies = [
+    "tree-sitter==0.23.2",
+    "tree-sitter-python==0.23.6",
+    "falkordb>=1.0.3",
+    "openai>=1.50.0",
+    "numpy>=2.2.5",
+    "python-dotenv>=1.0.0",
+    "watchdog>=4.0.0",
+    "mcp>=1.0.0",
+    "rich>=13.7.1",
+    "jedi>=0.19.0",
+]
+
+[project.optional-dependencies]
+# Local sentence-transformers embedding (Tier 1)
+local-embed = [
+    "sentence-transformers>=3.0.1",
+]
+# Streamlit UI
+ui = [
+    "streamlit>=1.35.0",
+    "streamlit-agraph>=0.0.45",
+    "pandas>=2.0.0",
+]
+# Development / testing
+dev = [
+    "pytest>=8.2.0",
+    "pytest-mock>=3.14.0",
+]
+# All optional deps
+all = [
+    "repo-insight[local-embed,ui,dev]",
+]
+
+[project.scripts]
+# CLI entry points — installed as shell commands after `pip install`
+repo-insight       = "demo_cli:main"
+repo-insight-mcp   = "mcp_server:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["repo_insight*"]
+
+[tool.setuptools.package-data]
+"*" = ["*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --tb=short"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

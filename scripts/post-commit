@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# Repo-Insight post-commit hook
+# Prints breaking callers whenever a commit changes Python function interfaces.
+#
+# Install:
+#   ln -sf ../../scripts/post-commit .git/hooks/post-commit
+set -euo pipefail
+
+REPO_ROOT="$(git rev-parse --show-toplevel)"
+
+python -c "
+import json, sys
+sys.path.insert(0, '$REPO_ROOT')
+from git_tools import git_diff_impact
+from ingest import get_connection
+
+g = get_connection()
+result = git_diff_impact('HEAD', repo_root='$REPO_ROOT', graph=g)
+
+if result.get('total_at_risk', 0) > 0:
+    print()
+    print('Repo-Insight: breaking changes detected')
+    print(json.dumps(result, indent=2))
+else:
+    print('Repo-Insight: no breaking changes.')
+" 2>/dev/null || true  # non-zero exit must not block the commit

@@ -15,6 +15,14 @@ SGLANG_BASE_URL = os.getenv("SGLANG_BASE_URL", "http://rocm:30000/v1")
 SGLANG_API_KEY = os.getenv("SGLANG_API_KEY", "EMPTY")
 LLM_MODEL = os.getenv("LLM_MODEL", "Qwen/Qwen3.6-35B-A3B")
 
+# Provider controls whether thinking/non-thinking extra_body params are sent.
+# sglang  — sends {"chat_template_kwargs": {"enable_thinking": ...}} (SGLang/Qwen3)
+# openai  — no extra_body (works with OpenAI, Azure, Together, etc.)
+# auto    — sglang if SGLANG_BASE_URL is set and doesn't look like openai.com, else openai
+_base = SGLANG_BASE_URL or ""
+_default_provider = "sglang" if ("openai.com" not in _base and "anthropic.com" not in _base) else "openai"
+LLM_PROVIDER = os.getenv("LLM_PROVIDER", _default_provider)
+
 # Baseline model for "fair fight" comparison (defaults to same server/model)
 BASELINE_SGLANG_BASE_URL = os.getenv("BASELINE_SGLANG_BASE_URL", SGLANG_BASE_URL)
 BASELINE_LLM_MODEL = os.getenv("BASELINE_LLM_MODEL", LLM_MODEL)

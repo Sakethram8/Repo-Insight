@@ -53,16 +53,18 @@ def get_graph_health(graph: falkordb.Graph | None = None) -> dict[str, Any]:
         defined_count = graph.query("MATCH ()-[d:DEFINED_IN]->() RETURN count(d)").result_set[0][0]
         imports_count = graph.query("MATCH ()-[i:IMPORTS]->() RETURN count(i)").result_set[0][0]
         inherits_count = graph.query("MATCH ()-[i:INHERITS_FROM]->() RETURN count(i)").result_set[0][0]
+        reads_count = graph.query("MATCH ()-[r:READS]->() RETURN count(r)").result_set[0][0]
     except Exception as e:
         logger.error("Failed to count edges: %s", e)
-        calls_count = defined_count = imports_count = inherits_count = 0
+        calls_count = defined_count = imports_count = inherits_count = reads_count = 0
 
     report["edge_counts"] = {
         "CALLS": calls_count,
         "DEFINED_IN": defined_count,
         "IMPORTS": imports_count,
         "INHERITS_FROM": inherits_count,
-        "total": calls_count + defined_count + imports_count + inherits_count,
+        "READS": reads_count,
+        "total": calls_count + defined_count + imports_count + inherits_count + reads_count,
     }
 
     # --- Orphan nodes (no edges at all) ---

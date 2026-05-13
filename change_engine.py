@@ -21,7 +21,8 @@ from typing import Any, Optional
 import openai
 import falkordb
 
-from config import SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL, BLAST_RADIUS_MAX_DEPTH, IMPACT_RADIUS_MAX_DEPTH
+from config import SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL, LLM_PROVIDER, BLAST_RADIUS_MAX_DEPTH, IMPACT_RADIUS_MAX_DEPTH
+from graph_index import GraphIndex
 from ingest import get_connection, run_ingestion, reingest_files
 from sandbox import SandboxManager
 from tools import (
@@ -35,12 +36,6 @@ from apply_changes import (
 
 logger = logging.getLogger(__name__)
 
-# Phase-specific inference settings tuned to the Qwen3.6-35B-A3B model card.
-# Non-thinking: fast, deterministic — for classification/summary tasks.
-_NO_THINK = {"chat_template_kwargs": {"enable_thinking": False}}
-# Thinking + coding profile: temperature=0.6, top_p=0.95, presence_penalty=0.0
-# per the official model card recommendation for code generation tasks.
-_THINK_CODING = {"chat_template_kwargs": {"enable_thinking": True}}
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -237,10 +232,12 @@ class GraphDrivenEngine:
         graph: Optional[falkordb.Graph] = None,
         sandbox_path: Path | None = None,
         swebench_tests: list[str] | None = None,
+        index: Optional[GraphIndex] = None,
     ):
         self.original_root = Path(repo_root).resolve()
         self.repo_root = Path(sandbox_path).resolve() if sandbox_path is not None else self.original_root
         self.graph = graph
+        self.index = index  # Optional in-memory adjacency cache — speeds up Phase 2
         # FAIL_TO_PASS test IDs from SWEbench — if set, Phase 5 runs only these.
         self.swebench_tests: list[str] = swebench_tests or []
         import httpx
@@ -250,6 +247,119 @@ class GraphDrivenEngine:
             timeout=httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=5.0),
         )
         self._on_phase: Optional[callable] = None  # callback for streaming
+        # Cache provider so _extra() doesn't re-read env every call
+        self._provider = LLM_PROVIDER
+
+    def _extra(self, thinking: bool) -> dict:
+        """Return provider-specific extra_body for thinking mode.
+        SGLang/Qwen3 uses chat_template_kwargs; standard OpenAI-compatible
+        providers accept no extra params — returning {} is safe for all."""
+        if self._provider == "sglang":
+            return {"chat_template_kwargs": {"enable_thinking": thinking}}
+        return {}
+
+    def run_from_diff(
+        self,
+        ref: str = "HEAD",
+        on_phase: Optional[callable] = None,
+        skip_apply: bool = False,
+        on_event=None,
+    ) -> ChangeResult:
+        """Mode D: seed the pipeline from git diff instead of a user prompt.
+
+        Steps:
+          1. Run git_diff_impact to find changed files and at-risk callers.
+          2. Collect FQNs of functions in changed files as seeds.
+          3. Build a user_prompt describing what changed.
+          4. Run Phase 2–5 from those seeds (skip Phase 0–1).
+        """
+        from git_tools import git_diff_impact
+
+        self._on_phase = on_phase
+        result = ChangeResult()
+
+        try:
+            # --- Collect impact from git diff ---
+            self._notify("phase_0", {"status": "running git diff impact..."})
+            diff_report = git_diff_impact(
+                ref=ref,
+                repo_root=str(self.original_root),
+                graph=self.graph,
+            )
+            result.ingestion_report = {"git_diff": diff_report, "ref": ref}
+            result.phases_completed.append("Phase 0: Git Diff Impact")
+            self._notify("phase_0", diff_report)
+
+            # --- Build seeds from changed functions ---
+            seeds: list[str] = []
+            # Collect from interface_breaks (functions whose signatures changed)
+            for fqn_info in diff_report.get("interface_breaks", {}).values():
+                if isinstance(fqn_info, dict):
+                    fqn = fqn_info.get("fqn") or fqn_info.get("seed", "")
+                    if fqn:
+                        seeds.append(fqn)
+            # Collect from deleted_function_breaks
+            for fqn in diff_report.get("deleted_function_breaks", {}).keys():
+                if fqn not in seeds:
+                    seeds.append(fqn)
+            # Fall back: use at-risk callers as seeds if no breaks found
+            if not seeds:
+                for entry in diff_report.get("at_risk_callers", [])[:5]:
+                    if isinstance(entry, dict) and entry.get("fqn"):
+                        seeds.append(entry["fqn"])
+
+            if not seeds:
+                result.error = (
+                    f"git diff against {ref} found no broken interfaces or at-risk callers. "
+                    "Nothing to fix."
+                )
+                return result
+
+            result.seeds = seeds
+            result.phases_completed.append("Phase 1: Seeds from Git Diff")
+            self._notify("phase_1", {"seeds": seeds, "source": f"git diff {ref}"})
+
+            # Build a descriptive prompt from the diff report
+            changed = diff_report.get("changed_files", [])
+            deleted = diff_report.get("deleted_files", [])
+            user_prompt = (
+                f"Fix breaking changes introduced by `git diff {ref}`. "
+                f"Changed files: {', '.join(changed[:5])}. "
+                f"Deleted files: {', '.join(deleted[:3])}. "
+                f"Total at-risk callers: {diff_report.get('total_at_risk', 0)}. "
+                f"Update all callers to match the new interfaces."
+            )
+
+            # --- Phase 2–5 (reuse existing pipeline, skip Phase 0–1) ---
+            result.subgraph = self._expand_subgraph(seeds)
+            result.phases_completed.append("Phase 2: Structural Expansion")
+            self._notify("phase_2", {
+                "blast_radius_count": len(result.subgraph.blast_radius_nodes),
+                "files_affected": len(result.subgraph.all_affected_files),
+            })
+
+            result.plan = self._plan_with_validation(user_prompt, result.subgraph, on_event=on_event)
+            result.phases_completed.append("Phase 3: Graph-Constrained Planning")
+            self._notify("phase_3", {
+                "planned_files": len(result.plan.planned_files),
+                "is_validated": result.plan.is_validated,
+            })
+
+            result.edits, result.answer = self._generate_edits(user_prompt, result.plan, result.subgraph)
+            result.phases_completed.append("Phase 4: Surgical Editing")
+            self._notify("phase_4", {"edit_blocks": len(result.edits)})
+
+            if not skip_apply and result.edits:
+                result.apply_result, result.test_result, result.post_edit_analysis = (
+                    self._apply_and_verify(result.edits, user_prompt, result.subgraph, on_event=on_event)
+                )
+                result.phases_completed.append("Phase 5: Verified Apply")
+
+        except Exception as e:
+            logger.error("run_from_diff pipeline failed: %s", e, exc_info=True)
+            result.error = str(e)
+
+        return result
 
     def run(
         self,
@@ -416,6 +526,13 @@ class GraphDrivenEngine:
         except Exception as e:
             logger.warning("Could not store repo fingerprint: %s", e)
 
+        # Rebuild in-memory index to reflect the fresh graph
+        if self.index is not None:
+            try:
+                self.index.rebuild(self.graph)
+            except Exception as e:
+                logger.warning("GraphIndex rebuild after ingestion failed: %s", e)
+
         return report
 
     # ------------------------------------------------------------------
@@ -460,7 +577,7 @@ class GraphDrivenEngine:
                 max_tokens=1024,
                 # No response_format here — prompt asks for a JSON array [...], not object {...}.
                 # json_object would force the model to wrap it, breaking direct array parsing.
-                extra_body=_NO_THINK,
+                extra_body=self._extra(False),
             )
             raw = response.choices[0].message.content.strip()
             # Extract JSON array from response, tolerant of <think> blocks
@@ -483,17 +600,27 @@ class GraphDrivenEngine:
     # ------------------------------------------------------------------
 
     def _expand_subgraph(self, seeds: list[str]) -> ChangeSubgraph:
-        """Deterministically expand seeds into a full change subgraph."""
+        """Deterministically expand seeds into a full change subgraph.
+
+        Uses GraphIndex (in-memory BFS) when available, otherwise falls back
+        to FalkorDB Cypher queries — same results, zero round-trips with index.
+        """
         subgraph = ChangeSubgraph(seed_nodes=seeds)
         seen_fqns: set[str] = set()
         fqn_depths: dict[str, int] = {}
 
         for seed in seeds:
             fqn_depths[seed] = 0
-            
-            # Blast radius (upstream — what breaks)
-            blast = get_upstream_callers(seed, self.graph, max_depth=BLAST_RADIUS_MAX_DEPTH)
-            for node in blast.get("affected", []):
+
+            # --- Blast radius (upstream — what breaks) ---
+            if self.index is not None:
+                blast_nodes_list = self.index.blast_radius(seed, max_depth=BLAST_RADIUS_MAX_DEPTH)
+            else:
+                blast_nodes_list = get_upstream_callers(
+                    seed, self.graph, max_depth=BLAST_RADIUS_MAX_DEPTH
+                ).get("affected", [])
+
+            for node in blast_nodes_list:
                 fqn = node.get("fqn", "")
                 if fqn:
                     depth = node.get("depth", node.get("distance", 0))
@@ -504,9 +631,15 @@ class GraphDrivenEngine:
                         if node.get("file_path"):
                             subgraph.all_affected_files.add(node["file_path"])
 
-            # Impact radius (downstream)
-            impact = get_downstream_deps(seed, self.graph, max_depth=IMPACT_RADIUS_MAX_DEPTH)
-            for node in impact.get("impacted", []):
+            # --- Impact radius (downstream) ---
+            if self.index is not None:
+                impact_nodes_list = self.index.impact_radius(seed, max_depth=IMPACT_RADIUS_MAX_DEPTH)
+            else:
+                impact_nodes_list = get_downstream_deps(
+                    seed, self.graph, max_depth=IMPACT_RADIUS_MAX_DEPTH
+                ).get("impacted", [])
+
+            for node in impact_nodes_list:
                 fqn = node.get("fqn", "")
                 if fqn:
                     depth = node.get("depth", node.get("distance", 0))
@@ -517,24 +650,45 @@ class GraphDrivenEngine:
                         if node.get("file_path"):
                             subgraph.all_affected_files.add(node["file_path"])
 
-            # Direct callers/callees
-            callers = get_callers(seed, self.graph)
-            for c in callers.get("callers", []):
-                fqn = c.get("fqn", "")
-                if fqn:
-                    fqn_depths[fqn] = min(fqn_depths.get(fqn, 1), 1)
-                    if fqn not in seen_fqns:
+            # --- Direct callers/callees ---
+            if self.index is not None:
+                # Build minimal node dicts from the in-memory maps
+                with self.index._lock:
+                    direct_callers = list(self.index.callers.get(seed, set()))
+                    direct_callees = list(self.index.callees.get(seed, set()))
+                    meta_snap = self.index.fn_meta
+                for caller_fqn in direct_callers:
+                    m = meta_snap.get(caller_fqn, {})
+                    c = {"fqn": caller_fqn, "file_path": m.get("file_path", ""), "depth": 1}
+                    fqn_depths[caller_fqn] = min(fqn_depths.get(caller_fqn, 1), 1)
+                    if caller_fqn not in seen_fqns:
                         subgraph.caller_nodes.append(c)
-                        seen_fqns.add(fqn)
-
-            callees = get_callees(seed, self.graph)
-            for c in callees.get("callees", []):
-                fqn = c.get("fqn", "")
-                if fqn:
-                    fqn_depths[fqn] = min(fqn_depths.get(fqn, 1), 1)
-                    if fqn not in seen_fqns:
+                        seen_fqns.add(caller_fqn)
+                for callee_fqn in direct_callees:
+                    m = meta_snap.get(callee_fqn, {})
+                    c = {"fqn": callee_fqn, "file_path": m.get("file_path", ""), "depth": 1}
+                    fqn_depths[callee_fqn] = min(fqn_depths.get(callee_fqn, 1), 1)
+                    if callee_fqn not in seen_fqns:
                         subgraph.callee_nodes.append(c)
-                        seen_fqns.add(fqn)
+                        seen_fqns.add(callee_fqn)
+            else:
+                callers = get_callers(seed, self.graph)
+                for c in callers.get("callers", []):
+                    fqn = c.get("fqn", "")
+                    if fqn:
+                        fqn_depths[fqn] = min(fqn_depths.get(fqn, 1), 1)
+                        if fqn not in seen_fqns:
+                            subgraph.caller_nodes.append(c)
+                            seen_fqns.add(fqn)
+
+                callees = get_callees(seed, self.graph)
+                for c in callees.get("callees", []):
+                    fqn = c.get("fqn", "")
+                    if fqn:
+                        fqn_depths[fqn] = min(fqn_depths.get(fqn, 1), 1)
+                        if fqn not in seen_fqns:
+                            subgraph.callee_nodes.append(c)
+                            seen_fqns.add(fqn)
 
             # Add seed's own file
             ctx = get_source_code(seed, self.graph, repo_root_override=str(self.repo_root))
@@ -585,7 +739,7 @@ class GraphDrivenEngine:
                 presence_penalty=0.0,
                 # Thinking enabled — planning requires reasoning about blast radius.
                 # Prompt asks for JSON array [...] — no response_format to avoid wrapping.
-                extra_body=_THINK_CODING,
+                extra_body=self._extra(True),
             )
             raw = response.choices[0].message.content.strip()
             plan.raw_plan = raw
@@ -698,7 +852,7 @@ class GraphDrivenEngine:
                 top_p=0.95,
                 presence_penalty=0.0,
                 # Thinking ON — force-coverage needs careful reasoning about missing files.
-                extra_body=_THINK_CODING,
+                extra_body=self._extra(True),
             )
             raw = response.choices[0].message.content.strip()
             plan_items = self._parse_plan_json(raw)
@@ -755,7 +909,7 @@ class GraphDrivenEngine:
                 temperature=0.6,
                 top_p=0.95,
                 presence_penalty=0.0,
-                extra_body=_THINK_CODING,  # thinking ON — edit generation is the hardest step
+                extra_body=self._extra(True),  # thinking ON — edit generation is the hardest step
             )
             answer = response.choices[0].message.content.strip()
 
@@ -780,7 +934,7 @@ class GraphDrivenEngine:
                         temperature=0.6,
                         top_p=0.95,
                         presence_penalty=0.0,
-                        extra_body=_THINK_CODING,
+                        extra_body=self._extra(True),
                     )
                     answer += "\n" + continuation.choices[0].message.content.strip()
                 except Exception as cont_err:
@@ -890,7 +1044,7 @@ class GraphDrivenEngine:
                 temperature=0.6,
                 top_p=0.95,
                 presence_penalty=0.0,
-                extra_body=_THINK_CODING,  # thinking ON for self-correction
+                extra_body=self._extra(True),  # thinking ON for self-correction
             )
             raw = response.choices[0].message.content.strip()
             raw = re.sub(r"<think>.*?</think>", "", raw, flags=re.DOTALL).strip()
@@ -912,6 +1066,8 @@ class GraphDrivenEngine:
             # Step 1: Actually write parsed changes back to FalkorDB
             reingest_report = reingest_files(changed_rel_paths, self.graph, sandbox)
             logger.info("Post-edit re-ingestion: %s", reingest_report)
+            if self.index is not None:
+                self.index.rebuild(self.graph)
         except Exception as e:
             logger.error("Post-edit reingest failed: %s", e)
             return {"status": "failed", "error": str(e)}

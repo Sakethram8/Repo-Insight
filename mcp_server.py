@@ -35,7 +35,10 @@ from tools import (
     get_function_context, get_callers, get_callees,
     get_impact_radius, get_blast_radius, get_source_code,
     semantic_search, get_macro_architecture, get_class_architecture,
+    get_cross_module_callers, get_file_interface, analyze_edit_impact,
+    get_module_readers,
 )
+from git_tools import git_diff_impact
 
 
 # ---------------------------------------------------------------------------
@@ -140,6 +143,111 @@ TOOL_DEFINITIONS = [
             "required": ["module_name"],
         },
     },
+    {
+        "name": "get_module_readers",
+        "description": (
+            "Find functions in other modules that READ (not call) named values exported from a module — "
+            "constants, config values, class instances, type aliases. "
+            "These functions depend on the VALUE of those names, not just their call signature. "
+            "If you change DATABASE_URL in config.py, all functions that read it from other modules may break. "
+            "Use this alongside get_cross_module_callers for complete impact coverage."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "module_name": {"type": "string", "description": "Dotted module name (e.g., config, mypackage.settings)."}
+            },
+            "required": ["module_name"],
+        },
+    },
+    {
+        "name": "get_cross_module_callers",
+        "description": (
+            "Find all callers of a function that live in a different module. "
+            "These are the only callers that could break if the function's signature changes — "
+            "intra-module callers can be updated in the same edit. "
+            "Call this before changing a function's parameters or return type."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fqn": {"type": "string", "description": "Fully Qualified Name of the function to check."}
+            },
+            "required": ["fqn"],
+        },
+    },
+    {
+        "name": "get_file_interface",
+        "description": (
+            "Get the current public interface of all functions in a file — "
+            "their names, parameter lists, and return types as stored in the graph. "
+            "Call this before editing a file to know which function contracts exist "
+            "and what would break downstream if they changed."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {"type": "string", "description": "Relative file path (e.g., fastapi/routing.py)."}
+            },
+            "required": ["file_path"],
+        },
+    },
+    {
+        "name": "analyze_git_diff",
+        "description": (
+            "Given a git ref, find all external callers that break due to interface changes "
+            "in that commit. Defaults to HEAD (most recent commit). "
+            "Equivalent to running get_file_interface + analyze_edit_impact across all changed "
+            "files at once, and also reports callers of deleted functions."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "ref": {
+                    "type": "string",
+                    "description": "Git ref to analyse (default: HEAD)."
+                },
+                "repo_root": {
+                    "type": "string",
+                    "description": "Repository root path (optional — auto-detected if omitted)."
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "analyze_edit_impact",
+        "description": (
+            "Given a list of functions whose signatures you changed, returns which external callers "
+            "are now at risk of breaking. Only interface changes (parameter list or return type) are "
+            "reported — body-only changes are filtered out since callers cannot observe them."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "The file that was edited."
+                },
+                "changed_signatures": {
+                    "type": "array",
+                    "description": "List of functions with their old and new signatures.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "fqn":        {"type": "string"},
+                            "old_params": {"type": "array", "items": {"type": "string"}},
+                            "new_params": {"type": "array", "items": {"type": "string"}},
+                            "old_return": {"type": ["string", "null"]},
+                            "new_return": {"type": ["string", "null"]},
+                        },
+                        "required": ["fqn", "old_params", "new_params"],
+                    },
+                },
+            },
+            "required": ["file_path", "changed_signatures"],
+        },
+    },
 ]
 
 
@@ -155,8 +263,21 @@ _TOOL_MAP = {
     "get_blast_radius": lambda args, g: get_blast_radius(fqn=args["fqn"], graph=g),
     "get_source_code": lambda args, g: get_source_code(fqn=args["fqn"], graph=g),
     "semantic_search": lambda args, g: semantic_search(query=args["query"], graph=g),
-    "get_macro_architecture": lambda args, g: get_macro_architecture(graph=g),
-    "get_class_architecture": lambda args, g: get_class_architecture(module_name=args["module_name"], graph=g),
+    "get_macro_architecture":    lambda args, g: get_macro_architecture(graph=g),
+    "get_class_architecture":    lambda args, g: get_class_architecture(module_name=args["module_name"], graph=g),
+    "get_cross_module_callers":  lambda args, g: get_cross_module_callers(fqn=args["fqn"], graph=g),
+    "get_file_interface":        lambda args, g: get_file_interface(file_path=args["file_path"], graph=g),
+    "get_module_readers":         lambda args, g: get_module_readers(module_name=args["module_name"], graph=g),
+    "analyze_git_diff":          lambda args, g: git_diff_impact(
+                                     ref=args.get("ref", "HEAD"),
+                                     repo_root=args.get("repo_root"),
+                                     graph=g,
+                                 ),
+    "analyze_edit_impact":       lambda args, g: analyze_edit_impact(
+                                     file_path=args["file_path"],
+                                     changed_signatures=args["changed_signatures"],
+                                     graph=g,
+                                 ),
 }
 
 

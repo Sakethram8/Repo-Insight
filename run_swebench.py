@@ -30,6 +30,7 @@ from typing import Optional
 from datasets import load_dataset
 from config import FALKORDB_HOST, FALKORDB_PORT
 from change_engine import GraphDrivenEngine, ChangeResult
+from graph_index import GraphIndex
 from ingest import get_connection
 from apply_changes import parse_edit_blocks, apply_edits
 import signal
@@ -145,6 +146,35 @@ def _capture_diff(repo_dir: Path) -> str:
     return result.stdout
 
 
+def _validate_patch(repo_dir: Path) -> tuple[bool, str]:
+    """Check that every modified Python file in the working tree parses cleanly.
+
+    Returns (True, "") on success, or (False, "path: error message") on the
+    first syntax error found. A syntactically broken patch always fails the
+    SWE-bench evaluator — catching it here saves downstream debug time.
+    """
+    import ast as _ast
+    try:
+        modified = subprocess.run(
+            ["git", "diff", "--name-only", "HEAD"],
+            cwd=str(repo_dir), capture_output=True, text=True, timeout=10,
+        )
+        for rel in modified.stdout.splitlines():
+            rel = rel.strip()
+            if not rel.endswith(".py"):
+                continue
+            full = repo_dir / rel
+            if not full.exists():
+                continue
+            try:
+                _ast.parse(full.read_text(encoding="utf-8", errors="replace"))
+            except SyntaxError as e:
+                return False, f"{rel}: {e}"
+    except Exception as e:
+        return False, f"validation error: {e}"
+    return True, ""
+
+
 def _run_instance(
     instance: dict,
     output_dir: Path,
@@ -184,6 +214,8 @@ def _run_instance(
         "phases_completed": [],
         "error": None,
         "timing_s": 0.0,
+        "syntax_valid": None,   # True/False/None (None = no patch generated)
+        "syntax_error": None,
     }
 
     # Skip if patch already exists
@@ -227,12 +259,25 @@ def _run_instance(
         logger.info("[%s] Phase 0: ingesting graph (timeout=%ds)", instance_id, INGEST_TIMEOUT)
         _hard_timeout(engine._ensure_graph_fresh, INGEST_TIMEOUT)
 
+        # Build in-memory adjacency index after ingestion so Phase 2
+        # uses BFS in memory (~<100ms) instead of ~15 FalkorDB round-trips.
+        engine.index = GraphIndex.build(graph)
+        logger.info("[%s] GraphIndex built: %s", instance_id, engine.index.summary())
+
         # Phases 1-5: LLM phases — tighter timeout
         logger.info("[%s] Phases 1-5: running pipeline (timeout=%ds)", instance_id, PIPELINE_TIMEOUT)
 
+        # Append FAIL_TO_PASS test IDs to the prompt — they name the affected
+        # file and class directly, giving Phase 1 seed localization a stronger signal.
+        fail_hint = ""
+        if fail_to_pass:
+            tests_str = ", ".join(fail_to_pass[:5])
+            fail_hint = f"\n\nTests that must pass after the fix: {tests_str}"
+        enhanced_prompt = problem + fail_hint
+
         def _run_phases():
             return engine.run(
-                user_prompt=problem,
+                user_prompt=enhanced_prompt,
                 skip_apply=False,
                 _skip_phase0=True,   # ingestion already done above
             )
@@ -279,13 +324,20 @@ def _run_instance(
         diff = _capture_diff(repo_dir)
 
         if diff.strip():
+            # Validate syntax before writing the patch
+            syntax_ok, syntax_err = _validate_patch(repo_dir)
+            result["syntax_valid"] = syntax_ok
+            result["syntax_error"] = syntax_err or None
+            if not syntax_ok:
+                logger.warning("[%s] Patch has syntax error — %s", instance_id, syntax_err)
+
             patch_path.parent.mkdir(parents=True, exist_ok=True)
             patch_path.write_text(diff, encoding="utf-8")
             result["status"] = "patched"
             result["patch_file"] = str(patch_path)
             logger.info(
-                "[%s] Patch written (%d bytes, %d lines)",
-                instance_id, len(diff), diff.count("\n"),
+                "[%s] Patch written (%d bytes, %d lines, syntax_valid=%s)",
+                instance_id, len(diff), diff.count("\n"), syntax_ok,
             )
         else:
             result["status"] = "empty_diff"
@@ -397,11 +449,16 @@ def main():
     # -- Run --
     results = []
     prev_repo: str | None = None
+    prev_commit: str | None = None
     for i, instance in enumerate(dataset, 1):
         iid = instance["instance_id"]
         current_repo = instance["repo"]
-        flush = current_repo != prev_repo   # only flush when repo changes
+        base_commit_outer = instance["base_commit"]
+        # Flush whenever repo OR commit changes — same repo at a different commit
+        # can have deleted files whose ghost nodes would otherwise stay in the graph.
+        flush = (current_repo != prev_repo) or (base_commit_outer != prev_commit)
         prev_repo = current_repo
+        prev_commit = base_commit_outer
         logger.info(
             "━━━ [%d/%d] %s ━━━",
             i, len(dataset), iid,

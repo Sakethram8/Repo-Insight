@@ -11,16 +11,19 @@ import os
 import time
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional
 import falkordb
-import openai
 import os as _os
 import signal as _signal
 import concurrent.futures as _cf
-SKIP_SUMMARIES = _os.getenv("SKIP_SUMMARIES", "false").lower() in ("true", "1")
 SKIP_JEDI = _os.getenv("SKIP_JEDI", "false").lower() in ("true", "1")
+
+from resolver import (
+    build_module_fqn_map, build_symbol_table, resolve_callee, resolve_base_class,
+    build_reexport_map, canonicalize_fqn, enrich_star_imports,
+)
 from config import (FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
-                    FLUSH_GRAPH_ON_INGEST, SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
-                    INGEST_CONCURRENCY, SUMMARIZATION_BATCH_SIZE)
+                    FLUSH_GRAPH_ON_INGEST, INGEST_CONCURRENCY)
 from parser import ParsedFile, parse_file, SKIP_DIRS
 from embedder import embed_text, embed_texts, build_embedding_text
 
@@ -36,7 +39,6 @@ from embedder import embed_text, embed_texts, build_embedding_text
 # }
 
 logger = logging.getLogger(__name__)
-_NO_THINK = {"chat_template_kwargs":{"enable_thinking":False}}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -46,23 +48,6 @@ def _file_to_module(file_path: str) -> str:
     """Convert a relative file path like 'foo/bar.py' to module name 'foo.bar'."""
     mod = file_path.replace("/", ".").replace("\\", ".")
     return mod[:-3] if mod.endswith(".py") else mod
-
-
-# Singleton OpenAI client for summary generation (avoids hundreds of TCP connections)
-_summary_client: openai.OpenAI | None = None
-
-
-def _get_summary_client() -> openai.OpenAI:
-    """Lazy-initialise a single OpenAI client for the summary generator."""
-    global _summary_client
-    if _summary_client is None:
-        import httpx
-        _summary_client = openai.OpenAI(
-            base_url=SGLANG_BASE_URL,
-            api_key=SGLANG_API_KEY,
-            timeout=httpx.Timeout(connect=10.0, read=120.0, write=10.0, pool=5.0),
-        )
-    return _summary_client
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +101,7 @@ def create_indices(graph: falkordb.Graph) -> None:
         "CREATE INDEX FOR (c:Class) ON (c.fqn)",
         "CREATE INDEX FOR (m:Module) ON (m.name)",
         "CREATE INDEX FOR (s:FileState) ON (s.file_path)",
+        "CREATE INDEX FOR ()-[r:READS]-() ON (r.name)",
     ]
     for query in index_queries:
         try:
@@ -128,71 +114,6 @@ def create_indices(graph: falkordb.Graph) -> None:
 
 
 import json
-
-def generate_summaries_batch(batch: list[tuple[str, str, str, str]]) -> dict[str, str]:
-    """Generate 1-2 sentence AI summaries for a batch of functions/classes.
-    batch: list of (id_string, sig_or_code, docstring, has_docstring)
-    Returns: dict mapping id_string to summary
-    """
-    if not batch:
-        return {}
-    try:
-        client = _get_summary_client()
-        prompt_parts = [
-            "Summarize what each of these functions/classes does in 1-2 sentences.\n"
-            "Return ONLY a valid JSON object mapping the ID to the summary string.\n"
-            "No markdown, no explanation, no code fences.\n\n"
-        ]
-        for idx, content, docstring, has_docstring in batch:
-            if has_docstring:
-                # Docstring present — signature + docstring is sufficient
-                prompt_parts.append(f"--- ID: {idx} ---\n{content}\nDocstring: {docstring[:300]}\n")
-            else:
-                # No docstring — send truncated code body for accuracy
-                prompt_parts.append(f"--- ID: {idx} ---\n{content[:600]}\n")
-
-        prompt = "".join(prompt_parts)
-        response = client.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[
-                {
-                    "role": "system",
-                    "content": "You are a code summarizer. Return ONLY valid JSON. No markdown fences, no explanation, no thinking. Output must be a single JSON object.",
-                },
-                {"role": "user", "content": prompt},
-            ],
-            max_tokens=512,
-            temperature=0,
-            # response_format={"type": "json_object"} removed — causes empty content
-            # with enable_thinking=false on this SGLang version. We parse JSON manually.
-            extra_body=_NO_THINK,
-        )
-        content = response.choices[0].message.content
-        # Some SGLang versions return None when thinking blocks absorb all output
-        if not content:
-            rc = getattr(response.choices[0].message, "reasoning_content", None)
-            content = rc or ""
-        # Strip any <think>...</think> blocks before JSON parsing
-        import re as _re
-        content = _re.sub(r"<think>.*?</think>", "", content, flags=_re.DOTALL).strip()
-        if not content:
-            logger.error("Batch summary: empty model content after stripping thinking")
-            return {}
-        raw = content.strip()
-        logger.debug("Batch summary raw content (first 300): %s", raw[:300])
-        try:
-            return json.loads(raw)
-        except json.JSONDecodeError:
-            if raw.startswith("```"):
-                raw = raw.removeprefix("```json").removeprefix("```").removesuffix("```").strip()
-            try:
-                return json.loads(raw)
-            except json.JSONDecodeError as e:
-                logger.error("Batch summary: JSON still invalid after stripping fences: %s", e)
-                return {}
-    except Exception as e:
-        logger.error("Batch summary generation failed: %s", e)
-        return {}
 
 
 def _file_content_hash(file_path: Path) -> str:
@@ -214,6 +135,21 @@ def extract_source_code(file_path: Path, start_line: int, end_line: int) -> str:
         return "\n".join(lines[start_line - 1 : end_line])
     except Exception:
         return ""
+
+
+# ---------------------------------------------------------------------------
+# Signature hashing
+# ---------------------------------------------------------------------------
+
+def _signature_hash(name: str, params: list[str], return_annotation: str | None) -> str:
+    """16-char hex hash of a function's observable interface (name + params + return type).
+
+    Unchanged if only the body changes. Changes when the contract changes.
+    Used to detect interface-breaking changes during incremental re-ingestion.
+    """
+    import hashlib
+    raw = json.dumps([name, params, return_annotation or ""], sort_keys=True)
+    return hashlib.sha1(raw.encode()).hexdigest()[:16]
 
 
 # ---------------------------------------------------------------------------
@@ -244,36 +180,59 @@ def ingest_parsed_files(
     repo_root: Path,
     on_progress=None,
 ) -> None:
-    """Write parsed AST entities into FalkorDB as nodes and edges."""
-    file_modules: dict[str, str] = {}
+    """Write parsed AST entities into FalkorDB as nodes and edges.
+
+    Phase order:
+      1. Module nodes
+      2. Symbol tables (in-memory, no graph writes)
+      3. Class nodes  (FQNs from qualname)
+      4. Function nodes (FQNs from qualname) + <module> pseudo-nodes
+      5. DEFINED_IN + INHERITS_FROM edges (exact FQN via symbol table)
+      6. IMPORTS edges
+      7. CALLS edges — symbol-table resolved (exact FQN match)
+      8. CALLS edges — Jedi precision pass on unresolved calls only
+    """
+    # --- Phase 2: symbol tables (before any node writes) ---
+    module_fqn_map = build_module_fqn_map(parsed_files)
+    symbol_tables = {
+        pf.file_path: build_symbol_table(pf, module_fqn_map[pf.file_path], module_fqn_map)
+        for pf in parsed_files
+    }
+    # Fix 1: build reexport map from __init__.py files so alias FQNs are
+    # canonicalized to their definition-site FQNs before CALLS edges are written.
+    reexport_map = build_reexport_map(parsed_files, module_fqn_map)
+    # Fix 2: resolve within-repo star imports by enumerating source exports.
+    enrich_star_imports(parsed_files, symbol_tables, module_fqn_map)
+    # known_fqns is populated as nodes are written; used for callee validation
+    known_fqns: set[str] = set()
+
+    # --- Step 1: Upsert Module nodes ---
+    file_modules: dict[str, str] = {}   # mod_fqn → file_path
     import_modules: set[str] = set()
 
     for pf in parsed_files:
-        mod_name = _file_to_module(pf.file_path)
+        mod_name = module_fqn_map[pf.file_path]
         file_modules[mod_name] = pf.file_path
-
         for imp in pf.imports:
-            import_modules.add(imp.module)
+            if imp.module and imp.module != ".":
+                import_modules.add(imp.module)
 
-    # Step 1: Upsert Module nodes
-    mod_emb_texts = [f"{mod_name}. Module defined in {fpath}" 
+    mod_emb_texts = [f"{mod_name}. Module defined in {fpath}"
                      for mod_name, fpath in file_modules.items()]
     mod_embeddings = embed_texts(mod_emb_texts) if mod_emb_texts else []
-    
-    module_nodes = []
-    mod_items = list(file_modules.items())
-    for i, (mod_name, fpath) in enumerate(mod_items):
-        module_nodes.append({
-            "name": mod_name, 
-            "file_path": fpath,
-            "embedding": json.dumps(mod_embeddings[i]) if mod_embeddings else None
-        })
 
+    module_nodes = []
+    for i, (mod_name, fpath) in enumerate(file_modules.items()):
+        module_nodes.append({
+            "name": mod_name,
+            "file_path": fpath,
+            "embedding": json.dumps(mod_embeddings[i]) if mod_embeddings else None,
+        })
     for mod_name in import_modules:
         if mod_name and mod_name not in file_modules:
             module_nodes.append({"name": mod_name, "file_path": "", "embedding": None})
 
-    module_nodes=[n for n in module_nodes if n.get("name") and n["name"].strip() not in ("",".")]        
+    module_nodes = [n for n in module_nodes if n.get("name") and n["name"].strip() not in ("", ".")]
     if module_nodes:
         _bulk_write(graph,
             """UNWIND $nodes AS n
@@ -281,123 +240,34 @@ def ingest_parsed_files(
                SET m.file_path = n.file_path
                WITH m, n WHERE n.file_path <> "" AND n.embedding IS NOT NULL
                SET m.embedding = n.embedding""",
-            module_nodes,            
+            module_nodes,
         )
 
-    # Prepare for AI summaries
-    items_to_summarize = []
-    for pf in parsed_files:
-        mod_name = _file_to_module(pf.file_path)
-            
-        abs_path = repo_root / pf.file_path
-        for cls in pf.classes:
-            code = extract_source_code(abs_path, cls.start_line, cls.end_line)
-            items_to_summarize.append(("class", cls, pf.file_path, mod_name, code))
-        for func in pf.functions:
-            code = extract_source_code(abs_path, func.start_line, func.end_line)
-            items_to_summarize.append(("function", func, pf.file_path, mod_name, code))
-
-    from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
-    
-    summaries: dict[str, str] = {}
-
-    if SKIP_SUMMARIES:
-        logger.info("SKIP_SUMMARIES=true — skipping LLM summarization")
-        for item in items_to_summarize:
-            idx = f"{item[2]}::{item[1].name}::{item[1].start_line}"
-            summaries[idx] = ""
-        batches = []
-    else:
-        BATCH_SIZE = SUMMARIZATION_BATCH_SIZE  # use config value (default 15)
-        batches = []
-        current_batch = []
-
-        for item in items_to_summarize:
-            kind, entity, file_path, mod_name, code = item
-            idx = f"{file_path}::{entity.name}::{entity.start_line}"
-            docstring = (entity.docstring or "").strip()
-            has_docstring = len(docstring) > 10
-
-            if has_docstring:
-                # Signature + docstring — compact, accurate
-                if hasattr(entity, "params") and entity.params:
-                    params = ",".join(entity.params)
-                    sig = f"{entity.name}({params})"
-                else:
-                    sig = entity.name
-                content=sig
-            else:
-                # No docstring — need code body
-                content = code
-
-            if len(code.strip()) > 0:
-                current_batch.append((idx, content, docstring, has_docstring))
-                if len(current_batch) >= BATCH_SIZE:
-                    batches.append(current_batch)
-                    current_batch = []
-            else:
-                summaries[idx] = ""
-
-        if current_batch:
-            batches.append(current_batch)
-
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        TimeElapsedColumn(),
-    ) as progress:
-        task_id = progress.add_task("[cyan]Generating AI Node Summaries...", total=len(batches))
-        # Summary concurrency is capped at 4 regardless of INGEST_CONCURRENCY.
-        # 16 concurrent 35B requests saturate the KV cache and serialise
-        # execution — 4 parallel requests gives the model room to batch properly.
-        _SUMMARY_CONCURRENCY = min(INGEST_CONCURRENCY, 4)
-        _summary_total_timeout = max(300, len(batches) * 30 // max(_SUMMARY_CONCURRENCY, 1))
-        with ThreadPoolExecutor(max_workers=_SUMMARY_CONCURRENCY) as executor:
-            future_to_batch = {
-                executor.submit(generate_summaries_batch, batch): batch
-                for batch in batches
-            }
-            try:
-                for future in as_completed(future_to_batch, timeout=_summary_total_timeout):
-                    batch_result = future.result()
-                    if batch_result:
-                        for idx_str, summary in batch_result.items():
-                            summaries[idx_str] = summary
-                    progress.advance(task_id)
-            except TimeoutError:
-                logger.warning(
-                    "Summary generation timed out after %ds — continuing with partial summaries "
-                    "(%d/%d batches completed)",
-                    _summary_total_timeout,
-                    sum(1 for f in future_to_batch if f.done()),
-                    len(future_to_batch),
-                )
-
-    # Step 2: Upsert Class nodes
+    # --- Step 2: Upsert Class nodes ---
     class_nodes: list[dict] = []
     class_emb_texts: list[str] = []
-    for item in items_to_summarize:
-        if item[0] != "class": continue
-        cls, file_path, mod_name, code = item[1], item[2], item[3], item[4]
-        summary = summaries.get(f"{file_path}::{cls.name}::{cls.start_line}", "")
-        emb_text = build_embedding_text(cls.name, cls.docstring, file_path)
-        class_emb_texts.append(emb_text)
-        fqn = f"{mod_name}.{cls.name}"
-        class_nodes.append({
-            "fqn": fqn, "name": cls.name, "file_path": file_path,
-            "start_line": cls.start_line, "end_line": cls.end_line,
-            "docstring": cls.docstring or "", "summary": summary,
-        })
-        
+    for pf in parsed_files:
+        mod_name = module_fqn_map[pf.file_path]
+        for cls in pf.classes:
+            emb_text = build_embedding_text(cls.name, cls.docstring, pf.file_path)
+            class_emb_texts.append(emb_text)
+            fqn = f"{mod_name}.{cls.qualname}"
+            known_fqns.add(fqn)
+            class_nodes.append({
+                "fqn": fqn, "name": cls.name, "file_path": pf.file_path,
+                "start_line": cls.start_line, "end_line": cls.end_line,
+                "docstring": cls.docstring or "",
+                "summary": cls.docstring or "",   # docstring IS the summary
+            })
+
     if on_progress:
         on_progress("Embeddings", 2, 3, "Generating vectors...")
 
     if class_emb_texts:
         class_embeddings = embed_texts(class_emb_texts)
         for i, node in enumerate(class_nodes):
-            node["embedding"] = json.dumps(class_embeddings[i])
+            if class_embeddings and class_embeddings[i]:  # Tier 3: skip if empty
+                node["embedding"] = json.dumps(class_embeddings[i])
 
     if class_nodes:
         _bulk_write(graph,
@@ -413,32 +283,42 @@ def ingest_parsed_files(
             class_nodes,
         )
 
-    # Step 3: Upsert Function nodes
+    # --- Step 3: Upsert Function nodes ---
     func_nodes: list[dict] = []
     func_emb_texts: list[str] = []
-    for item in items_to_summarize:
-        if item[0] != "function": continue
-        func, file_path, mod_name, code = item[1], item[2], item[3], item[4]
-        summary = summaries.get(f"{file_path}::{func.name}::{func.start_line}", "")
-        emb_text = build_embedding_text(func.name, func.docstring, file_path)
-        func_emb_texts.append(emb_text)
-        fqn = f"{mod_name}.{func.class_name}.{func.name}" if func.is_method else f"{mod_name}.{func.name}"
-        func_nodes.append({
-            "fqn": fqn, "name": func.name, "file_path": file_path,
-            "start_line": func.start_line, "end_line": func.end_line,
-            "docstring": func.docstring or "", "is_method": func.is_method,
-            "class_name": func.class_name or "", "module_name": mod_name,
-            "summary": summary,
-            "params": json.dumps(func.params),
-            "decorators": json.dumps(func.decorators),
-            "return_annotation": func.return_annotation or "",
-        })
-        
+    for pf in parsed_files:
+        mod_name = module_fqn_map[pf.file_path]
+        for func in pf.functions:
+            # Embedding text: docstring first, then typed signature, then name only
+            if func.docstring:
+                emb_source = func.docstring
+            elif func.params or func.return_annotation:
+                params_str = ", ".join(func.params)
+                ret = f" -> {func.return_annotation}" if func.return_annotation else ""
+                emb_source = f"{func.name}({params_str}){ret}"
+            else:
+                emb_source = None
+            func_emb_texts.append(build_embedding_text(func.name, emb_source, pf.file_path))
+            fqn = f"{mod_name}.{func.qualname}"
+            known_fqns.add(fqn)
+            func_nodes.append({
+                "fqn": fqn, "name": func.name, "file_path": pf.file_path,
+                "start_line": func.start_line, "end_line": func.end_line,
+                "docstring": func.docstring or "", "is_method": func.is_method,
+                "class_name": func.class_name or "", "module_name": mod_name,
+                "summary": func.docstring or "",   # docstring IS the summary
+                "params": json.dumps(func.params),
+                "decorators": json.dumps(func.decorators),
+                "return_annotation": func.return_annotation or "",
+                "signature_hash": _signature_hash(func.name, func.params, func.return_annotation),
+            })
+
     if func_emb_texts:
         func_embeddings = embed_texts(func_emb_texts)
         for i, node in enumerate(func_nodes):
-            node["embedding"] = json.dumps(func_embeddings[i])
-            
+            if func_embeddings and func_embeddings[i]:  # Tier 3: skip if empty
+                node["embedding"] = json.dumps(func_embeddings[i])
+
     if func_nodes:
         _bulk_write(graph,
             """UNWIND $nodes AS n
@@ -455,32 +335,83 @@ def ingest_parsed_files(
                    f.embedding = n.embedding,
                    f.params = n.params,
                    f.decorators = n.decorators,
-                   f.return_annotation = n.return_annotation""",
+                   f.return_annotation = n.return_annotation,
+                   f.signature_hash = n.signature_hash""",
             func_nodes,
         )
 
-    # Step 4: Create DEFINED_IN and INHERITS_FROM edges
+    # Add <module> pseudo-function per file — represents module-level execution
+    module_pseudo_nodes = []
+    for pf in parsed_files:
+        mod_name = module_fqn_map[pf.file_path]
+        pseudo_fqn = f"{mod_name}.<module>"
+        known_fqns.add(pseudo_fqn)
+        module_pseudo_nodes.append({
+            "fqn": pseudo_fqn, "name": "<module>",
+            "file_path": pf.file_path, "start_line": 1, "end_line": 0,
+            "docstring": "", "is_method": False, "class_name": "",
+            "module_name": mod_name,
+            "summary": f"Module-level initialization code for {mod_name}",
+            "params": "[]", "decorators": "[]", "return_annotation": "",
+            "embedding": None,
+        })
+    if module_pseudo_nodes:
+        _bulk_write(graph,
+            """UNWIND $nodes AS n
+               MERGE (f:Function {fqn: n.fqn})
+               SET f.name = n.name, f.file_path = n.file_path,
+                   f.start_line = n.start_line, f.end_line = n.end_line,
+                   f.docstring = n.docstring, f.is_method = n.is_method,
+                   f.class_name = n.class_name, f.module_name = n.module_name,
+                   f.summary = n.summary, f.params = n.params,
+                   f.decorators = n.decorators, f.return_annotation = n.return_annotation""",
+            module_pseudo_nodes,
+        )
+
+    # --- Step 4: DEFINED_IN and INHERITS_FROM edges ---
     func_to_class: list[dict] = []
     func_to_mod: list[dict] = []
     class_to_mod: list[dict] = []
-    inherits_edges: list[dict] = []
-    
+    inherits_resolved: list[dict] = []
+
     for pf in parsed_files:
-        mod_name = _file_to_module(pf.file_path)
+        mod_name = module_fqn_map[pf.file_path]
+        table = symbol_tables[pf.file_path]
 
         for func in pf.functions:
-            fqn = f"{mod_name}.{func.class_name}.{func.name}" if func.is_method else f"{mod_name}.{func.name}"
+            fqn = f"{mod_name}.{func.qualname}"
             if func.is_method:
-                class_fqn = f"{mod_name}.{func.class_name}"
+                # class_name is immediate enclosing class; qualname may have deeper nesting
+                # DEFINED_IN points to the immediate class
+                class_qualname = func.qualname.rsplit(".", 1)[0] if "." in func.qualname else func.class_name
+                class_fqn = f"{mod_name}.{class_qualname}"
                 func_to_class.append({"fqn": fqn, "cfqn": class_fqn})
             else:
                 func_to_mod.append({"fqn": fqn, "mname": mod_name})
-                
+
+        # <module> pseudo-node → DEFINED_IN → Module
+        func_to_mod.append({"fqn": f"{mod_name}.<module>", "mname": mod_name})
+
         for cls in pf.classes:
-            class_fqn = f"{mod_name}.{cls.name}"
-            class_to_mod.append({"cfqn": class_fqn, "mname": mod_name})
-            for base in cls.bases:
-                inherits_edges.append({"cfqn": class_fqn, "base_name": base})
+            class_fqn = f"{mod_name}.{cls.qualname}"
+            # DEFINED_IN → Module for top-level; → outer Class for nested
+            if "." in cls.qualname:
+                outer_qualname = cls.qualname.rsplit(".", 1)[0]
+                class_to_mod.append({"cfqn": class_fqn, "mname": outer_qualname,
+                                     "is_nested": True, "mod_name": mod_name})
+            else:
+                class_to_mod.append({"cfqn": class_fqn, "mname": mod_name,
+                                     "is_nested": False, "mod_name": mod_name})
+
+            # INHERITS_FROM — resolved via symbol table (exact FQN)
+            for base_raw in cls.bases:
+                base_fqn = resolve_base_class(base_raw, table)
+                if base_fqn:
+                    if reexport_map:
+                        base_fqn = canonicalize_fqn(base_fqn, reexport_map)
+                    inherits_resolved.append({"cfqn": class_fqn, "base_fqn": base_fqn})
+                else:
+                    logger.debug("INHERITS_FROM unresolved: %s bases %s", class_fqn, base_raw)
 
     if func_to_class:
         _bulk_write(graph,
@@ -496,33 +427,61 @@ def ingest_parsed_files(
                MATCH (m:Module {name: e.mname})
                MERGE (f)-[:DEFINED_IN]->(m)""",
             func_to_mod, chunk_size=500, param="edges")
-    if class_to_mod:
+
+    # For top-level classes: DEFINED_IN → Module
+    top_level_classes = [e for e in class_to_mod if not e["is_nested"]]
+    nested_classes = [e for e in class_to_mod if e["is_nested"]]
+    if top_level_classes:
         _bulk_write(graph,
             """UNWIND $edges AS e
                MATCH (c:Class {fqn: e.cfqn})
                MATCH (m:Module {name: e.mname})
                MERGE (c)-[:DEFINED_IN]->(m)""",
-            class_to_mod, chunk_size=500, param="edges")
-    if inherits_edges:
+            top_level_classes, chunk_size=500, param="edges")
+    if nested_classes:
+        # DEFINED_IN → outer Class (mname here is the outer class qualname)
+        nested_with_fqn = [
+            {"cfqn": e["cfqn"], "outer_fqn": f"{e['mod_name']}.{e['mname']}"}
+            for e in nested_classes
+        ]
         _bulk_write(graph,
             """UNWIND $edges AS e
                MATCH (c:Class {fqn: e.cfqn})
-               MATCH (base:Class {name: e.base_name})
+               MATCH (outer:Class {fqn: e.outer_fqn})
+               MERGE (c)-[:DEFINED_IN]->(outer)""",
+            nested_with_fqn, chunk_size=500, param="edges")
+
+    # INHERITS_FROM — exact FQN match (no name collision possible)
+    if inherits_resolved:
+        _bulk_write(graph,
+            """UNWIND $edges AS e
+               MATCH (c:Class {fqn: e.cfqn})
+               MATCH (base:Class {fqn: e.base_fqn})
                MERGE (c)-[:INHERITS_FROM]->(base)""",
-            inherits_edges, chunk_size=500, param="edges")
+            inherits_resolved, chunk_size=500, param="edges")
 
-    # Step 5: Create IMPORTS edges
+    # Fix A: build parent map for inherited method resolution in Step 6.
+    # Must be built after inherits_resolved is populated (Step 4) and after
+    # known_fqns is fully populated (Steps 2-3 above).
+    parent_map = _build_parent_map(inherits_resolved)
+
+    # --- Step 5: IMPORTS edges ---
     import_edges: list[dict] = []
+    seen_import_pairs: set[tuple[str, str]] = set()
     for pf in parsed_files:
-        src_mod = _file_to_module(pf.file_path)
-
+        src_mod = module_fqn_map[pf.file_path]
         for imp in pf.imports:
-            import_edges.append({
-                "src_name": src_mod,
-                "tgt_name": imp.module,
-                "alias": imp.alias or "",
-            })
-    import_edges = [e for e in import_edges if e.get("src_name") and e.get("tgt_name") and e["tgt_name"] != "."]       
+            tgt = imp.module
+            if not tgt or tgt == ".":
+                continue
+            pair = (src_mod, tgt)
+            if pair not in seen_import_pairs:
+                seen_import_pairs.add(pair)
+                import_edges.append({
+                    "src_name": src_mod,
+                    "tgt_name": tgt,
+                    "alias": imp.alias or "",
+                })
     if import_edges:
         _bulk_write(graph,
             """UNWIND $edges AS e
@@ -532,79 +491,58 @@ def ingest_parsed_files(
                SET i.alias = e.alias""",
             import_edges, chunk_size=500, param="edges")
 
-    # Step 6: Create CALLS edges
-    # Build a set of known imported modules per source module for scoped matching
-    module_imports: dict[str, set[str]] = {}
-    for pf in parsed_files:
-        src_mod = _file_to_module(pf.file_path)
-        module_imports[src_mod] = {imp.module for imp in pf.imports}
+    # --- Steps 6 + 6b: CALLS and READS edges ---
+    pending_calls = _write_call_and_reads_edges(
+        parsed_files, graph, module_fqn_map, symbol_tables,
+        reexport_map, parent_map, known_fqns,
+    )
 
-    call_edges: list[dict] = []
-    for pf in parsed_files:
-        mod_name = _file_to_module(pf.file_path)
-            
-        for call in pf.calls:
-            if call.caller_name == "__classbody__" or call.caller_name == "<module>":
-                continue  
-
-            caller_fqn = f"{mod_name}.{call.caller_name}"
-            callee_simple = call.callee_name.split(".")[-1] if "." in call.callee_name else call.callee_name
-            
-            # Build scoped module list: same module + imported modules
-            scope_modules = [mod_name] + list(module_imports.get(mod_name, set()))
-
-            call_edges.append({
-                "caller_fqn": caller_fqn,
-                "callee_name": "." + callee_simple,
-                "callee_exact": callee_simple,
-                "scope_modules": scope_modules,
-                "line": call.line,
-                "file_path": call.file_path,
-            })
-            
-    if call_edges:
-        # chunk_size=200: this query has a complex WHERE + module scope list per edge,
-        # so smaller chunks keep each UNWIND fast and well within socket timeout.
-        _bulk_write(graph,
-            """UNWIND $edges AS e
-               MATCH (caller:Function {fqn: e.caller_fqn})
-               MATCH (callee:Function)
-               WHERE (callee.fqn ENDS WITH e.callee_name OR callee.fqn = e.callee_exact)
-                 AND callee.module_name IN e.scope_modules
-               MERGE (caller)-[c:CALLS]->(callee)
-               SET c.line = e.line, c.file_path = e.file_path, c.resolution = 'tree-sitter'""",
-            call_edges, chunk_size=200, param="edges")
-    # Step 7: Jedi precision pass — parallelized across files
-    jedi_upgraded = 0
-    jedi_total = 0
-
+    # --- Step 7: Jedi precision pass — only on unresolved calls ---
     if SKIP_JEDI:
         logger.info("SKIP_JEDI=true — skipping Jedi call resolution pass")
     else:
-        def _resolve_one_file(pf):
-            if not pf.file_path.endswith(".py"):
+        # Group pending calls back by file for Jedi processing
+        from collections import defaultdict
+        pending_by_file: dict[str, list] = defaultdict(list)
+        pf_by_path: dict[str, ParsedFile] = {pf.file_path: pf for pf in parsed_files}
+        for pf, call in pending_calls:
+            pending_by_file[pf.file_path].append(call)
+
+        def _resolve_one_file(file_path: str) -> list[dict]:
+            if not file_path.endswith(".py"):
                 return []
+            pf = pf_by_path.get(file_path)
+            if pf is None:
+                return []
+            # Temporarily replace calls with only the pending ones
+            import copy
+            pf_subset = copy.copy(pf)
+            pf_subset.calls = pending_by_file[file_path]
             try:
-                return resolve_calls_with_jedi(pf, repo_root)
+                return resolve_calls_with_jedi(pf_subset, repo_root)
             except Exception as e:
-                logger.warning("Jedi failed for %s: %s", pf.file_path, e)
+                logger.warning("Jedi failed for %s: %s", file_path, e)
                 return []
 
         with ThreadPoolExecutor(max_workers=INGEST_CONCURRENCY) as jedi_pool:
-            futures = [jedi_pool.submit(_resolve_one_file, pf) for pf in parsed_files]
+            futures = [
+                jedi_pool.submit(_resolve_one_file, fp)
+                for fp in pending_by_file
+            ]
+            jedi_upgraded = 0
             for future in as_completed(futures):
-                precise_edges = future.result()
-                jedi_total += len(precise_edges)
-                jedi_edges = [e for e in precise_edges if e["resolution"] == "jedi"]
+                jedi_edges = [e for e in future.result() if e["resolution"] == "jedi"]
                 jedi_upgraded += len(jedi_edges)
                 if jedi_edges:
                     _bulk_write(graph,
                         """UNWIND $edges AS e
-                        MATCH (caller:Function {fqn: e.caller_fqn})
-                        MATCH (callee:Function {fqn: e.callee_fqn})
-                        MERGE (caller)-[c:CALLS]->(callee)
-                        SET c.line = e.line, c.file_path = e.file_path, c.resolution = 'jedi'""",
+                           MATCH (caller:Function {fqn: e.caller_fqn})
+                           MATCH (callee:Function {fqn: e.callee_fqn})
+                           MERGE (caller)-[c:CALLS]->(callee)
+                           SET c.line = e.line, c.file_path = e.file_path,
+                               c.resolution = 'jedi'""",
                         jedi_edges, chunk_size=100, param="edges")
+        logger.info("Jedi upgraded %d additional CALLS edges", jedi_upgraded)
 
 
 def run_ingestion(directory_path: str, *, on_progress=None) -> dict:
@@ -794,15 +732,12 @@ def _resolve_calls_with_jedi_inner(
     precise_edges = []
 
     for call in parsed_file.calls:
-        if call.caller_name in ("__classbody__", "<module>"):
-            continue
-
-        caller_fqn = f"{mod_name}.{call.caller_name}"
+        # caller_qualname replaces the old caller_name field
+        caller_fqn = f"{mod_name}.{call.caller_qualname}"
         resolution = "tree-sitter"
-        callee_fqn = call.callee_name
+        callee_fqn = call.callee_expr   # full expression, e.g. "self.connect"
 
         try:
-            # Jedi goto resolves to the definition
             defs = script.goto(line=call.line, column=call.column)
             if defs:
                 target = defs[0]
@@ -810,7 +745,7 @@ def _resolve_calls_with_jedi_inner(
                     callee_fqn = target.full_name
                     resolution = "jedi"
         except Exception:
-            pass  # Fall through to tree-sitter
+            pass
 
         precise_edges.append({
             "caller_fqn": caller_fqn,
@@ -824,8 +759,183 @@ def _resolve_calls_with_jedi_inner(
 
 
 # ---------------------------------------------------------------------------
+# Fix A helpers — inherited method resolution
+# ---------------------------------------------------------------------------
+
+def _build_parent_map(inherits_resolved: list[dict]) -> dict[str, list[str]]:
+    """Build class_fqn → [direct_parent_fqns, ...] from INHERITS_FROM edge list."""
+    from collections import defaultdict as _dd
+    parents: dict[str, list[str]] = _dd(list)
+    for e in inherits_resolved:
+        parents[e["cfqn"]].append(e["base_fqn"])
+    return parents
+
+
+def _resolve_via_inheritance(
+    fqn: str,
+    parent_map: dict[str, list[str]],
+    known_fqns: set[str],
+    _depth: int = 0,
+) -> Optional[str]:
+    """Walk the inheritance chain to find the method on an ancestor class.
+
+    Example: Dog.breathe not in known_fqns → check Animal.breathe → found.
+    Depth-limited to 8 to guard against circular inheritance.
+    """
+    if _depth > 8:
+        return None
+    if fqn in known_fqns:
+        return fqn
+    parts = fqn.rsplit(".", 1)
+    if len(parts) < 2:
+        return None
+    class_fqn, method_name = parts
+    for parent_fqn in parent_map.get(class_fqn, []):
+        candidate = f"{parent_fqn}.{method_name}"
+        result = _resolve_via_inheritance(candidate, parent_map, known_fqns, _depth + 1)
+        if result:
+            return result
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Incremental re-ingestion (for post-edit graph refresh)
 # ---------------------------------------------------------------------------
+
+def _write_call_and_reads_edges(
+    parsed_files: list[ParsedFile],
+    graph: falkordb.Graph,
+    module_fqn_map: dict[str, str],
+    symbol_tables: dict,
+    reexport_map: dict[str, str],
+    parent_map: dict[str, list[str]],
+    known_fqns: set[str],
+) -> list[tuple]:
+    """Resolve and write CALLS + READS edges for the given parsed files.
+
+    Returns the list of (ParsedFile, CallEdge) pairs that could not be resolved
+    by the symbol table (pending for Jedi). In edges-only mode the caller
+    discards this — Jedi is only run in the full ingestion path.
+    """
+    # --- CALLS edges ---
+    resolved_call_edges: list[dict] = []
+    pending_calls: list[tuple] = []
+
+    for pf in parsed_files:
+        mod_name = module_fqn_map[pf.file_path]
+        table = symbol_tables[pf.file_path]
+
+        for call in pf.calls:
+            caller_fqn = f"{mod_name}.{call.caller_qualname}"
+            callee_fqn = resolve_callee(call.callee_expr, call.caller_qualname, table, known_fqns)
+            if callee_fqn and reexport_map:
+                callee_fqn = canonicalize_fqn(callee_fqn, reexport_map)
+            if callee_fqn and callee_fqn not in known_fqns and parent_map:
+                inherited = _resolve_via_inheritance(callee_fqn, parent_map, known_fqns)
+                if inherited:
+                    callee_fqn = inherited
+            if callee_fqn:
+                resolved_call_edges.append({
+                    "caller_fqn": caller_fqn,
+                    "callee_fqn": callee_fqn,
+                    "resolution": "symbol-table",
+                    "line": call.line,
+                    "file_path": call.file_path,
+                })
+            else:
+                pending_calls.append((pf, call))
+
+    if resolved_call_edges:
+        _bulk_write(graph,
+            """UNWIND $edges AS e
+               MATCH (caller:Function {fqn: e.caller_fqn})
+               MATCH (callee:Function {fqn: e.callee_fqn})
+               MERGE (caller)-[c:CALLS]->(callee)
+               SET c.line = e.line, c.file_path = e.file_path,
+                   c.resolution = e.resolution""",
+            resolved_call_edges, chunk_size=300, param="edges")
+    logger.info(
+        "CALLS: %d resolved via symbol-table, %d pending for Jedi",
+        len(resolved_call_edges), len(pending_calls),
+    )
+
+    # --- READS edges ---
+    reads_edges: list[dict] = []
+    seen_reads: set[tuple] = set()
+
+    for pf in parsed_files:
+        mod_name = module_fqn_map[pf.file_path]
+        table = symbol_tables[pf.file_path]
+
+        for ref in pf.variable_refs:
+            reader_fqn = f"{mod_name}.{ref.user_qualname}"
+            if reader_fqn not in known_fqns:
+                continue
+
+            if "." in ref.name:
+                head, attr_name = ref.name.split(".", 1)
+                resolved_head = table.resolve(head)
+                if resolved_head is None or resolved_head in known_fqns:
+                    continue
+                source_module = resolved_head
+                if source_module == mod_name:
+                    continue
+                key = (reader_fqn, source_module, attr_name)
+                if key not in seen_reads:
+                    seen_reads.add(key)
+                    reads_edges.append({"reader_fqn": reader_fqn,
+                                        "source_module": source_module,
+                                        "name": attr_name, "line": ref.line})
+            else:
+                resolved = table.resolve(ref.name)
+                if resolved is None:
+                    continue
+                dot_pos = resolved.rfind(".")
+                if dot_pos < 0:
+                    continue
+                source_module = resolved[:dot_pos]
+                if source_module == mod_name:
+                    continue
+                key = (reader_fqn, source_module, ref.name)
+                if key not in seen_reads:
+                    seen_reads.add(key)
+                    reads_edges.append({"reader_fqn": reader_fqn,
+                                        "source_module": source_module,
+                                        "name": ref.name, "line": ref.line})
+
+    if reads_edges:
+        _bulk_write(graph,
+            """UNWIND $edges AS e
+               MATCH (f:Function {fqn: e.reader_fqn})
+               MATCH (m:Module {name: e.source_module})
+               MERGE (f)-[r:READS]->(m)
+               SET r.name = e.name, r.line = e.line""",
+            reads_edges, chunk_size=200, param="edges")
+        logger.info("READS edges written: %d", len(reads_edges))
+
+    return pending_calls
+
+
+def _find_importer_files(changed_modules: list[str], graph: falkordb.Graph) -> list[str]:
+    """Return file_paths of all modules that IMPORT any of the changed modules.
+
+    Used by reingest_files to find files whose outbound CALLS/READS edges may
+    point to stale FQNs after a dependency changed.
+    """
+    if not changed_modules:
+        return []
+    try:
+        result = graph.query(
+            """UNWIND $mods AS m
+               MATCH (src:Module)-[:IMPORTS]->(tgt:Module {name: m})
+               WHERE src.file_path <> ''
+               RETURN DISTINCT src.file_path""",
+            {"mods": changed_modules},
+        )
+        return [row[0] for row in result.result_set]
+    except Exception as e:
+        logger.warning("_find_importer_files failed (non-fatal): %s", e)
+        return []
 
 def reingest_files(
     file_paths: list[str],
@@ -867,22 +977,85 @@ def reingest_files(
     if parsed_files:
         ingest_parsed_files(parsed_files, graph, repo_root)
 
-        # Update FileState mtime so the watcher knows this file is fresh
-        import time as _time
+        # Store content hash (same scheme as run_ingestion) so the watcher
+        # can skip files that haven't changed since the last ingest.
         for pf in parsed_files:
             abs_path = repo_root / pf.file_path
-            try:
-                mtime = abs_path.stat().st_mtime
-            except OSError:
-                mtime = 0.0
+            content_hash = _file_content_hash(abs_path)
             graph.query(
-                """MERGE (fs:FileState {file_path: $path})
-                   SET fs.mtime = $mtime, fs.last_ingested = $ts""",
-                {"path": pf.file_path, "mtime": mtime, "ts": _time.time()},
+                "MERGE (s:FileState {file_path: $fp}) SET s.mtime = $h",
+                {"fp": pf.file_path, "h": content_hash},
+            )
+
+    # Fix 3: cascade edge re-resolution — find all files that import from the
+    # changed modules and re-resolve their CALLS/READS edges so they don't
+    # point to stale FQNs.  We skip summaries/embeddings (those are stable).
+    changed_modules = [_file_to_module(fp) for fp in file_paths]
+    importer_paths = [
+        fp for fp in _find_importer_files(changed_modules, graph)
+        if fp not in file_paths   # already re-ingested above
+    ]
+    if importer_paths:
+        logger.info(
+            "reingest_files: cascade re-resolving edges for %d importer file(s)",
+            len(importer_paths),
+        )
+        # Delete only CALLS and READS edges — nodes are unchanged
+        graph.query(
+            """UNWIND $fps AS fp
+               MATCH (f:Function {file_path: fp})-[r:CALLS|READS]->()
+               DELETE r""",
+            {"fps": importer_paths},
+        )
+        # Parse importer files (fast — tree-sitter only, no LLM/embeddings)
+        importer_parsed: list[ParsedFile] = []
+        for rel_path in importer_paths:
+            abs_path = repo_root / rel_path
+            if not abs_path.exists():
+                continue
+            try:
+                importer_parsed.append(parse_file(abs_path, repo_root))
+            except Exception as e:
+                logger.warning("Cascade re-parse failed for %s: %s", rel_path, e)
+
+        if importer_parsed:
+            # Build combined symbol tables (changed files + importers) so that
+            # relative imports in importer files resolve against the new module FQNs.
+            all_for_resolution = parsed_files + importer_parsed
+            imp_fqn_map = build_module_fqn_map(all_for_resolution)
+            imp_tables = {
+                pf.file_path: build_symbol_table(
+                    pf, imp_fqn_map[pf.file_path], imp_fqn_map
+                )
+                for pf in all_for_resolution
+            }
+            imp_reexport = build_reexport_map(all_for_resolution, imp_fqn_map)
+            enrich_star_imports(all_for_resolution, imp_tables, imp_fqn_map)
+
+            # known_fqns from graph (nodes are already written — no need to re-write them)
+            imp_known: set[str] = set()
+            for row in graph.query("MATCH (f:Function) RETURN f.fqn").result_set:
+                imp_known.add(row[0])
+            for row in graph.query("MATCH (c:Class) RETURN c.fqn").result_set:
+                imp_known.add(row[0])
+
+            # parent_map from graph (INHERITS_FROM edges already present)
+            inh_rows = graph.query(
+                "MATCH (c:Class)-[:INHERITS_FROM]->(b:Class) RETURN c.fqn, b.fqn"
+            ).result_set
+            imp_parent_map = _build_parent_map(
+                [{"cfqn": r[0], "base_fqn": r[1]} for r in inh_rows]
+            )
+
+            # Write only CALLS and READS edges — skip all node writes and embeddings
+            _write_call_and_reads_edges(
+                importer_parsed, graph, imp_fqn_map, imp_tables,
+                imp_reexport, imp_parent_map, imp_known,
             )
 
     return {
         "files_reingested": len(parsed_files),
+        "cascade_files": len(importer_paths),
         "file_paths": file_paths,
     }
 

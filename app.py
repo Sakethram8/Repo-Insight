@@ -4,6 +4,7 @@ Repo-Insight: Unified Coding Agent Interface.
 Browser-first, chat-driven, with on-demand graph visualization.
 """
 
+import logging
 import streamlit as st
 from streamlit_agraph import agraph, Node, Edge, Config
 import falkordb
@@ -12,6 +13,8 @@ import json
 import openai
 from pathlib import Path
 from collections import Counter
+
+logger = logging.getLogger(__name__)
 
 from config import (FALKORDB_HOST, FALKORDB_PORT, GRAPH_NAME,
                     SGLANG_BASE_URL, SGLANG_API_KEY, LLM_MODEL,
@@ -22,6 +25,7 @@ from sandbox import SandboxManager
 from apply_changes import apply_to_original
 from tools import get_macro_architecture, get_class_architecture
 from watcher import start_watcher
+from graph_index import GraphIndex
 
 # ---------------------------------------------------------------------------
 # Page config
@@ -124,6 +128,12 @@ if "active_tab" not in st.session_state:
     st.session_state.active_tab = "chat"
 if "graph_watcher" not in st.session_state:
     st.session_state.graph_watcher = None
+if "graph_index" not in st.session_state:
+    st.session_state.graph_index = None
+if "zoom_module" not in st.session_state:
+    st.session_state.zoom_module = None  # semantic zoom target
+if "git_impact_data" not in st.session_state:
+    st.session_state.git_impact_data = None
 
 
 # ---------------------------------------------------------------------------
@@ -303,12 +313,23 @@ with st.sidebar:
                 pct = 20 + int(current / max(total, 1) * 75)
                 progress_bar.progress(pct, text=f"{stage}... {detail[:50]}")
             report = run_ingestion(str(sandbox_path), on_progress=_on_progress)
+            progress_bar.progress(95, text="Building in-memory index...")
+            try:
+                idx = GraphIndex.build(get_db_graph())
+                st.session_state.graph_index = idx
+            except Exception as idx_err:
+                st.session_state.graph_index = None
+                logger.warning("GraphIndex build failed: %s", idx_err)
             progress_bar.progress(100, text="✅ Graph ready")
             st.session_state.ingestion_report = report
             st.session_state.graph_ready = True
             if st.session_state.graph_watcher:
                 st.session_state.graph_watcher.stop()
-            st.session_state.graph_watcher = start_watcher(st.session_state.original_path, get_db_graph())
+            st.session_state.graph_watcher = start_watcher(
+                st.session_state.original_path,
+                get_db_graph(),
+                index=st.session_state.graph_index,
+            )
             st.success(
                 f"✅ Sandbox [{manager.sandbox_id}]: "
                 f"{report.get('functions',0)} functions · "
@@ -393,8 +414,8 @@ with st.sidebar:
 # Main area — Tabs: Chat | Graph
 # ---------------------------------------------------------------------------
 
-tab_chat, tab_graph, tab_bench = st.tabs([
-    "💬 Agent Chat", "🔗 Graph Explorer", "📊 Benchmark"
+tab_chat, tab_graph, tab_git, tab_bench = st.tabs([
+    "💬 Agent Chat", "🔗 Graph Explorer", "🔀 Git Impact", "📊 Benchmark"
 ])
 
 
@@ -505,7 +526,8 @@ with tab_chat:
 
                     engine = GraphDrivenEngine(
                         original_path, graph,
-                        sandbox_path=sandbox_path if sandbox_path != original_path else None
+                        sandbox_path=sandbox_path if sandbox_path != original_path else None,
+                        index=st.session_state.graph_index,
                     )
                     start = time.time()
                     
@@ -700,7 +722,8 @@ with tab_chat:
                         orig_path = st.session_state.original_path or Path(repo_path).resolve()
                         engine = GraphDrivenEngine(
                             orig_path, graph,
-                            sandbox_path=sb_path if sb_path != orig_path else None
+                            sandbox_path=sb_path if sb_path != orig_path else None,
+                            index=st.session_state.graph_index,
                         )
                         start_c = time.time()
                         result_c = engine.run(prompt, on_phase=_on_phase_fair)
@@ -881,28 +904,82 @@ with tab_graph:
         try:
             graph = get_db_graph()
 
-            col_s1, col_s2 = st.columns(2)
+            col_s1, col_s2, col_s3 = st.columns(3)
             with col_s1:
                 min_weight = st.slider("Min edge weight", 1, 50, 3)
             with col_s2:
                 max_nodes = st.slider("Max nodes", 10, 200, 80)
-
-            nodes, edges = build_macro_viz(graph, min_weight, max_nodes)
-
-            if nodes:
-                st.caption(f"Showing {len(nodes)} modules, {len(edges)} connections")
-                config = Config(
-                    width=1200,
-                    height=700,
-                    directed=True,
-                    nodeHighlightBehavior=True,
-                    highlightColor="#fbbf24",
-                    collapsible=False,
-                    physics=False,
+            with col_s3:
+                # Semantic zoom — drill into a specific module
+                zoom_input = st.text_input(
+                    "Zoom into module",
+                    value=st.session_state.zoom_module or "",
+                    placeholder="e.g. parser, ingest",
+                    help="Enter a module name to drill into its class architecture",
                 )
-                agraph(nodes=nodes, edges=edges, config=config)
+                if zoom_input != st.session_state.zoom_module:
+                    st.session_state.zoom_module = zoom_input or None
+
+            if st.session_state.zoom_module:
+                # Semantic zoom active — show class architecture for the selected module
+                st.markdown(
+                    f"**Zoomed into:** `{st.session_state.zoom_module}` — "
+                    f"[clear zoom](#)",
+                )
+                if st.button("← Back to macro view", key="zoom_back"):
+                    st.session_state.zoom_module = None
+                    st.rerun()
+
+                data = get_class_architecture(st.session_state.zoom_module, graph)
+                node_degrees_z = Counter()
+                for e in data.get("class_edges", []):
+                    node_degrees_z[e["source"]] += 1
+                    node_degrees_z[e["target"]] += 1
+
+                zoom_nodes, zoom_edges, zoom_classes = [], [], set()
+                for e in data.get("class_edges", []):
+                    zoom_classes.add(e["source"])
+                    zoom_classes.add(e["target"])
+                    label = " & ".join(e["types"])
+                    size = min(max(e["weight"] / 2, 1), 10)
+                    zoom_edges.append(Edge(
+                        source=e["source"], target=e["target"],
+                        label=label, width=size, color=get_edge_color(e["types"][0] if e["types"] else ""),
+                    ))
+                for c in zoom_classes:
+                    deg = min(node_degrees_z.get(c, 0), 15)
+                    zoom_nodes.append(Node(id=c, label=c, color="#818cf8", size=18 + deg))
+
+                if zoom_nodes:
+                    st.caption(f"Module `{st.session_state.zoom_module}`: {len(zoom_nodes)} classes, {len(zoom_edges)} edges")
+                    config = Config(width=1200, height=660, directed=True,
+                                    nodeHighlightBehavior=True, highlightColor="#fbbf24",
+                                    collapsible=False, physics=True)
+                    agraph(nodes=zoom_nodes, edges=zoom_edges, config=config)
+                else:
+                    st.info(f"No class relationships found in `{st.session_state.zoom_module}`. Try a different module name.")
+
             else:
-                st.info("No edges match the current filter. Lower the min weight.")
+                # Full macro view
+                nodes, edges = build_macro_viz(graph, min_weight, max_nodes)
+
+                if nodes:
+                    st.caption(
+                        f"Showing {len(nodes)} modules, {len(edges)} connections — "
+                        f"type a module name above to zoom in"
+                    )
+                    config = Config(
+                        width=1200,
+                        height=700,
+                        directed=True,
+                        nodeHighlightBehavior=True,
+                        highlightColor="#fbbf24",
+                        collapsible=False,
+                        physics=False,
+                    )
+                    agraph(nodes=nodes, edges=edges, config=config)
+                else:
+                    st.info("No edges match the current filter. Lower the min weight.")
         except Exception as e:
             st.error(f"Could not load graph: {e}")
 
@@ -957,7 +1034,163 @@ with tab_graph:
 
 
 # ===========================
-# TAB 3: Benchmark
+# TAB 3: Git Impact
+# ===========================
+with tab_git:
+    st.markdown("## 🔀 Git Impact Analysis")
+    st.caption(
+        "See which callers break when code changes between git refs. "
+        "Use this before a commit to catch cascade failures, or point it at any ref "
+        "(`HEAD~1`, a branch name, or a commit SHA)."
+    )
+
+    col_ref, col_run = st.columns([3, 1])
+    with col_ref:
+        git_ref = st.text_input(
+            "Git ref to diff against",
+            value="HEAD",
+            placeholder="HEAD, HEAD~1, main, abc1234",
+        )
+    with col_run:
+        st.markdown("<br>", unsafe_allow_html=True)
+        run_impact = st.button("▶ Analyze", type="primary", use_container_width=True)
+
+    if run_impact:
+        if not st.session_state.graph_ready:
+            st.warning("Load a codebase first.")
+        else:
+            try:
+                from git_tools import git_diff_impact
+                repo_root = str(
+                    st.session_state.original_path
+                    or st.session_state.repo_path
+                    or "./"
+                )
+                with st.spinner(f"Running git diff impact against `{git_ref}`..."):
+                    impact = git_diff_impact(
+                        ref=git_ref,
+                        repo_root=repo_root,
+                        graph=get_db_graph(),
+                    )
+                st.session_state.git_impact_data = impact
+            except Exception as e:
+                st.error(f"Git impact analysis failed: {e}")
+
+    if st.session_state.git_impact_data:
+        impact = st.session_state.git_impact_data
+
+        # --- Summary metrics ---
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Changed files", len(impact.get("changed_files", [])))
+        c2.metric("Deleted files", len(impact.get("deleted_files", [])))
+        c3.metric("Interface breaks", len(impact.get("interface_breaks", {})))
+        c4.metric("At-risk callers", impact.get("total_at_risk", 0),
+                  delta="callers need updating" if impact.get("total_at_risk", 0) > 0 else None,
+                  delta_color="inverse")
+
+        # --- Changed files list ---
+        changed = impact.get("changed_files", [])
+        deleted = impact.get("deleted_files", [])
+        if changed or deleted:
+            with st.expander(f"📂 Changed files ({len(changed)} modified, {len(deleted)} deleted)"):
+                for f in changed:
+                    st.markdown(f"✏️ `{f}`")
+                for f in deleted:
+                    st.markdown(f"🗑️ `{f}`")
+
+        # --- Interface breaks ---
+        interface_breaks = impact.get("interface_breaks", {})
+        if interface_breaks:
+            st.subheader("🔴 Interface Breaks")
+            st.caption("These functions changed their signatures — callers listed below must be updated.")
+            for fn_name, break_info in interface_breaks.items():
+                if not isinstance(break_info, dict):
+                    continue
+                with st.expander(f"`{fn_name}` — {len(break_info.get('at_risk_callers', []))} at-risk callers"):
+                    old_sig = break_info.get("old_signature", "")
+                    new_sig = break_info.get("new_signature", "")
+                    if old_sig or new_sig:
+                        col_old, col_new = st.columns(2)
+                        with col_old:
+                            st.markdown("**Before:**")
+                            st.code(old_sig or "(not found)", language="python")
+                        with col_new:
+                            st.markdown("**After:**")
+                            st.code(new_sig or "(not found)", language="python")
+                    callers = break_info.get("at_risk_callers", [])
+                    if callers:
+                        st.markdown("**At-risk callers:**")
+                        for c in callers[:20]:
+                            fqn = c if isinstance(c, str) else c.get("fqn", str(c))
+                            st.markdown(f"- `{fqn}`")
+
+        # --- Deleted function breaks ---
+        deleted_breaks = impact.get("deleted_function_breaks", {})
+        if deleted_breaks:
+            st.subheader("🗑️ Deleted Function Breaks")
+            for fn_fqn, callers in deleted_breaks.items():
+                with st.expander(f"`{fn_fqn}` deleted — {len(callers)} callers orphaned"):
+                    for c in callers[:20]:
+                        fqn = c if isinstance(c, str) else c.get("fqn", str(c))
+                        st.markdown(f"- `{fqn}`")
+
+        # --- Reader breaks ---
+        reader_breaks = impact.get("reader_breaks", {})
+        if reader_breaks:
+            st.subheader("📖 Reader Breaks (READS edges)")
+            for mod_name, readers in reader_breaks.items():
+                with st.expander(f"Module `{mod_name}` — {len(readers)} affected readers"):
+                    for r in readers[:20]:
+                        st.markdown(f"- `{r}`")
+
+        # --- Auto-fix button ---
+        if impact.get("total_at_risk", 0) > 0 and st.session_state.graph_ready:
+            st.divider()
+            st.markdown("### Auto-fix with Graph-Driven Engine")
+            st.caption(
+                "Mode D will seed the 6-phase pipeline from the broken functions above "
+                "and attempt to update all at-risk callers automatically."
+            )
+            if st.button("⚡ Run Mode D Auto-fix", type="primary"):
+                from change_engine import GraphDrivenEngine
+                phase_status = st.status("🚀 Running Git-Diff Auto-Fix...", expanded=True)
+
+                def _on_phase_d(phase, data):
+                    phase_status.write(f"✓ {phase} — {data}")
+
+                try:
+                    orig_path = st.session_state.original_path or Path(st.session_state.repo_path).resolve()
+                    engine = GraphDrivenEngine(
+                        orig_path,
+                        get_db_graph(),
+                        sandbox_path=st.session_state.sandbox_path,
+                        index=st.session_state.graph_index,
+                    )
+                    result = engine.run_from_diff(
+                        ref=impact.get("ref", "HEAD"),
+                        on_phase=_on_phase_d,
+                        skip_apply=True,
+                    )
+                    phase_status.update(label="✅ Auto-fix complete", state="complete")
+                    st.markdown(result.answer or "(no answer)")
+                    if result.edits:
+                        with st.expander(f"✏️ {len(result.edits)} proposed edits"):
+                            for eb in result.edits[:10]:
+                                st.code(
+                                    f"FILE: {eb.file_path}\n"
+                                    f"<<<<<<< SEARCH\n{eb.search_text[:300]}\n"
+                                    f"=======\n{eb.replace_text[:300]}\n"
+                                    f">>>>>>> REPLACE",
+                                    language="diff",
+                                )
+                except Exception as e:
+                    st.error(f"Auto-fix failed: {e}")
+    else:
+        st.info("Run the analysis above to see which callers break when code changes.")
+
+
+# ===========================
+# TAB 4: Benchmark
 # ===========================
 with tab_bench:
     st.markdown("## 📊 Precision / Recall / F1 Benchmark")

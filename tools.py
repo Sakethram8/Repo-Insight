@@ -73,8 +73,6 @@ def get_callees(fqn: str, graph: falkordb.Graph) -> dict:
 
 def get_downstream_deps(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT_RADIUS_MAX_DEPTH) -> dict:
     max_depth = int(max_depth)
-    # Added WHERE clause to avoid traversing through massive hub nodes (in-degree > 50)
-    # Added LIMIT to prevent memory spikes
     cypher = (
         f"MATCH p = (src:Function {{fqn: $fqn}})-[:CALLS*1..{max_depth}]->(impacted:Function) "
         f"WHERE ALL(n IN nodes(p)[1..-1] WHERE size((n)<-[:CALLS]-()) < 50) "
@@ -89,6 +87,7 @@ def get_downstream_deps(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT
         "direction": "downstream",
         "depth": max_depth,
         "impacted_count": len(impacted),
+        "truncated": len(impacted) >= 300,   # Fix 5: warn when LIMIT was hit
         "warning": len(impacted) >= IMPACT_RADIUS_WARN_THRESHOLD,
         "impacted": impacted,
     }
@@ -96,8 +95,6 @@ def get_downstream_deps(fqn: str, graph: falkordb.Graph, max_depth: int = IMPACT
 
 def get_upstream_callers(fqn: str, graph: falkordb.Graph, max_depth: int = BLAST_RADIUS_MAX_DEPTH) -> dict:
     max_depth = int(max_depth)
-    # Traverse UPSTREAM: find all callers that transitively call fqn
-    # Arrow is reversed vs get_downstream_deps — (caller)-[:CALLS*..]->(target)
     cypher = (
         f"MATCH p = (caller:Function)-[:CALLS*1..{max_depth}]->(src:Function {{fqn: $fqn}}) "
         f"RETURN DISTINCT caller.fqn, caller.file_path, length(p) "
@@ -110,6 +107,7 @@ def get_upstream_callers(fqn: str, graph: falkordb.Graph, max_depth: int = BLAST
         "direction": "upstream",
         "depth": max_depth,
         "affected_count": len(affected),
+        "truncated": len(affected) >= 300,   # Fix 5: warn when LIMIT was hit
         "warning": len(affected) >= IMPACT_RADIUS_WARN_THRESHOLD,
         "affected": affected,
     }
@@ -231,44 +229,85 @@ def _get_cached_embedding(fqn: str, embedding_json: str) -> tuple[float, ...]:
     return tuple(_json.loads(embedding_json))
 
 
-def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
-    query_embedding = embed_text(query)
+def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5,
+                    index=None) -> dict:
+    """Find functions/classes semantically similar to *query*.
 
-    # Fetch ONLY necessary strings without computing heavy global joins
-    func_results = graph.query("MATCH (f:Function) WHERE f.embedding IS NOT NULL RETURN 'Function', f.fqn, f.file_path, f.summary, f.embedding")
-    class_results = graph.query("MATCH (c:Class) WHERE c.embedding IS NOT NULL RETURN 'Class', c.fqn, c.file_path, c.summary, c.embedding")
+    When *index* (a GraphIndex) is provided, embeddings and in-degree are
+    served from memory — zero Redis I/O after the initial index build.
+    Falls back to querying FalkorDB directly when no index is available.
+    Returns {"query": query, "results": []} gracefully when no embedding
+    backend is available (Tier 3 degradation).
+    """
+    query_embedding = embed_text(query)
+    if not query_embedding:
+        return {"query": query, "results": [],
+                "note": "Embedding backend unavailable — semantic search disabled"}
+    q_vec = np.array(query_embedding, dtype=np.float32)
+
+    # --- Fast path: use in-memory GraphIndex ---
+    if index is not None and index.embeddings:
+        fqns   = list(index.embeddings.keys())
+        matrix = np.array(list(index.embeddings.values()), dtype=np.float32)
+        scores = (matrix @ q_vec) / (
+            np.linalg.norm(matrix, axis=1) * np.linalg.norm(q_vec) + 1e-8
+        )
+        top_indices = np.argsort(scores)[::-1][: top_k * 10]
+        scored = []
+        for i in top_indices:
+            fqn        = fqns[i]
+            meta       = index.fn_meta.get(fqn, {})
+            in_degree  = index.in_degree.get(fqn, 0)
+            final      = float(scores[i]) + math.log(in_degree + 1) * 0.05
+            scored.append({
+                "label": "Function",
+                "fqn": fqn,
+                "file_path": meta.get("file_path", ""),
+                "summary": index.summaries.get(fqn, ""),
+                "in_degree": in_degree,
+                "score": round(final, 4),
+            })
+        scored.sort(key=lambda x: x["score"], reverse=True)
+        return {"query": query, "results": scored[:top_k]}
+
+    # --- Fallback: query FalkorDB directly (no index available) ---
+    func_results = graph.query(
+        "MATCH (f:Function) WHERE f.embedding IS NOT NULL "
+        "RETURN 'Function', f.fqn, f.file_path, f.summary, f.embedding"
+    )
+    class_results = graph.query(
+        "MATCH (c:Class) WHERE c.embedding IS NOT NULL "
+        "RETURN 'Class', c.fqn, c.file_path, c.summary, c.embedding"
+    )
 
     all_rows = list(func_results.result_set) + list(class_results.result_set)
     valid_rows = []
-    
     for row in all_rows:
         label, fqn, file_path, summary, embedding_str = row
-        if not embedding_str or not fqn: continue
+        if not embedding_str or not fqn:
+            continue
         try:
             emb = list(_get_cached_embedding(fqn, embedding_str))
             valid_rows.append((row, emb))
         except Exception:
             continue
 
-    if not valid_rows: return {"query": query, "results": []}
+    if not valid_rows:
+        return {"query": query, "results": []}
 
     matrix = np.array([emb for _, emb in valid_rows], dtype=np.float32)
-    q_vec = np.array(query_embedding, dtype=np.float32)
     scores = (matrix @ q_vec) / (np.linalg.norm(matrix, axis=1) * np.linalg.norm(q_vec) + 1e-8)
 
-    # Pick top 50 raw candidates first to minimize database overhead
     top_indices = np.argsort(scores)[::-1][:50]
-    
     scored = []
     for idx in top_indices:
         row = valid_rows[idx][0]
         label, fqn, file_path, summary, _ = row
         base_score = float(scores[idx])
-        
-        # Query degree individually ONLY for top candidates
-        deg_res = graph.query("MATCH ()-[r:CALLS]->(n) WHERE n.fqn = $fqn RETURN count(r)", {"fqn": fqn})
+        deg_res = graph.query(
+            "MATCH ()-[r:CALLS]->(n) WHERE n.fqn = $fqn RETURN count(r)", {"fqn": fqn}
+        )
         in_degree = deg_res.result_set[0][0] if deg_res.result_set else 0
-        
         final_score = base_score + (math.log(in_degree + 1) * 0.05)
         scored.append({
             "label": label, "fqn": fqn, "file_path": file_path,
@@ -282,3 +321,159 @@ def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5) -> dict:
 # Aliases used by mcp_server.py
 get_impact_radius = get_downstream_deps
 get_blast_radius = get_upstream_callers
+
+
+# ---------------------------------------------------------------------------
+# Change impact tools
+# ---------------------------------------------------------------------------
+
+def get_cross_module_callers(fqn: str, graph) -> dict:
+    """Callers of fqn that live in a different module.
+
+    These are the only callers that matter when a function's interface changes —
+    intra-module callers can always be updated in the same edit session.
+    """
+    result = graph.query(
+        """MATCH (caller:Function)-[:CALLS]->(target:Function {fqn: $fqn})
+           WHERE caller.module_name <> target.module_name
+           RETURN caller.fqn, caller.file_path, caller.start_line, caller.module_name
+           ORDER BY caller.module_name""",
+        {"fqn": fqn},
+    )
+    callers = [
+        {"fqn": r[0], "file_path": r[1], "start_line": r[2], "module_name": r[3]}
+        for r in result.result_set
+    ]
+    return {
+        "target_fqn": fqn,
+        "cross_module_caller_count": len(callers),
+        "callers": callers,
+    }
+
+
+def get_file_interface(file_path: str, graph) -> dict:
+    """All functions in a file with their current stored signatures.
+
+    Call this before editing a file to know which function contracts exist
+    and which could be broken by a signature change.
+    """
+    import json as _json
+    result = graph.query(
+        """MATCH (f:Function)
+           WHERE f.file_path = $file_path AND f.name <> '<module>'
+           RETURN f.fqn, f.name, f.params, f.return_annotation,
+                  f.is_method, f.class_name, f.start_line
+           ORDER BY f.start_line""",
+        {"file_path": file_path},
+    )
+    functions = []
+    for r in result.result_set:
+        fqn, name, params_raw, return_ann, is_method, class_name, start_line = r
+        try:
+            params = _json.loads(params_raw) if params_raw else []
+        except Exception:
+            params = []
+        functions.append({
+            "fqn": fqn,
+            "name": name,
+            "params": params,
+            "return_annotation": return_ann or None,
+            "is_method": is_method,
+            "class_name": class_name or None,
+            "start_line": start_line,
+        })
+    return {"file_path": file_path, "function_count": len(functions), "functions": functions}
+
+
+def get_module_readers(module_name: str, graph) -> dict:
+    """Functions in other modules that READ named values exported from this module.
+
+    Captures the data-flow dependency that CALLS edges miss: when a function
+    imports and uses a constant, config value, or any non-callable name from
+    another module, that function may break if the exported name changes.
+    """
+    result = graph.query(
+        """MATCH (f:Function)-[r:READS]->(m:Module {name: $module_name})
+           WHERE f.module_name <> $module_name
+           RETURN f.fqn, f.file_path, f.start_line, r.name
+           ORDER BY r.name, f.module_name""",
+        {"module_name": module_name},
+    )
+    readers = [
+        {"fqn": r[0], "file_path": r[1], "start_line": r[2], "read_name": r[3]}
+        for r in result.result_set
+    ]
+    return {
+        "module_name": module_name,
+        "reader_count": len(readers),
+        "readers": readers,
+    }
+
+
+def _param_name_only(param: str) -> str:
+    """Extract the bare parameter name from a signature fragment.
+
+    Fix 7: strips type annotations and default values so that adding an
+    annotation to an existing parameter ('x' → 'x: int') is not reported
+    as a breaking interface change.
+
+    Examples:
+        'x'            → 'x'
+        'x: int'       → 'x'
+        'x: int = 5'   → 'x'
+        '*args'        → '*args'
+        '**kwargs'     → '**kwargs'
+    """
+    return param.split(":")[0].split("=")[0].strip()
+
+
+def analyze_edit_impact(file_path: str, changed_signatures: list[dict], graph) -> dict:
+    """Given functions whose signatures changed, return which external callers are at risk.
+
+    Only interface changes (params / return type) are reported — body-only changes
+    produce no output since callers cannot observe them.
+
+    Args:
+        file_path: The file that was edited (for context only).
+        changed_signatures: List of dicts with keys:
+            fqn, old_params (list), new_params (list),
+            old_return (str|None), new_return (str|None)
+        graph: FalkorDB graph connection.
+
+    Returns:
+        {file_path, interface_breaking_changes (int), impact: [{fqn, change, at_risk_callers, caller_count}]}
+    """
+    report = []
+    for sig in changed_signatures:
+        params_changed = (
+            [_param_name_only(p) for p in sig.get("old_params", [])]
+            != [_param_name_only(p) for p in sig.get("new_params", [])]
+        )
+        return_changed = (sig.get("old_return") or "") != (sig.get("new_return") or "")
+
+        if not params_changed and not return_changed:
+            continue  # body-only change — callers unaffected
+
+        callers = get_cross_module_callers(sig["fqn"], graph)["callers"]
+        if not callers:
+            continue  # interface changed but no external callers — safe
+
+        report.append({
+            "fqn": sig["fqn"],
+            "change": {
+                "params_changed": params_changed,
+                "return_changed": return_changed,
+                "old_params": sig.get("old_params", []),
+                "new_params": sig.get("new_params", []),
+                "old_return": sig.get("old_return"),
+                "new_return": sig.get("new_return"),
+            },
+            "at_risk_callers": callers,
+            "caller_count": len(callers),
+        })
+
+    return {
+        "file_path": file_path,
+        "interface_breaking_changes": len(report),
+        "impact": report,
+    }

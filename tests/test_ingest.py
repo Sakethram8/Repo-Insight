@@ -8,7 +8,7 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 from ingest import (
-    _file_to_module, generate_summaries_batch, extract_source_code,
+    _file_to_module, extract_source_code,
 )
 
 
@@ -27,33 +27,6 @@ class TestFileToModule:
 
     def test_init_file(self):
         assert _file_to_module("pkg/__init__.py") == "pkg.__init__"
-
-
-class TestGenerateSummariesBatch:
-    def test_empty_batch_returns_empty_dict(self):
-        result = generate_summaries_batch([])
-        assert result == {}
-
-    @patch("ingest._get_summary_client")
-    def test_successful_summary(self, mock_client_factory):
-        mock_client = MagicMock()
-        mock_response = MagicMock()
-        mock_response.choices = [MagicMock()]
-        mock_response.choices[0].message.content = '{"123": "This function adds two numbers."}'
-        mock_client.chat.completions.create.return_value = mock_response
-        mock_client_factory.return_value = mock_client
-
-        result = generate_summaries_batch([("123", "def add(a, b): return a + b", "", False)])
-        assert result == {"123": "This function adds two numbers."}
-
-    @patch("ingest._get_summary_client")
-    def test_llm_error_returns_empty_dict(self, mock_client_factory):
-        mock_client = MagicMock()
-        mock_client.chat.completions.create.side_effect = Exception("LLM down")
-        mock_client_factory.return_value = mock_client
-
-        result = generate_summaries_batch([("123", "def broken(): pass")])
-        assert result == {}
 
 
 class TestExtractSourceCode:
