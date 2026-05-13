@@ -1,6 +1,6 @@
 [build-system]
 requires = ["setuptools>=68", "wheel"]
-build-backend = "setuptools.backends.legacy:build"
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "repo-insight"
@@ -59,12 +59,15 @@ all = [
 repo-insight       = "demo_cli:main"
 repo-insight-mcp   = "mcp_server:main"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["repo_insight*"]
-
-[tool.setuptools.package-data]
-"*" = ["*.py"]
+# Flat layout — all modules live in the root directory, not a subdirectory package.
+# py-modules lists every top-level .py file that should be importable after install.
+[tool.setuptools]
+py-modules = [
+    "agent", "app", "apply_changes", "change_engine", "config",
+    "demo_cli", "embedder", "git_tools", "graph_health", "graph_index",
+    "ingest", "mcp_server", "parser", "resolver", "run_swebench",
+    "sandbox", "scoring", "tools", "watcher",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -177,8 +177,8 @@ class TestLocalizeSeeds:
         self.engine.client.chat.completions.create.return_value = mock_response
 
         seeds = self.engine._localize_seeds("something")
-        assert len(seeds) == 3
-        assert seeds == ["mod.func0", "mod.func1", "mod.func2"]
+        assert len(seeds) == 5
+        assert seeds == ["mod.func0", "mod.func1", "mod.func2", "mod.func3", "mod.func4"]
 
     @patch("change_engine.semantic_search")
     def test_empty_candidates_returns_empty(self, mock_search):
@@ -199,7 +199,7 @@ class TestLocalizeSeeds:
         self.engine.client.chat.completions.create.side_effect = Exception("LLM down")
 
         seeds = self.engine._localize_seeds("test")
-        assert len(seeds) == 3
+        assert len(seeds) == 4  # top-5 fallback, only 4 candidates available
 
 
 # ---------------------------------------------------------------------------

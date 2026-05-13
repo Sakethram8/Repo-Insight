@@ -118,7 +118,7 @@ def parse_edit_blocks(llm_output: str) -> list[EditBlock]:
 # ---------------------------------------------------------------------------
 
 def _fuzzy_apply(content: str, search_text: str, replace_text: str,
-                 threshold: float = 0.85) -> tuple[str | None, float]:
+                 threshold: float = 0.72) -> tuple[str | None, float]:
     """Find best approximate match for search_text in content using a fast-skip heuristic.
     Returns (new_content, similarity_ratio) or (None, 0.0) if below threshold.
     """

@@ -585,17 +585,27 @@ class GraphDrivenEngine:
             # Extract JSON array from response, tolerant of <think> blocks
             seeds = self._extract_json_array(raw)
             if seeds:
-                raw_seeds = [s for s in seeds if isinstance(s,str)]
-                #Clean each seed -reject tracebacks, extract function names
+                raw_seeds = [s for s in seeds if isinstance(s, str)]
                 cleaned = [_clean_seed(s) for s in raw_seeds]
                 cleaned = [s for s in cleaned if s]
                 if cleaned:
-                    return cleaned
+                    # Only keep seeds that actually exist in the graph — the LLM
+                    # sometimes hallucinates FQNs from training data that don't exist
+                    # at the specific commit being evaluated (or need to be CREATED).
+                    graph_fqns = {c["fqn"] for c in candidates}
+                    valid = [s for s in cleaned if s in graph_fqns]
+                    if valid:
+                        return valid
+                    # All LLM seeds were hallucinated — fall back to candidates
+                    logger.warning(
+                        "All LLM seeds absent from graph (%s) — using top-5 candidates",
+                        cleaned[:3],
+                    )
         except Exception as e:
             logger.error("Seed localization LLM call failed: %s", e)
 
-        # Fallback: use top 3 semantic search results
-        return [c["fqn"] for c in candidates[:3]]
+        # Fallback: use top 5 semantic search results
+        return [c["fqn"] for c in candidates[:5]]
 
     # ------------------------------------------------------------------
     # Phase 2: Structural Expansion (NO LLM)
