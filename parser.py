@@ -63,6 +63,7 @@ class FunctionDef:
     params: list[str] = field(default_factory=list)
     decorators: list[str] = field(default_factory=list)
     return_annotation: Optional[str] = None
+    raises: list[str] = field(default_factory=list)   # exception type names from raise stmts
 
 
 @dataclass
@@ -488,6 +489,25 @@ def _walk_tree(
                 file_path=rel_path,
                 line=node.start_point[0] + 1,
             ))
+
+    elif node.type == "raise_statement" and func_stack and result.functions:
+        # Extract exception type name from `raise ExcType(...)` or `raise ExcType`
+        # for Tier 0 fingerprint raises field.
+        for child in node.named_children:
+            if child.type in ("call", "identifier", "attribute"):
+                # Get the base name: ExcType(...) → ExcType, mod.ExcType → ExcType
+                base = child.child_by_field_name("function") or child
+                exc_text = base.text.decode("utf-8").split("(")[0].split(".")[-1]
+                if exc_text and exc_text[0].isupper():
+                    # Attach to the innermost function definition
+                    for func in reversed(result.functions):
+                        # Only attach if this raise is inside the function's line range
+                        raise_line = node.start_point[0] + 1
+                        if func.start_line <= raise_line <= func.end_line:
+                            if exc_text not in func.raises:
+                                func.raises.append(exc_text)
+                            break
+                break
 
     # Recurse into children for all other node types
     for child in node.children:

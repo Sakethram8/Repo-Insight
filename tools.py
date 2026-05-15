@@ -7,6 +7,7 @@ No LLM calls. These are the functions the agent will invoke.
 import json
 import logging
 import math
+import re
 import time
 from functools import lru_cache
 from pathlib import Path
@@ -16,6 +17,20 @@ import falkordb
 from embedder import embed_text
 
 logger = logging.getLogger(__name__)
+
+
+def _name_token_score(query: str, func_name: str) -> float:
+    """KGCompass-inspired name token overlap score (0–1).
+    Splits both query and function name into lowercase tokens and measures overlap.
+    Combined with cosine similarity (75/25 split) for hybrid ranking.
+    """
+    q_tokens = set(re.findall(r"\w+", query.lower()))
+    name_tokens = set(
+        re.findall(r"[a-z]+", re.sub(r"([A-Z])", r"_\1", func_name).lower())
+    )
+    if not name_tokens:
+        return 0.0
+    return len(q_tokens & name_tokens) / len(name_tokens)
 
 
 def get_function_context(fqn: str, graph: falkordb.Graph) -> dict:
@@ -267,6 +282,12 @@ def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5,
                 "in_degree": in_degree,
                 "score": round(final, 4),
             })
+        # Hybrid: 75% cosine + 25% name-token overlap (KGCompass-inspired)
+        for item in scored:
+            name = item["fqn"].split(".")[-1]
+            item["score"] = round(
+                0.75 * item["score"] + 0.25 * _name_token_score(query, name), 4
+            )
         scored.sort(key=lambda x: x["score"], reverse=True)
         return {"query": query, "results": scored[:top_k]}
 
@@ -314,6 +335,12 @@ def semantic_search(query: str, graph: falkordb.Graph, top_k: int = 5,
             "summary": summary, "in_degree": in_degree, "score": round(final_score, 4),
         })
 
+    # Hybrid: 75% cosine + 25% name-token overlap
+    for item in scored:
+        name = item["fqn"].split(".")[-1]
+        item["score"] = round(
+            0.75 * item["score"] + 0.25 * _name_token_score(query, name), 4
+        )
     scored.sort(key=lambda x: x["score"], reverse=True)
     return {"query": query, "results": scored[:top_k]}
 

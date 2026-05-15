@@ -131,13 +131,21 @@ def embed_text(text: str) -> list[float]:
     return result[0] if result else []
 
 
-def build_embedding_text(name: str, docstring: str | None, file_path: str) -> str:
+def build_embedding_text(
+    name: str,
+    docstring: str | None,
+    file_path: str,
+    fingerprint: str | None = None,
+) -> str:
     """Build the string that gets embedded for a function or class node.
 
-    Priority: docstring → name + file context.
-    The LLM-generated summary is no longer used — docstrings are more accurate,
-    always current, and require no external service.
+    Priority: fingerprint → docstring → name + file context.
+    The fingerprint contains signature + calls + reads + behavior label —
+    richer structural signal than docstring alone, improving semantic search
+    for undocumented functions.
     """
+    if fingerprint and fingerprint.strip():
+        return fingerprint.strip()[:400]
     if docstring and docstring.strip():
         return f"{name}. {docstring.strip()[:300]}"
     return f"{name} in {file_path}"

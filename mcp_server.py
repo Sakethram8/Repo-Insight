@@ -14,6 +14,11 @@ Requires:  pip install mcp
 import argparse
 import json
 import logging
+import os
+import re
+import subprocess
+import tempfile
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -216,6 +221,174 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "ingest_repository",
+        "description": (
+            "Parse a local repository and build its code knowledge graph in FalkorDB. "
+            "Call this first when working with a new repo. Returns counts of functions, "
+            "classes, and call edges discovered."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Absolute or relative path to the repository root (default: current dir).",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_graph_summary",
+        "description": (
+            "Return a summary of what is currently in the code graph — total functions, "
+            "classes, edges, and top modules by function count. Call this to understand "
+            "what has been indexed before running other graph tools."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
+    {
+        "name": "run_failing_tests_and_localize",
+        "description": (
+            "Run specific failing tests, capture the stack trace, and map the failing "
+            "functions back to their graph FQNs. This gives deterministic, ground-truth "
+            "seed localization — far more precise than semantic search alone. "
+            "Use this before get_blast_radius to find exact bug locations."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Path to the repository to run tests in.",
+                },
+                "test_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "pytest test IDs to run (e.g. ['tests/test_q.py::QTests::test_filter']).",
+                },
+            },
+            "required": ["repo_path", "test_ids"],
+        },
+    },
+    {
+        "name": "get_issue_context",
+        "description": (
+            "Given a GitHub issue URL or plain issue text, find the most likely functions "
+            "to fix using hybrid scoring (semantic similarity + name matching). "
+            "For GitHub URLs, fetches the issue title and body automatically. "
+            "Returns ranked candidate functions with graph paths showing why each is relevant."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "github_url": {
+                    "type": "string",
+                    "description": "GitHub issue URL (e.g. https://github.com/django/django/issues/1234).",
+                },
+                "issue_text": {
+                    "type": "string",
+                    "description": "Plain text issue description (used if github_url is not provided).",
+                },
+            },
+            "required": [],
+        },
+    },
+    {
+        "name": "get_coverage_guided_blast_radius",
+        "description": (
+            "Get a precision-filtered blast radius by intersecting the static call graph "
+            "with dynamic test coverage. Only returns callers that were actually executed "
+            "by the failing tests — eliminating ~60% of irrelevant nodes from the blast radius. "
+            "Requires pytest-cov: pip install pytest-cov"
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "repo_path": {
+                    "type": "string",
+                    "description": "Path to the repository.",
+                },
+                "test_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Failing test IDs to run for coverage.",
+                },
+                "fqn": {
+                    "type": "string",
+                    "description": "FQN of the function to compute blast radius for.",
+                },
+            },
+            "required": ["fqn"],
+        },
+    },
+    {
+        "name": "get_function_fingerprints",
+        "description": (
+            "Return the compact structured fingerprint for each requested function FQN. "
+            "Fingerprints contain: signature, behavior label (if generated), calls list, reads list, "
+            "raises list, and caller count — all in ~30 tokens. Use this on blast-radius results to "
+            "understand 20+ functions without reading source. For functions with no behavior label, "
+            "call get_function_skeletons next, generate a label, then store it with store_behavior_labels."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fqns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of FQNs to retrieve fingerprints for.",
+                },
+            },
+            "required": ["fqns"],
+        },
+    },
+    {
+        "name": "get_function_skeletons",
+        "description": (
+            "Return a stripped AST skeleton (~38% of source tokens) for functions that lack a behavior label. "
+            "The skeleton preserves control-flow conditions, return statements, raises, and variable names "
+            "while stripping string literals, argument values, and import noise. "
+            "Use this to generate a behavior label efficiently — pass the skeleton to the LLM, "
+            "then cache the label with store_behavior_labels. Skeletons are cached in FalkorDB after first use."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "fqns": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "List of FQNs to get skeletons for.",
+                },
+            },
+            "required": ["fqns"],
+        },
+    },
+    {
+        "name": "store_behavior_labels",
+        "description": (
+            "Permanently cache behavior labels you generated for undocumented functions. "
+            "Labels are injected into the fingerprint and stored in FalkorDB — future calls to "
+            "get_function_fingerprints will return them for free. "
+            "Format: one concise code-comment style line, e.g. 'Resolves aliased FQN via prefix matching'."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "labels": {
+                    "type": "object",
+                    "description": "Mapping of FQN → behavior label string.",
+                    "additionalProperties": {"type": "string"},
+                },
+            },
+            "required": ["labels"],
+        },
+    },
+    {
         "name": "analyze_edit_impact",
         "description": (
             "Given a list of functions whose signatures you changed, returns which external callers "
@@ -252,6 +425,366 @@ TOOL_DEFINITIONS = [
 
 
 # ---------------------------------------------------------------------------
+# Tool implementations (helper functions used by _TOOL_MAP below)
+# ---------------------------------------------------------------------------
+
+def _ingest_repository(args: dict, graph) -> dict:
+    from ingest import run_ingestion
+    repo_path = args.get("repo_path", ".")
+    try:
+        report = run_ingestion(str(Path(repo_path).resolve()))
+        return {
+            "status": "ingested",
+            "repo_path": str(repo_path),
+            "functions": report.get("functions", 0),
+            "classes": report.get("classes", 0),
+            "call_edges": report.get("call_edges", 0),
+            "files_parsed": report.get("files_parsed", 0),
+        }
+    except Exception as e:
+        return {"status": "error", "error": str(e)}
+
+
+def _get_graph_summary(args: dict, graph) -> dict:
+    from graph_health import get_graph_health
+    return get_graph_health(graph)
+
+
+def _run_failing_tests_and_localize(args: dict, graph) -> dict:
+    repo_path = args.get("repo_path", ".")
+    test_ids = list(args.get("test_ids", []))
+    if not test_ids:
+        return {"error": "test_ids is required"}
+
+    cmd = ["python", "-m", "pytest"] + test_ids + ["--tb=long", "-q", "--no-header"]
+    try:
+        result = subprocess.run(
+            cmd, cwd=str(repo_path),
+            capture_output=True, text=True, timeout=120,
+        )
+        output = result.stdout + result.stderr
+    except subprocess.TimeoutExpired:
+        return {"error": "Test execution timed out after 120s"}
+    except Exception as e:
+        return {"error": f"Test execution failed: {e}"}
+
+    # Parse traceback frames: File "path", line N, in func_name
+    trace_pattern = re.compile(r'File "([^"]+)", line (\d+), in (\w+)')
+    matches = trace_pattern.findall(output)
+
+    seeds = []
+    seen: set[tuple] = set()
+    repo_resolved = str(Path(repo_path).resolve())
+
+    for file_path, line_no, func_name in reversed(matches):
+        # Normalize to relative path
+        try:
+            rel_path = str(Path(file_path).relative_to(repo_resolved))
+        except ValueError:
+            rel_path = file_path
+
+        # Skip test files — the bug is in the implementation, not the test
+        if any(p in rel_path for p in ("/test", "test_", "_test.py")):
+            continue
+
+        key = (rel_path, func_name)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Attempt to map to a graph FQN
+        fqn_found = None
+        file_path_found = rel_path
+        try:
+            # Exact match first
+            rows = graph.query(
+                "MATCH (f:Function {name: $name, file_path: $fp}) "
+                "RETURN f.fqn, f.file_path LIMIT 1",
+                {"name": func_name, "fp": rel_path},
+            ).result_set
+            if not rows:
+                # Fallback: match by filename suffix (handles different base paths)
+                filename = Path(rel_path).name
+                rows = graph.query(
+                    "MATCH (f:Function {name: $name}) "
+                    "WHERE f.file_path ENDS WITH $fn "
+                    "RETURN f.fqn, f.file_path LIMIT 1",
+                    {"name": func_name, "fn": filename},
+                ).result_set
+            if rows:
+                fqn_found = rows[0][0]
+                file_path_found = rows[0][1]
+        except Exception:
+            pass
+
+        seeds.append({
+            "fqn": fqn_found,
+            "file_path": file_path_found,
+            "func_name": func_name,
+            "line": int(line_no),
+            "in_graph": fqn_found is not None,
+        })
+
+    return {
+        "seeds": seeds[:10],
+        "raw_trace": output[-3000:],
+        "test_ids": test_ids,
+        "return_code": result.returncode,
+        "total_frames": len(matches),
+    }
+
+
+def _get_issue_context(args: dict, graph) -> dict:
+    input_url = args.get("github_url", "")
+    input_text = args.get("issue_text", "")
+
+    issue_meta: dict = {}
+    query_text = input_text
+
+    # Fetch GitHub issue if URL provided
+    if input_url:
+        gh_match = re.search(
+            r"github\.com/([^/]+)/([^/]+)/issues/(\d+)", input_url
+        )
+        if gh_match:
+            owner, repo, issue_num = gh_match.groups()
+            api_url = f"https://api.github.com/repos/{owner}/{repo}/issues/{issue_num}"
+            headers = {"Accept": "application/vnd.github.v3+json"}
+            token = os.getenv("GITHUB_TOKEN")
+            if token:
+                headers["Authorization"] = f"token {token}"
+            try:
+                import requests as _req
+                r = _req.get(api_url, headers=headers, timeout=10)
+                r.raise_for_status()
+                data = r.json()
+                issue_meta = {
+                    "title": data.get("title", ""),
+                    "number": issue_num,
+                    "labels": [lb["name"] for lb in data.get("labels", [])],
+                    "url": input_url,
+                }
+                query_text = f"{data.get('title', '')} {data.get('body', '')}"
+            except Exception as e:
+                issue_meta = {"fetch_error": str(e)}
+                query_text = input_url  # fall back to raw URL text
+        else:
+            query_text = input_url
+
+    if not query_text.strip():
+        return {"error": "Provide github_url or issue_text"}
+
+    # Semantic search
+    from tools import semantic_search as _sem_search
+    search_result = _sem_search(query=query_text, graph=graph, top_k=20)
+    candidates = search_result.get("results", [])
+
+    # KGCompass-inspired hybrid scoring: 75% semantic + 25% name-token overlap
+    q_tokens = set(re.findall(r"\w+", query_text.lower()))
+
+    for c in candidates:
+        name = c.get("name") or c.get("fqn", "").split(".")[-1]
+        # Split camelCase + snake_case into tokens
+        name_tokens = set(re.findall(r"[a-z]+", re.sub(r"([A-Z])", r"_\1", name).lower()))
+        lev = len(q_tokens & name_tokens) / max(len(name_tokens), 1)
+        c["hybrid_score"] = round(0.75 * float(c.get("score", 0)) + 0.25 * lev, 4)
+
+    candidates.sort(key=lambda x: x.get("hybrid_score", 0), reverse=True)
+
+    return {
+        "issue": issue_meta,
+        "query_preview": query_text[:300],
+        "candidates": candidates[:10],
+    }
+
+
+def _get_coverage_guided_blast_radius(args: dict, graph) -> dict:
+    from tools import get_blast_radius as _blast
+
+    fqn = args.get("fqn", "")
+    repo_path = args.get("repo_path", ".")
+    test_ids = list(args.get("test_ids", []))
+
+    if not fqn:
+        return {"error": "fqn is required"}
+
+    # Get full static blast radius first
+    blast = _blast(fqn=fqn, graph=graph)
+    blast_nodes = blast.get("affected", [])
+
+    if not blast_nodes or not test_ids:
+        return {**blast, "coverage_filtered": False,
+                "note": "Returning full blast radius (no test_ids provided)"}
+
+    # Run tests with coverage
+    cov_path = Path(tempfile.mkdtemp()) / "coverage.json"
+    cmd = (
+        ["python", "-m", "pytest"] + test_ids
+        + [f"--cov={repo_path}", f"--cov-report=json:{cov_path}",
+           "-q", "--no-header", "--tb=no"]
+    )
+    try:
+        subprocess.run(cmd, cwd=str(repo_path), capture_output=True,
+                       timeout=120, check=False)
+    except Exception as e:
+        return {**blast, "coverage_filtered": False,
+                "coverage_note": f"Coverage run failed: {e}"}
+
+    # Parse coverage.json → file → executed line numbers
+    covered_lines: dict[str, set[int]] = {}
+    try:
+        with open(cov_path) as f:
+            cov_data = json.load(f)
+        repo_resolved = str(Path(repo_path).resolve())
+        for file_path, file_data in cov_data.get("files", {}).items():
+            try:
+                rel = str(Path(file_path).relative_to(repo_resolved))
+            except ValueError:
+                rel = file_path
+            executed = set(file_data.get("executed_lines", []))
+            if executed:
+                covered_lines[rel] = executed
+    except Exception as e:
+        return {**blast, "coverage_filtered": False,
+                "coverage_note": f"Coverage parse failed: {e}"}
+
+    # Filter: keep blast nodes whose start_line was executed
+    filtered = []
+    for node in blast_nodes:
+        node_file = node.get("file_path", "")
+        if node_file not in covered_lines:
+            continue  # file not touched by failing tests — irrelevant
+        try:
+            rows = graph.query(
+                "MATCH (f:Function {fqn: $fqn}) RETURN f.start_line",
+                {"fqn": node.get("fqn", "")},
+            ).result_set
+            start_line = int(rows[0][0]) if rows and rows[0][0] is not None else None
+        except Exception:
+            start_line = None
+
+        if start_line and start_line in covered_lines[node_file]:
+            filtered.append({**node, "covered": True})
+
+    return {
+        "affected": filtered,
+        "total_blast_radius": len(blast_nodes),
+        "after_coverage_filter": len(filtered),
+        "nodes_eliminated": len(blast_nodes) - len(filtered),
+        "coverage_filtered": True,
+        "seed_fqn": fqn,
+    }
+
+
+def _get_function_fingerprints(args: dict, graph) -> dict:
+    fqns = list(args.get("fqns", []))
+    if not fqns:
+        return {"error": "fqns list is required"}
+
+    result: dict[str, str | None] = {}
+    for fqn in fqns:
+        try:
+            rows = graph.query(
+                "MATCH (f:Function {fqn: $fqn}) RETURN f.fingerprint",
+                {"fqn": fqn},
+            ).result_set
+            result[fqn] = rows[0][0] if rows and rows[0][0] else None
+        except Exception as e:
+            result[fqn] = None
+            logger.warning("fingerprint query failed for %s: %s", fqn, e)
+
+    found = sum(1 for v in result.values() if v is not None)
+    return {"fingerprints": result, "found": found, "missing": len(fqns) - found}
+
+
+def _get_function_skeletons(args: dict, graph) -> dict:
+    from fingerprinting import build_code_skeleton
+    fqns = list(args.get("fqns", []))
+    if not fqns:
+        return {"error": "fqns list is required"}
+
+    result: dict[str, str | None] = {}
+    for fqn in fqns:
+        try:
+            rows = graph.query(
+                "MATCH (f:Function {fqn: $fqn}) RETURN f.skeleton, f.file_path, f.start_line, f.end_line",
+                {"fqn": fqn},
+            ).result_set
+            if not rows:
+                result[fqn] = None
+                continue
+
+            skeleton, file_path, start_line, end_line = rows[0]
+
+            # Return cached skeleton if available
+            if skeleton:
+                result[fqn] = skeleton
+                continue
+
+            # Build from source
+            if not file_path or start_line is None or end_line is None:
+                result[fqn] = None
+                continue
+
+            try:
+                src_lines = Path(file_path).read_text(errors="replace").splitlines()
+                src = "\n".join(src_lines[int(start_line) - 1 : int(end_line)])
+                skel = build_code_skeleton(src)
+                result[fqn] = skel
+
+                # Cache in FalkorDB
+                try:
+                    graph.query(
+                        "MATCH (f:Function {fqn: $fqn}) SET f.skeleton = $sk",
+                        {"fqn": fqn, "sk": skel},
+                    )
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning("skeleton build failed for %s: %s", fqn, e)
+                result[fqn] = None
+
+        except Exception as e:
+            logger.warning("skeleton query failed for %s: %s", fqn, e)
+            result[fqn] = None
+
+    found = sum(1 for v in result.values() if v is not None)
+    return {"skeletons": result, "found": found, "missing": len(fqns) - found}
+
+
+def _store_behavior_labels(args: dict, graph) -> dict:
+    from fingerprinting import inject_behavior_label
+    labels: dict[str, str] = dict(args.get("labels", {}))
+    if not labels:
+        return {"error": "labels dict is required"}
+
+    stored = 0
+    errors: list[str] = []
+    for fqn, label in labels.items():
+        try:
+            rows = graph.query(
+                "MATCH (f:Function {fqn: $fqn}) RETURN f.fingerprint",
+                {"fqn": fqn},
+            ).result_set
+            if not rows:
+                errors.append(f"{fqn}: not found in graph")
+                continue
+
+            current_fp = rows[0][0] or ""
+            updated_fp = inject_behavior_label(current_fp, label)
+            graph.query(
+                "MATCH (f:Function {fqn: $fqn}) SET f.fingerprint = $fp, f.fingerprint_label = $label",
+                {"fqn": fqn, "fp": updated_fp, "label": label},
+            )
+            stored += 1
+        except Exception as e:
+            errors.append(f"{fqn}: {e}")
+            logger.warning("store_behavior_label failed for %s: %s", fqn, e)
+
+    return {"stored": stored, "total": len(labels), "errors": errors}
+
+
+# ---------------------------------------------------------------------------
 # Dispatcher
 # ---------------------------------------------------------------------------
 
@@ -267,7 +800,7 @@ _TOOL_MAP = {
     "get_class_architecture":    lambda args, g: get_class_architecture(module_name=args["module_name"], graph=g),
     "get_cross_module_callers":  lambda args, g: get_cross_module_callers(fqn=args["fqn"], graph=g),
     "get_file_interface":        lambda args, g: get_file_interface(file_path=args["file_path"], graph=g),
-    "get_module_readers":         lambda args, g: get_module_readers(module_name=args["module_name"], graph=g),
+    "get_module_readers":        lambda args, g: get_module_readers(module_name=args["module_name"], graph=g),
     "analyze_git_diff":          lambda args, g: git_diff_impact(
                                      ref=args.get("ref", "HEAD"),
                                      repo_root=args.get("repo_root"),
@@ -278,6 +811,14 @@ _TOOL_MAP = {
                                      changed_signatures=args["changed_signatures"],
                                      graph=g,
                                  ),
+    "get_function_fingerprints":        _get_function_fingerprints,
+    "get_function_skeletons":           _get_function_skeletons,
+    "store_behavior_labels":            _store_behavior_labels,
+    "ingest_repository":                _ingest_repository,
+    "get_graph_summary":                _get_graph_summary,
+    "run_failing_tests_and_localize":   _run_failing_tests_and_localize,
+    "get_issue_context":                _get_issue_context,
+    "get_coverage_guided_blast_radius": _get_coverage_guided_blast_radius,
 }
 
 

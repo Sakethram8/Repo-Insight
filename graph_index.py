@@ -43,9 +43,10 @@ class GraphIndex:
     fn_meta:    dict[str, dict] = field(default_factory=dict)
     module_fns: dict[str, list[str]] = field(default_factory=lambda: defaultdict(list))
     # Fix 4: embedding cache — avoids 81MB Redis pull on every semantic_search
-    embeddings: dict[str, tuple[float, ...]] = field(default_factory=dict)
-    summaries:  dict[str, str] = field(default_factory=dict)
-    in_degree:  dict[str, int] = field(default_factory=dict)
+    embeddings:   dict[str, tuple[float, ...]] = field(default_factory=dict)
+    summaries:    dict[str, str] = field(default_factory=dict)
+    in_degree:    dict[str, int] = field(default_factory=dict)
+    fingerprints: dict[str, str] = field(default_factory=dict)
     # Fix 6: thread safety — lock held only during the atomic swap, not during load
     _lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -69,9 +70,10 @@ class GraphIndex:
         new_subclasses = defaultdict(set)
         new_fn_meta    = {}
         new_module_fns = defaultdict(list)
-        new_embeddings: dict[str, tuple[float, ...]] = {}
-        new_summaries:  dict[str, str] = {}
-        new_in_degree:  dict[str, int] = {}
+        new_embeddings:   dict[str, tuple[float, ...]] = {}
+        new_summaries:    dict[str, str] = {}
+        new_in_degree:    dict[str, int] = {}
+        new_fingerprints: dict[str, str] = {}
 
         try:
             for row in graph.query(
@@ -125,16 +127,29 @@ class GraphIndex:
         try:
             for row in graph.query(
                 "MATCH (f:Function) WHERE f.embedding IS NOT NULL "
-                "RETURN f.fqn, f.embedding, f.summary"
+                "RETURN f.fqn, f.embedding, f.summary, f.fingerprint"
             ).result_set:
-                fqn, emb_json, summary = row[0], row[1], row[2]
+                fqn, emb_json, summary, fingerprint = row[0], row[1], row[2], row[3]
                 try:
                     new_embeddings[fqn] = tuple(json.loads(emb_json))
                 except Exception:
                     pass
                 new_summaries[fqn] = summary or ""
+                if fingerprint:
+                    new_fingerprints[fqn] = fingerprint
         except Exception as e:
             logger.warning("GraphIndex: failed to load embeddings: %s", e)
+
+        try:
+            for row in graph.query(
+                "MATCH (f:Function) WHERE f.fingerprint IS NOT NULL AND f.embedding IS NULL "
+                "RETURN f.fqn, f.fingerprint"
+            ).result_set:
+                fqn, fingerprint = row[0], row[1]
+                if fingerprint:
+                    new_fingerprints[fqn] = fingerprint
+        except Exception as e:
+            logger.warning("GraphIndex: failed to load fingerprints: %s", e)
 
         try:
             for row in graph.query(
@@ -147,16 +162,17 @@ class GraphIndex:
         # Fix 6: atomic swap — acquire lock only for the brief replacement so
         # concurrent reads see either the fully old or fully new state.
         with self._lock:
-            self.callees    = new_callees
-            self.callers    = new_callers
-            self.reads      = new_reads
-            self.bases      = new_bases
-            self.subclasses = new_subclasses
-            self.fn_meta    = new_fn_meta
-            self.module_fns = new_module_fns
-            self.embeddings = new_embeddings
-            self.summaries  = new_summaries
-            self.in_degree  = new_in_degree
+            self.callees      = new_callees
+            self.callers      = new_callers
+            self.reads        = new_reads
+            self.bases        = new_bases
+            self.subclasses   = new_subclasses
+            self.fn_meta      = new_fn_meta
+            self.module_fns   = new_module_fns
+            self.embeddings   = new_embeddings
+            self.summaries    = new_summaries
+            self.in_degree    = new_in_degree
+            self.fingerprints = new_fingerprints
 
         logger.info(
             "GraphIndex loaded: %d functions, %d caller-edges, %d reads-edges, %d embeddings",
@@ -188,6 +204,7 @@ class GraphIndex:
 
     def _bfs(self, start: str, adj: dict, max_depth: int) -> list[dict]:
         visited: dict[str, int] = {}
+        predecessor: dict[str, str] = {}  # node → who discovered it
         queue: list[tuple[str, int]] = [(start, 0)]
         while queue:
             current, depth = queue.pop(0)
@@ -196,19 +213,34 @@ class GraphIndex:
             for neighbour in adj.get(current, set()):
                 if neighbour not in visited:
                     visited[neighbour] = depth + 1
+                    predecessor[neighbour] = current
                     queue.append((neighbour, depth + 1))
-        return self._format_hits(visited)
+        return self._format_hits(visited, predecessor, start)
 
-    def _format_hits(self, visited: dict[str, int]) -> list[dict]:
+    def _format_hits(
+        self, visited: dict[str, int], predecessor: dict[str, str] = {}, start: str = ""
+    ) -> list[dict]:
         with self._lock:
             meta_snap = self.fn_meta
         result = []
         for hit_fqn, dist in sorted(visited.items(), key=lambda x: x[1]):
             meta = meta_snap.get(hit_fqn, {})
+
+            # Reconstruct call chain from hit back to seed
+            path_parts: list[str] = []
+            node = hit_fqn
+            while node and node != start and node in predecessor:
+                path_parts.append(node.split(".")[-1])
+                node = predecessor[node]
+            if start:
+                path_parts.append(start.split(".")[-1])
+            path_str = " → ".join(reversed(path_parts)) if path_parts else ""
+
             result.append({
                 "fqn": hit_fqn,
                 "file_path": meta.get("file_path", ""),
                 "distance": dist,
+                "path": path_str,
             })
         return result
 
@@ -225,4 +257,5 @@ class GraphIndex:
                 "reads_edges": sum(len(v) for v in self.reads.values()),
                 "inherits_edges": sum(len(v) for v in self.bases.values()),
                 "embeddings_cached": len(self.embeddings),
+                "fingerprints_cached": len(self.fingerprints),
             }

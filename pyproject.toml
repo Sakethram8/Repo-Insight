@@ -31,6 +31,7 @@ dependencies = [
     "mcp>=1.0.0",
     "rich>=13.7.1",
     "jedi>=0.19.0",
+    "requests>=2.31.0",
 ]
 
 [project.optional-dependencies]
@@ -48,6 +49,7 @@ ui = [
 dev = [
     "pytest>=8.2.0",
     "pytest-mock>=3.14.0",
+    "pytest-cov>=5.0.0",
 ]
 # All optional deps
 all = [
@@ -64,9 +66,9 @@ repo-insight-mcp   = "mcp_server:main"
 [tool.setuptools]
 py-modules = [
     "agent", "app", "apply_changes", "change_engine", "config",
-    "demo_cli", "embedder", "git_tools", "graph_health", "graph_index",
-    "ingest", "mcp_server", "parser", "resolver", "run_swebench",
-    "sandbox", "scoring", "tools", "watcher",
+    "demo_cli", "embedder", "fingerprinting", "git_tools", "graph_health",
+    "graph_index", "ingest", "mcp_server", "parser", "resolver",
+    "run_swebench", "sandbox", "scoring", "tools", "watcher",
 ]
 
 [tool.pytest.ini_options]

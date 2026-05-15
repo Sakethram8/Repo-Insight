@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "repo-insight": {
+      "command": "python",
+      "args": ["mcp_server.py"],
+      "env": {
+        "FALKORDB_HOST": "localhost",
+        "FALKORDB_PORT": "6379",
+        "GRAPH_NAME": "repo_insight"
+      }
+    }
+  }
+}

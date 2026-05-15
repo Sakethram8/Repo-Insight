@@ -549,6 +549,85 @@ def ingest_parsed_files(
                         jedi_edges, chunk_size=100, param="edges")
         logger.info("Jedi upgraded %d additional CALLS edges", jedi_upgraded)
 
+    # --- Step 8: Generate and store Tier-0 static fingerprints ---
+    # All CALLS and READS edges are now in the graph, so we can compute
+    # accurate calls/reads/caller_count for each function.
+    _write_fingerprints(parsed_files, graph, module_fqn_map, known_fqns)
+
+
+def _write_fingerprints(
+    parsed_files: list[ParsedFile],
+    graph: falkordb.Graph,
+    module_fqn_map: dict[str, str],
+    known_fqns: set[str],
+) -> None:
+    """Generate and store Tier-0 static fingerprints for all ingested functions."""
+    from fingerprinting import build_static_fingerprint
+
+    # Batch-query caller counts for all known FQNs in one pass
+    try:
+        caller_counts: dict[str, int] = {}
+        rows = graph.query(
+            "MATCH ()-[:CALLS]->(f:Function) RETURN f.fqn, count(*)"
+        ).result_set
+        for row in rows:
+            caller_counts[row[0]] = int(row[1])
+    except Exception as e:
+        logger.warning("Fingerprint: caller count query failed: %s", e)
+        caller_counts = {}
+
+    # Batch-query CALLS edges (callee short names) per function
+    try:
+        callees_map: dict[str, list[str]] = {}
+        rows = graph.query(
+            "MATCH (f:Function)-[:CALLS]->(t:Function) RETURN f.fqn, t.fqn"
+        ).result_set
+        for row in rows:
+            callees_map.setdefault(row[0], []).append(row[1])
+    except Exception as e:
+        logger.warning("Fingerprint: callee query failed: %s", e)
+        callees_map = {}
+
+    # Batch-query READS edges per function
+    try:
+        reads_map: dict[str, list[str]] = {}
+        rows = graph.query(
+            "MATCH (f:Function)-[r:READS]->() RETURN f.fqn, r.name"
+        ).result_set
+        for row in rows:
+            reads_map.setdefault(row[0], []).append(row[1])
+    except Exception as e:
+        logger.warning("Fingerprint: reads query failed: %s", e)
+        reads_map = {}
+
+    fingerprint_updates: list[dict] = []
+    for pf in parsed_files:
+        mod_name = module_fqn_map[pf.file_path]
+        for func in pf.functions:
+            fqn = f"{mod_name}.{func.qualname}" if func.qualname else f"{mod_name}.{func.name}"
+            if fqn not in known_fqns:
+                continue
+            fp = build_static_fingerprint(
+                name=func.name,
+                qualname=func.qualname or func.name,
+                params=func.params,
+                return_annotation=func.return_annotation,
+                docstring=func.docstring,
+                raises=func.raises,
+                calls=callees_map.get(fqn, []),
+                reads=reads_map.get(fqn, []),
+                caller_count=caller_counts.get(fqn, 0),
+            )
+            fingerprint_updates.append({"fqn": fqn, "fp": fp})
+
+    if fingerprint_updates:
+        _bulk_write(
+            graph,
+            "UNWIND $edges AS e MATCH (f:Function {fqn: e.fqn}) SET f.fingerprint = e.fp",
+            fingerprint_updates, chunk_size=200, param="edges",
+        )
+        logger.info("Fingerprints written: %d functions", len(fingerprint_updates))
+
 
 def run_ingestion(directory_path: str, *, on_progress=None, graph_name: str | None = None) -> dict:
     """Run full ingestion pipeline: parse, summarise, embed, and write to graph.
