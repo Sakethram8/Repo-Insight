@@ -308,7 +308,14 @@ def _run_instance(
         condition = "BASELINE" if no_graph else "GRAPH"
         logger.info("[%s] Running Claude Code (%s)", instance_id, condition)
 
-        env = {**os.environ, "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", "fake")}
+        env = {
+            **os.environ,
+            "ANTHROPIC_API_KEY": os.environ.get("ANTHROPIC_API_KEY", "fake"),
+            # Force all Claude Code model tiers to our vLLM alias
+            "ANTHROPIC_DEFAULT_OPUS_MODEL":   CLAUDE_MODEL,
+            "ANTHROPIC_DEFAULT_SONNET_MODEL": CLAUDE_MODEL,
+            "ANTHROPIC_DEFAULT_HAIKU_MODEL":  CLAUDE_MODEL,
+        }
         if "ANTHROPIC_BASE_URL" not in env:
             logger.warning("[%s] ANTHROPIC_BASE_URL not set — Claude Code will call real Anthropic API", instance_id)
 

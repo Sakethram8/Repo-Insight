@@ -71,34 +71,29 @@ HOST                              HOST
 
 **If SGLang is NOT running, start vLLM:**
 ```bash
-[ROCM] python -m vllm.entrypoints.openai.api_server \
-  --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
+[ROCM] vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct \
   --served-model-name claude-3-5-sonnet-20241022 \
   --port 8000 \
   --host 0.0.0.0 \
   --max-model-len 65536 \
   --gpu-memory-utilization 0.90 \
-  --dtype bfloat16 \
-  --trust-remote-code
+  --enable-auto-tool-choice \
+  --tool-call-parser qwen3_coder
 ```
 
-> **`--served-model-name claude-3-5-sonnet-20241022`** — Claude Code hardcodes this model
-> name in every request. vLLM will serve Qwen under that alias, so Claude Code finds it
-> without needing a LiteLLM proxy in the middle.
-
-> **No `--tensor-parallel-size`** — MI300X is a single unified 192GB chip.
-> If vLLM detects multiple logical GPUs and complains, add `--tensor-parallel-size 1` explicitly.
+> **Why these flags:**
+> - `--served-model-name` — aliases Qwen as `claude-3-5-sonnet-20241022` so Claude Code finds it
+> - `--enable-auto-tool-choice` — required for Claude Code's `tool_choice: "auto"` requests
+> - `--tool-call-parser qwen3_coder` — correct parser for Qwen3-Coder's XML tool call format
+> - No `--dtype`, no `--trust-remote-code`, no `--tensor-parallel-size` needed
+> - No `--enable-reasoning` — Qwen3-**Coder** has no thinking mode (unlike Qwen3 base)
+> - vLLM v0.4+ serves `/v1/messages` (Anthropic format) natively — no LiteLLM needed
 
 > **Why Qwen3-Coder-30B-A3B:** MoE — 30B total params, only **3B active** per forward pass.
-> Full weights ~60GB bfloat16 (trivial on 192GB), but inference speed is close to a 3B dense
-> model. You get large-model quality at small-model speed.
->
-> **Model alternatives** (all fit in 192GB):
-> - `Qwen/Qwen3-Coder-30B-A3B-Instruct` ← **chosen** (MoE, fast + strong coding)
-> - `Qwen/Qwen2.5-Coder-32B-Instruct` (dense 32B, good fallback)
-> - `Qwen/Qwen2.5-Coder-72B-Instruct` (dense 72B, ~160GB, slower but stronger)
+> Full weights ~60GB (trivial on 192GB), inference speed close to a 3B dense model.
+> Native 256K context window; we cap at 64K for agent session length.
 
-**Wait for:** `Application startup complete.` (~2-3 min — 60GB loads faster than 160GB)
+**Wait for:** `Application startup complete.` (~2-3 min)
 
 **Verify from host:**
 ```bash
@@ -146,12 +141,17 @@ vLLM natively serves the Anthropic Messages API (`/v1/messages`) — **no LiteLL
 The `--served-model-name` alias in Step 1 ensures Claude Code finds the model by its expected name.
 
 ```bash
-[HOST] # Point Claude Code at vLLM directly
-export ANTHROPIC_BASE_URL=http://localhost:8000   # vLLM, not a proxy
-export ANTHROPIC_API_KEY=fake                     # any non-empty value works
+[HOST] export ANTHROPIC_BASE_URL=http://localhost:8000
+export ANTHROPIC_API_KEY=fake
+# Force Claude Code to use our model alias for ALL request tiers
+# (without these it defaults to claude-opus-4-7 which vLLM won't find)
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
+export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 ```
 
-> If you used the container IP instead of localhost, set it here too:
+> If the container IP differs from localhost:
 > ```bash
 > CONTAINER_IP=$(docker inspect rocm -f '{{.NetworkSettings.IPAddress}}')
 > export ANTHROPIC_BASE_URL=http://${CONTAINER_IP}:8000
@@ -162,10 +162,6 @@ export ANTHROPIC_API_KEY=fake                     # any non-empty value works
 [HOST] claude --model claude-3-5-sonnet-20241022 --print -p "Reply with only the number: what is 7 times 6?"
 # Expected: "42" — full chain confirmed
 ```
-
-> **Why `--model`?** Claude Code defaults to `claude-opus-4-7` but vLLM is aliased as
-> `claude-3-5-sonnet-20241022`. They must match. The runner passes `--model` automatically
-> via the `CLAUDE_MODEL` env var (default: `claude-3-5-sonnet-20241022`).
 
 **If you get parameter errors** (vLLM rejecting unknown Anthropic params), fall back to LiteLLM:
 ```bash
@@ -187,6 +183,9 @@ Quick confirmation:
 # Confirm claude can run a task (no MCP needed)
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
 export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 claude --model claude-3-5-sonnet-20241022 --print -p "List 3 Python built-in functions."
 ```
@@ -238,6 +237,9 @@ print('PASS: fingerprints OK')
 [HOST - DROPLET 2]
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
 export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 export SKIP_JEDI=true
 
@@ -283,6 +285,9 @@ VALIDATION_IDS="django__django-11790,django__django-11951,django__django-12193,d
 source venv/bin/activate && cd Repo-Insight
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
 export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 VALIDATION_IDS="django__django-11790,django__django-11951,django__django-12193,django__django-12406,django__django-9296,sphinx-doc__sphinx-10323,sphinx-doc__sphinx-7590,sphinx-doc__sphinx-8475,sphinx-doc__sphinx-9230,sphinx-doc__sphinx-9698"
 
@@ -310,6 +315,9 @@ for r in rs:
 source venv/bin/activate && cd Repo-Insight
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
 export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 export SKIP_JEDI=true
 VALIDATION_IDS="django__django-11790,django__django-11951,django__django-12193,django__django-12406,django__django-9296,sphinx-doc__sphinx-10323,sphinx-doc__sphinx-7590,sphinx-doc__sphinx-8475,sphinx-doc__sphinx-9230,sphinx-doc__sphinx-9698"
@@ -387,6 +395,9 @@ tmux new -s run
 source venv/bin/activate && cd Repo-Insight
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
 export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 
 # Seed output dir with validation results — skip-existing won't re-run them
@@ -405,6 +416,9 @@ python run_swebench_ccli.py \
 source venv/bin/activate && cd Repo-Insight
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-3-5-sonnet-20241022
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
 export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 export SKIP_JEDI=true
 
