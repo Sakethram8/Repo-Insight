@@ -64,6 +64,10 @@ FALKORDB_HOST = os.environ.get("FALKORDB_HOST", "localhost")
 FALKORDB_PORT = os.environ.get("FALKORDB_PORT", "6379")
 GRAPH_NAME    = os.environ.get("GRAPH_NAME", "repo_insight")
 
+# Model name must match --served-model-name in vLLM exactly.
+# Claude Code defaults to claude-opus-4-7; override with this env var.
+CLAUDE_MODEL  = os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
+
 CLONE_TIMEOUT   = 120    # seconds for git clone
 AGENT_TIMEOUT   = 1200   # 20 min cap per instance for Claude Code
 INSTANCE_TIMEOUT = 1500  # 25 min total per instance
@@ -309,7 +313,8 @@ def _run_instance(
             logger.warning("[%s] ANTHROPIC_BASE_URL not set — Claude Code will call real Anthropic API", instance_id)
 
         proc = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions", "-p", prompt],
+            ["claude", "--print", "--dangerously-skip-permissions",
+             "--model", CLAUDE_MODEL, "-p", prompt],
             cwd=str(repo_dir),
             capture_output=True,
             text=True,

@@ -159,9 +159,13 @@ export ANTHROPIC_API_KEY=fake                     # any non-empty value works
 
 **Test full chain — Claude Code → vLLM → response:**
 ```bash
-[HOST] claude --print -p "Reply with only the number: what is 7 times 6?"
+[HOST] claude --model claude-3-5-sonnet-20241022 --print -p "Reply with only the number: what is 7 times 6?"
 # Expected: "42" — full chain confirmed
 ```
+
+> **Why `--model`?** Claude Code defaults to `claude-opus-4-7` but vLLM is aliased as
+> `claude-3-5-sonnet-20241022`. They must match. The runner passes `--model` automatically
+> via the `CLAUDE_MODEL` env var (default: `claude-3-5-sonnet-20241022`).
 
 **If you get parameter errors** (vLLM rejecting unknown Anthropic params), fall back to LiteLLM:
 ```bash
@@ -183,7 +187,8 @@ Quick confirmation:
 # Confirm claude can run a task (no MCP needed)
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
-claude --print -p "List 3 Python built-in functions."
+export CLAUDE_MODEL=claude-3-5-sonnet-20241022
+claude --model claude-3-5-sonnet-20241022 --print -p "List 3 Python built-in functions."
 ```
 
 ---
@@ -233,6 +238,7 @@ print('PASS: fingerprints OK')
 [HOST - DROPLET 2]
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 export SKIP_JEDI=true
 
 # Run this from the Repo-Insight directory
@@ -277,6 +283,7 @@ VALIDATION_IDS="django__django-11790,django__django-11951,django__django-12193,d
 source venv/bin/activate && cd Repo-Insight
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 VALIDATION_IDS="django__django-11790,django__django-11951,django__django-12193,django__django-12406,django__django-9296,sphinx-doc__sphinx-10323,sphinx-doc__sphinx-7590,sphinx-doc__sphinx-8475,sphinx-doc__sphinx-9230,sphinx-doc__sphinx-9698"
 
 python run_swebench_ccli.py \
@@ -303,6 +310,7 @@ for r in rs:
 source venv/bin/activate && cd Repo-Insight
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 export SKIP_JEDI=true
 VALIDATION_IDS="django__django-11790,django__django-11951,django__django-12193,django__django-12406,django__django-9296,sphinx-doc__sphinx-10323,sphinx-doc__sphinx-7590,sphinx-doc__sphinx-8475,sphinx-doc__sphinx-9230,sphinx-doc__sphinx-9698"
 
@@ -379,6 +387,7 @@ tmux new -s run
 source venv/bin/activate && cd Repo-Insight
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 
 # Seed output dir with validation results — skip-existing won't re-run them
 cp -r results/validation_baseline/. results/ccli_baseline/ 2>/dev/null || true
@@ -396,6 +405,7 @@ python run_swebench_ccli.py \
 source venv/bin/activate && cd Repo-Insight
 export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 export SKIP_JEDI=true
 
 # Seed output dir with validation results — skip-existing won't re-run them
