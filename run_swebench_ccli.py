@@ -312,6 +312,9 @@ def _run_instance(
             "ANTHROPIC_DEFAULT_OPUS_MODEL":   CLAUDE_MODEL,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": CLAUDE_MODEL,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL":  CLAUDE_MODEL,
+            # Required on root-owned droplets: bypasses the root safety check
+            # that otherwise blocks --dangerously-skip-permissions
+            "IS_SANDBOX": "1",
         }
         if "ANTHROPIC_BASE_URL" not in env:
             logger.warning("[%s] ANTHROPIC_BASE_URL not set — Claude Code will call real Anthropic API", instance_id)

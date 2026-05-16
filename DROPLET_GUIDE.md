@@ -128,6 +128,7 @@ sudo apt-get install -y nodejs
 npm install -g @anthropic-ai/claude-code
 
 # Verify everything
+# Verify everything
 claude --version
 python -c "import mcp_server; print(len(mcp_server.TOOL_DEFINITIONS), 'MCP tools OK')"
 python -c "from datasets import load_dataset; ds=load_dataset('MariusHobbhahn/swe-bench-verified-mini',split='test'); print(len(ds),'instances')"
@@ -273,35 +274,13 @@ export SKIP_JEDI=true
 # Run from the Repo-Insight directory (where .mcp.json lives)
 cd ~/Repo-Insight
 
-# Good test: ask a natural question — model should call get_graph_summary automatically
-claude --model claude-3-5-sonnet-20241022 --print \
+# IS_SANDBOX=1 is required on root-owned droplets:
+# --dangerously-skip-permissions is blocked as root without it
+IS_SANDBOX=1 claude --model claude-3-5-sonnet-20241022 --print --dangerously-skip-permissions \
   -p "Call get_graph_summary to get statistics about this codebase and report the number of functions."
 
-# Expected: tool call log line + "functions: NNN" number > 100
-# If you see "Tool result" or "get_graph_summary" in output → MCP is working ✓
-# If you see raw <function=...> XML or "Skill" in output → tool chain broken ✗
-```
-
-**Lightweight sanity check** (bypasses model entirely — confirms MCP server starts):
-```bash
-[HOST - DROPLET 2]
-cd ~/Repo-Insight
-# Start the MCP server manually and send a tools/list request
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | \
-  GRAPH_NAME=repo_insight FALKORDB_HOST=localhost SKIP_JEDI=true \
-  python3 mcp_server.py 2>/dev/null | python3 -c "
-import sys, json
-for line in sys.stdin:
-    line = line.strip()
-    if line.startswith('{'):
-        d = json.loads(line)
-        tools = d.get('result', {}).get('tools', [])
-        print(f'MCP server returned {len(tools)} tools:')
-        for t in tools:
-            print(f'  - {t[\"name\"]}')
-        break
-"
-# Expected: 22+ tools listed (get_graph_summary, search_codebase, etc.)
+# Expected: structured output with functions > 100
+# If you see "636 functions" or similar → full MCP chain is working ✓
 ```
 
 ---
@@ -341,6 +320,7 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-3-5-sonnet-20241022
 export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-3-5-sonnet-20241022
 export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
 export CLAUDE_MODEL=claude-3-5-sonnet-20241022
+export IS_SANDBOX=1   # required: droplet runs as root
 VALIDATION_IDS="django__django-11790,django__django-11951,django__django-12193,django__django-12406,django__django-9296,sphinx-doc__sphinx-10323,sphinx-doc__sphinx-7590,sphinx-doc__sphinx-8475,sphinx-doc__sphinx-9230,sphinx-doc__sphinx-9698"
 
 python run_swebench_ccli.py \
@@ -372,6 +352,7 @@ export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-3-5-sonnet-20241022
 export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
 export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 export SKIP_JEDI=true
+export IS_SANDBOX=1   # required: droplet runs as root
 VALIDATION_IDS="django__django-11790,django__django-11951,django__django-12193,django__django-12406,django__django-9296,sphinx-doc__sphinx-10323,sphinx-doc__sphinx-7590,sphinx-doc__sphinx-8475,sphinx-doc__sphinx-9230,sphinx-doc__sphinx-9698"
 
 python run_swebench_ccli.py \
@@ -451,6 +432,7 @@ export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-3-5-sonnet-20241022
 export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-3-5-sonnet-20241022
 export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
 export CLAUDE_MODEL=claude-3-5-sonnet-20241022
+export IS_SANDBOX=1   # required: droplet runs as root
 
 # Seed output dir with validation results — skip-existing won't re-run them
 cp -r results/validation_baseline/. results/ccli_baseline/ 2>/dev/null || true
@@ -473,6 +455,7 @@ export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-3-5-sonnet-20241022
 export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
 export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 export SKIP_JEDI=true
+export IS_SANDBOX=1   # required: droplet runs as root
 
 # Seed output dir with validation results — skip-existing won't re-run them
 cp -r results/validation_graph/. results/ccli_graph/ 2>/dev/null || true
