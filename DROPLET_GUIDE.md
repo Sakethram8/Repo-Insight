@@ -9,7 +9,7 @@ The MI300X changes several defaults from the generic guide:
 
 | Parameter | Generic guide | MI300X guide | Reason |
 |---|---|---|---|
-| Model | Qwen2.5-Coder-32B | **Qwen2.5-Coder-72B** | 192GB fits 72B in bfloat16 (~160GB) |
+| Model | Qwen2.5-Coder-32B | **Qwen3-Coder-30B-A3B** | MoE: 3B active, 60GB weights, fast |
 | `--tensor-parallel-size` | 2 | **1** (omit flag) | MI300X is single unified 192GB chip |
 | `--max-model-len` | 32768 | **65536** | 192GB headroom allows 64K context |
 | Workers | 4 | **8** | 20 vCPUs supports 8 parallel agents |
@@ -25,13 +25,13 @@ The MI300X changes several defaults from the generic guide:
 DROPLET 1 (Baseline)              DROPLET 2 (Graph-Enhanced)
 ─────────────────────             ─────────────────────────────
 rocm container                    rocm container
-  └── vLLM port 8000                └── vLLM port 8000
-      Qwen2.5-Coder-72B                 Qwen2.5-Coder-72B
+  └── vLLM :8000                    └── vLLM :8000
+      Qwen3-Coder-30B-A3B               Qwen3-Coder-30B-A3B
+      alias: claude-3-5-sonnet          alias: claude-3-5-sonnet
 HOST                              HOST
-  ├── LiteLLM proxy :4000           ├── LiteLLM proxy :4000
   ├── Claude Code CLI               ├── Claude Code CLI
   ├── Repo-Insight (ibm-bob)        ├── Repo-Insight (ibm-bob)
-  └── run_swebench_ccli.py          ├── FalkorDB docker :6379
+  └── run_swebench_ccli.py          ├── FalkorDB :6379
       --no-graph --workers 8        └── run_swebench_ccli.py
                                         --workers 8
 ```
@@ -72,7 +72,7 @@ HOST                              HOST
 **If SGLang is NOT running, start vLLM:**
 ```bash
 [ROCM] python -m vllm.entrypoints.openai.api_server \
-  --model Qwen/Qwen2.5-Coder-72B-Instruct \
+  --model Qwen/Qwen3-Coder-30B-A3B-Instruct \
   --served-model-name claude-3-5-sonnet-20241022 \
   --port 8000 \
   --host 0.0.0.0 \
@@ -89,12 +89,16 @@ HOST                              HOST
 > **No `--tensor-parallel-size`** — MI300X is a single unified 192GB chip.
 > If vLLM detects multiple logical GPUs and complains, add `--tensor-parallel-size 1` explicitly.
 
+> **Why Qwen3-Coder-30B-A3B:** MoE — 30B total params, only **3B active** per forward pass.
+> Full weights ~60GB bfloat16 (trivial on 192GB), but inference speed is close to a 3B dense
+> model. You get large-model quality at small-model speed.
+>
 > **Model alternatives** (all fit in 192GB):
-> - `Qwen/Qwen2.5-Coder-72B-Instruct` ← **recommended** (best coding, ~160GB bfloat16)
-> - `Qwen/Qwen2.5-Coder-32B-Instruct` (faster inference, still very strong, ~70GB)
-> - `Qwen/Qwen3-32B` (general-purpose, strong at code)
+> - `Qwen/Qwen3-Coder-30B-A3B-Instruct` ← **chosen** (MoE, fast + strong coding)
+> - `Qwen/Qwen2.5-Coder-32B-Instruct` (dense 32B, good fallback)
+> - `Qwen/Qwen2.5-Coder-72B-Instruct` (dense 72B, ~160GB, slower but stronger)
 
-**Wait for:** `Application startup complete.` (~3-5 min to load 72B weights from disk)
+**Wait for:** `Application startup complete.` (~2-3 min — 60GB loads faster than 160GB)
 
 **Verify from host:**
 ```bash
@@ -177,7 +181,7 @@ Quick confirmation:
 ```bash
 [HOST - DROPLET 1]
 # Confirm claude can run a task (no MCP needed)
-export ANTHROPIC_BASE_URL=http://localhost:4000
+export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
 claude --print -p "List 3 Python built-in functions."
 ```
@@ -227,7 +231,7 @@ print('PASS: fingerprints OK')
 ### 5d. Verify Claude Code calls our MCP tools
 ```bash
 [HOST - DROPLET 2]
-export ANTHROPIC_BASE_URL=http://localhost:4000
+export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
 export SKIP_JEDI=true
 
@@ -242,71 +246,119 @@ claude --print -p "Use the repo-insight MCP tool get_graph_summary() and tell me
 
 ---
 
-## STEP 6 — Smoke test: 3 instances per droplet
+## STEP 6 — Validation batch (10 instances per droplet)
 
-**Run this before committing to 50 instances.**
+Run this before the full 50-instance suite. The 10 instances are hand-picked to cover both
+repos, different bug types, and different test suite sizes — enough to catch any integration
+issues before committing to the full run.
 
-**Droplet 1:**
+**Validation batch — why these 10:**
+
+| Instance | Repo | Bug type | FAIL tests |
+|---|---|---|---|
+| django__django-11790 | django | HTML attribute missing | 2 |
+| django__django-11951 | django | batch_size logic | 1 |
+| django__django-12193 | django | widget state bug | 1 |
+| django__django-12406 | django | form/model behaviour | 3 |
+| django__django-9296 | django | missing `__iter__` impl | 1 |
+| sphinx-doc__sphinx-10323 | sphinx | indentation rendering | 1 |
+| sphinx-doc__sphinx-7590 | sphinx | C++ literal parser | 1 |
+| sphinx-doc__sphinx-8475 | sphinx | HTTP redirect handling | 1 |
+| sphinx-doc__sphinx-9230 | sphinx | doc type rendering | 1 |
+| sphinx-doc__sphinx-9698 | sphinx | index entry generation | 1 |
+
+```bash
+VALIDATION_IDS="django__django-11790,django__django-11951,django__django-12193,django__django-12406,django__django-9296,sphinx-doc__sphinx-10323,sphinx-doc__sphinx-7590,sphinx-doc__sphinx-8475,sphinx-doc__sphinx-9230,sphinx-doc__sphinx-9698"
+```
+
+**Droplet 1 — baseline validation:**
 ```bash
 [HOST - DROPLET 1]
 source venv/bin/activate && cd Repo-Insight
-export ANTHROPIC_BASE_URL=http://localhost:4000
+export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+VALIDATION_IDS="django__django-11790,django__django-11951,django__django-12193,django__django-12406,django__django-9296,sphinx-doc__sphinx-10323,sphinx-doc__sphinx-7590,sphinx-doc__sphinx-8475,sphinx-doc__sphinx-9230,sphinx-doc__sphinx-9698"
 
 python run_swebench_ccli.py \
   --no-graph \
-  --limit 3 \
-  --workers 3 \
-  --output-dir ./results/smoke_baseline
+  --instances "$VALIDATION_IDS" \
+  --workers 5 \
+  --output-dir ./results/validation_baseline
 
 # Quick result check
 python3 -c "
 import json
-for r in json.load(open('results/smoke_baseline/results.json')):
-    print(f\"{r['instance_id'][:40]}: {r['status']} | {r['total_tokens']} tok | {r['duration_s']}s\")
+from collections import Counter
+rs = json.load(open('results/validation_baseline/results.json'))
+print('Status breakdown:', Counter(r['status'] for r in rs))
+print()
+for r in rs:
+    print(f\"{r['instance_id']:<45} {r['status']:<12} {r['total_tokens']:>7} tok  {r['duration_s']:>6.1f}s\")
 "
 ```
 
-**Droplet 2:**
+**Droplet 2 — graph validation:**
 ```bash
 [HOST - DROPLET 2]
 source venv/bin/activate && cd Repo-Insight
-export ANTHROPIC_BASE_URL=http://localhost:4000
+export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
 export SKIP_JEDI=true
+VALIDATION_IDS="django__django-11790,django__django-11951,django__django-12193,django__django-12406,django__django-9296,sphinx-doc__sphinx-10323,sphinx-doc__sphinx-7590,sphinx-doc__sphinx-8475,sphinx-doc__sphinx-9230,sphinx-doc__sphinx-9698"
 
 python run_swebench_ccli.py \
-  --limit 3 \
-  --workers 3 \
-  --output-dir ./results/smoke_graph
+  --instances "$VALIDATION_IDS" \
+  --workers 5 \
+  --output-dir ./results/validation_graph
 
-# Check that MCP tools were actually called
+# Check status + crucially: were MCP tools called?
 python3 -c "
 import json
-for r in json.load(open('results/smoke_graph/results.json')):
-    print(f\"{r['instance_id'][:40]}: {r['status']} | tools={r['tools_called']}\")
+from collections import Counter
+rs = json.load(open('results/validation_graph/results.json'))
+print('Status breakdown:', Counter(r['status'] for r in rs))
+print()
+for r in rs:
+    tools = r['tools_called'][:3]  # show first 3 tools called
+    print(f\"{r['instance_id']:<45} {r['status']:<12} tools={tools}\")
 "
 ```
 
-**Green light criteria before full run:**
-- `status` = `patched` or `empty_diff` (never `error`)
-- Droplet 2: at least one instance has non-empty `tools_called`
-- Duration per instance: 3-20 minutes (72B is slower than 32B per call but higher quality)
-- Logs created: `ls results/smoke_*/agent_logs/`
+**Green light — proceed to full run if ALL of these are true:**
+
+| Check | Expected | How to verify |
+|---|---|---|
+| No `error` statuses | All `patched` or `empty_diff` | Status breakdown above |
+| Droplet 2: tools called | ≥ 5/10 instances have non-empty `tools_called` | tools= column above |
+| Duration reasonable | 3-15 min/instance | `duration_s` column |
+| Both repos covered | django and sphinx instances both ran | check instance IDs in output |
+| Logs created | 10 log files per droplet | `ls results/validation_*/agent_logs/ \| wc -l` |
+
+**Quick early comparison (optional but useful):**
+```bash
+# Run on local machine after pulling both validation results
+python compare_results.py \
+  --baseline results/validation_baseline/results.json \
+  --graph    results/validation_graph/results.json \
+  --output   results/validation_comparison.md
+cat results/validation_comparison.md
+# Even with 10 instances this shows whether the graph is helping
+```
 
 **If something fails:**
 ```bash
-# 1. Is the LLM responding?
-curl -s http://localhost:4000/v1/models
+# 1. Is vLLM responding?
+curl -s http://localhost:8000/v1/models
 
 # 2. Is FalkorDB up? (Droplet 2)
 redis-cli -h localhost -p 6379 ping
 
-# 3. Read the per-instance log
-cat results/smoke_graph/agent_logs/<instance_id>.log | tail -100
+# 3. Read the specific instance log
+cat results/validation_graph/agent_logs/<instance_id>.log | tail -100
 
-# 4. Check LiteLLM log for errors
-tail -50 litellm.log
+# 4. Check if the model alias worked
+curl -s http://localhost:8000/v1/models | grep claude
+# Must show "claude-3-5-sonnet-20241022"
 ```
 
 ---
@@ -321,12 +373,15 @@ tmux new -s run
 # Inside tmux: Ctrl+B D to detach, tmux attach -t run to re-attach
 ```
 
-**Droplet 1 — baseline** (~45 minutes with 72B + 8 workers):
+**Droplet 1 — baseline** (~30 min with Qwen3-Coder-30B-A3B + 8 workers):
 ```bash
 [HOST - DROPLET 1, in tmux]
 source venv/bin/activate && cd Repo-Insight
-export ANTHROPIC_BASE_URL=http://localhost:4000
+export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
+
+# Seed output dir with validation results — skip-existing won't re-run them
+cp -r results/validation_baseline/. results/ccli_baseline/ 2>/dev/null || true
 
 python run_swebench_ccli.py \
   --no-graph \
@@ -335,13 +390,16 @@ python run_swebench_ccli.py \
   --skip-existing
 ```
 
-**Droplet 2 — graph-enhanced** (~2 hours with 72B + 8 workers):
+**Droplet 2 — graph-enhanced** (~1.5 hours with Qwen3-Coder-30B-A3B + 8 workers):
 ```bash
 [HOST - DROPLET 2, in tmux]
 source venv/bin/activate && cd Repo-Insight
-export ANTHROPIC_BASE_URL=http://localhost:4000
+export ANTHROPIC_BASE_URL=http://localhost:8000
 export ANTHROPIC_API_KEY=fake
 export SKIP_JEDI=true
+
+# Seed output dir with validation results — skip-existing won't re-run them
+cp -r results/validation_graph/. results/ccli_graph/ 2>/dev/null || true
 
 python run_swebench_ccli.py \
   --workers 8 \
@@ -461,12 +519,12 @@ python compare_results.py \
 
 | Phase | Droplet 1 | Droplet 2 | Wall clock |
 |---|---|---|---|
-| vLLM load 72B weights | 3-5 min | 3-5 min | 0:00 |
+| vLLM load 30B-A3B weights | 2-3 min | 2-3 min | 0:00 |
 | Host setup + install | 10 min | 10 min | 0:10 |
 | LiteLLM + chain test | 5 min | 5 min | 0:15 |
 | FalkorDB + ingest test | — | 5 min | 0:20 |
 | Smoke test (3 instances) | 15-30 min | 20-40 min | 0:50 |
-| **Full 50 instances** | **~45 min** | **~2 hours** | 2:45 |
+| **Full 50 instances** | **~30 min** | **~1.5 hours** | 2:00 |
 | Comparison report | 2 min | — | 2:47 |
 | Bob demo (5 instances) | — | ~1 hour | ~4:00 |
 | **Total** | | | **~4 hours** |
