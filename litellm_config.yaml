@@ -1,0 +1,30 @@
+# LiteLLM proxy config — bridges Claude Code (Anthropic API format) → vLLM (OpenAI format)
+#
+# Usage:
+#   pip install litellm
+#   litellm --config litellm_config.yaml --port 4000
+#
+# Then run Claude Code with:
+#   ANTHROPIC_BASE_URL=http://localhost:4000 ANTHROPIC_API_KEY=fake claude ...
+#
+# Adjust api_base to match your vLLM server address.
+# Adjust model to match whatever is loaded in vLLM.
+
+model_list:
+  - model_name: claude-3-5-sonnet-20241022   # Claude Code hardcodes this model name
+    litellm_params:
+      model: openai/Qwen/Qwen3-32B           # change to your vLLM model
+      api_base: http://localhost:8000/v1      # change to your vLLM address
+      api_key: EMPTY
+      max_tokens: 8192
+
+  - model_name: claude-opus-4-5              # fallback if Claude Code tries opus
+    litellm_params:
+      model: openai/Qwen/Qwen3-32B
+      api_base: http://localhost:8000/v1
+      api_key: EMPTY
+      max_tokens: 8192
+
+general_settings:
+  drop_params: true          # ignore Anthropic-specific params vLLM doesn't understand
+  max_parallel_requests: 8

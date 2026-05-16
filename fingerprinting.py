@@ -170,8 +170,10 @@ def build_code_skeleton(source_code: str) -> str:
 
 def inject_behavior_label(fingerprint: str, label: str) -> str:
     """Insert or replace the behavior label line (// ...) in a fingerprint string."""
+    clean_label = label.strip().lstrip("/").strip()[:120]
+    if not fingerprint or not fingerprint.strip():
+        return f"// {clean_label}"
     lines = fingerprint.split("\n")
-    sig_line = lines[0] if lines else ""
+    sig_line = lines[0]
     rest = [l for l in lines[1:] if not l.startswith("//")]
-    clean_label = label.strip().lstrip("/").strip()
-    return "\n".join([sig_line, f"// {clean_label[:120]}"] + rest)
+    return "\n".join([sig_line, f"// {clean_label}"] + rest)

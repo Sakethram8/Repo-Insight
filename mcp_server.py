@@ -327,6 +327,25 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "get_architecture_diagram",
+        "description": (
+            "Return a Mermaid flowchart diagram of the repository's module-level architecture — "
+            "which modules call, import, or inherit from which. "
+            "Bob can embed this directly in responses or docs. "
+            "Shows the top N strongest module relationships by edge weight."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "top_n": {
+                    "type": "integer",
+                    "description": "Max number of edges to show (default: 20). Use fewer for simpler diagrams.",
+                }
+            },
+            "required": [],
+        },
+    },
+    {
         "name": "get_function_fingerprints",
         "description": (
             "Return the compact structured fingerprint for each requested function FQN. "
@@ -446,8 +465,11 @@ def _ingest_repository(args: dict, graph) -> dict:
 
 
 def _get_graph_summary(args: dict, graph) -> dict:
-    from graph_health import get_graph_health
-    return get_graph_health(graph)
+    try:
+        from graph_health import get_graph_health
+        return get_graph_health(graph)
+    except Exception as e:
+        return {"error": str(e)}
 
 
 def _run_failing_tests_and_localize(args: dict, graph) -> dict:
@@ -484,7 +506,9 @@ def _run_failing_tests_and_localize(args: dict, graph) -> dict:
             rel_path = file_path
 
         # Skip test files — the bug is in the implementation, not the test
-        if any(p in rel_path for p in ("/test", "test_", "_test.py")):
+        rel_parts = Path(rel_path).parts
+        if any(p in ("tests", "test", "testing") or p.startswith("test_") or p.endswith("_test.py")
+               for p in rel_parts):
             continue
 
         key = (rel_path, func_name)
@@ -676,22 +700,72 @@ def _get_coverage_guided_blast_radius(args: dict, graph) -> dict:
     }
 
 
+def _get_architecture_diagram(args: dict, graph) -> dict:
+    from tools import get_macro_architecture
+    top_n = int(args.get("top_n", 20))
+    try:
+        arch = get_macro_architecture(graph)
+        edges = arch.get("modules", [])
+        # Sort by weight, take top N
+        edges = sorted(edges, key=lambda e: e["weight"], reverse=True)[:top_n]
+        if not edges:
+            return {"mermaid": "graph TD\n  %% No module edges found — run ingest_repository first", "edges": 0}
+
+        # Build Mermaid flowchart
+        lines = ["graph TD"]
+        seen_nodes: set[str] = set()
+
+        def _node_id(name: str) -> str:
+            return re.sub(r"[^a-zA-Z0-9]", "_", name)
+
+        for e in edges:
+            src, tgt = e["source"], e["target"]
+            sid, tid = _node_id(src), _node_id(tgt)
+            types = e.get("types", [])
+            weight = e["weight"]
+
+            # Add node labels on first appearance
+            if sid not in seen_nodes:
+                lines.append(f'    {sid}["{src}"]')
+                seen_nodes.add(sid)
+            if tid not in seen_nodes:
+                lines.append(f'    {tid}["{tgt}"]')
+                seen_nodes.add(tid)
+
+            # Edge label: type + weight
+            label = "/".join(sorted(types)) + f" ×{weight}"
+            arrow = "-->" if "CALLS" in types else "-.->"
+            lines.append(f"    {sid} {arrow}|{label}| {tid}")
+
+        mermaid = "\n".join(lines)
+        return {
+            "mermaid": mermaid,
+            "edges": len(edges),
+            "note": "Paste into any Mermaid renderer or GitHub markdown to visualize.",
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 def _get_function_fingerprints(args: dict, graph) -> dict:
     fqns = list(args.get("fqns", []))
     if not fqns:
         return {"error": "fqns list is required"}
 
-    result: dict[str, str | None] = {}
-    for fqn in fqns:
-        try:
-            rows = graph.query(
-                "MATCH (f:Function {fqn: $fqn}) RETURN f.fingerprint",
-                {"fqn": fqn},
-            ).result_set
-            result[fqn] = rows[0][0] if rows and rows[0][0] else None
-        except Exception as e:
-            result[fqn] = None
-            logger.warning("fingerprint query failed for %s: %s", fqn, e)
+    # Single batch query instead of N round-trips
+    result: dict[str, str | None] = {fqn: None for fqn in fqns}
+    try:
+        rows = graph.query(
+            "UNWIND $fqns AS fqn "
+            "MATCH (f:Function {fqn: fqn}) "
+            "RETURN f.fqn, f.fingerprint",
+            {"fqns": fqns},
+        ).result_set
+        for row in rows:
+            if row[0] and row[1]:
+                result[row[0]] = row[1]
+    except Exception as e:
+        logger.warning("fingerprint batch query failed: %s", e)
 
     found = sum(1 for v in result.values() if v is not None)
     return {"fingerprints": result, "found": found, "missing": len(fqns) - found}
@@ -703,26 +777,33 @@ def _get_function_skeletons(args: dict, graph) -> dict:
     if not fqns:
         return {"error": "fqns list is required"}
 
+    # Batch-fetch all metadata in one query
+    meta_map: dict[str, tuple] = {}
+    try:
+        rows = graph.query(
+            "UNWIND $fqns AS fqn "
+            "MATCH (f:Function {fqn: fqn}) "
+            "RETURN f.fqn, f.skeleton, f.file_path, f.start_line, f.end_line",
+            {"fqns": fqns},
+        ).result_set
+        for row in rows:
+            meta_map[row[0]] = (row[1], row[2], row[3], row[4])  # skeleton, file_path, start, end
+    except Exception as e:
+        logger.warning("skeleton batch query failed: %s", e)
+
     result: dict[str, str | None] = {}
     for fqn in fqns:
+        if fqn not in meta_map:
+            result[fqn] = None
+            continue
         try:
-            rows = graph.query(
-                "MATCH (f:Function {fqn: $fqn}) RETURN f.skeleton, f.file_path, f.start_line, f.end_line",
-                {"fqn": fqn},
-            ).result_set
-            if not rows:
-                result[fqn] = None
-                continue
+            skeleton, file_path, start_line, end_line = meta_map[fqn]
 
-            skeleton, file_path, start_line, end_line = rows[0]
-
-            # Return cached skeleton if available
             if skeleton:
                 result[fqn] = skeleton
                 continue
 
-            # Build from source
-            if not file_path or start_line is None or end_line is None:
+            if not file_path or start_line is None or end_line is None or int(start_line) < 1:
                 result[fqn] = None
                 continue
 
@@ -731,8 +812,6 @@ def _get_function_skeletons(args: dict, graph) -> dict:
                 src = "\n".join(src_lines[int(start_line) - 1 : int(end_line)])
                 skel = build_code_skeleton(src)
                 result[fqn] = skel
-
-                # Cache in FalkorDB
                 try:
                     graph.query(
                         "MATCH (f:Function {fqn: $fqn}) SET f.skeleton = $sk",
@@ -743,9 +822,8 @@ def _get_function_skeletons(args: dict, graph) -> dict:
             except Exception as e:
                 logger.warning("skeleton build failed for %s: %s", fqn, e)
                 result[fqn] = None
-
         except Exception as e:
-            logger.warning("skeleton query failed for %s: %s", fqn, e)
+            logger.warning("skeleton processing failed for %s: %s", fqn, e)
             result[fqn] = None
 
     found = sum(1 for v in result.values() if v is not None)
@@ -811,6 +889,7 @@ _TOOL_MAP = {
                                      changed_signatures=args["changed_signatures"],
                                      graph=g,
                                  ),
+    "get_architecture_diagram":         _get_architecture_diagram,
     "get_function_fingerprints":        _get_function_fingerprints,
     "get_function_skeletons":           _get_function_skeletons,
     "store_behavior_labels":            _store_behavior_labels,

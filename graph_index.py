@@ -218,8 +218,10 @@ class GraphIndex:
         return self._format_hits(visited, predecessor, start)
 
     def _format_hits(
-        self, visited: dict[str, int], predecessor: dict[str, str] = {}, start: str = ""
+        self, visited: dict[str, int], predecessor: dict[str, str] | None = None, start: str = ""
     ) -> list[dict]:
+        if predecessor is None:
+            predecessor = {}
         with self._lock:
             meta_snap = self.fn_meta
         result = []
@@ -236,10 +238,16 @@ class GraphIndex:
                 path_parts.append(start.split(".")[-1])
             path_str = " → ".join(reversed(path_parts)) if path_parts else ""
 
+            # KGCompass-inspired exponential decay: β=0.6 per hop.
+            # 1-hop = 0.60, 2-hop = 0.36, 3-hop = 0.22, 4-hop = 0.13.
+            # Keeps distant-but-semantically-similar functions from dominating.
+            relevance = round(0.6 ** dist, 4)
+
             result.append({
                 "fqn": hit_fqn,
                 "file_path": meta.get("file_path", ""),
                 "distance": dist,
+                "relevance": relevance,
                 "path": path_str,
             })
         return result

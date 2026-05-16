@@ -145,7 +145,9 @@ def build_embedding_text(
     for undocumented functions.
     """
     if fingerprint and fingerprint.strip():
-        return fingerprint.strip()[:400]
+        text = fingerprint.strip()[:400]
+        last_nl = text.rfind("\n")
+        return text[:last_nl] if last_nl > 0 else text
     if docstring and docstring.strip():
         return f"{name}. {docstring.strip()[:300]}"
     return f"{name} in {file_path}"

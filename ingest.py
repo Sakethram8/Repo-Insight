@@ -602,7 +602,9 @@ def _write_fingerprints(
 
     fingerprint_updates: list[dict] = []
     for pf in parsed_files:
-        mod_name = module_fqn_map[pf.file_path]
+        mod_name = module_fqn_map.get(pf.file_path)
+        if not mod_name:
+            continue
         for func in pf.functions:
             fqn = f"{mod_name}.{func.qualname}" if func.qualname else f"{mod_name}.{func.name}"
             if fqn not in known_fqns:
