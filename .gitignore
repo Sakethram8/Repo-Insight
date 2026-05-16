@@ -168,8 +168,7 @@ cython_debug/
 .DS_Store
 
 # Repo-Insight specifics
-*.json
-!.Bob/mcp.json
+
 *.sqlite
 data/
 logs/

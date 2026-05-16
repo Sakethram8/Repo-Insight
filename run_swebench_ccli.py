@@ -123,10 +123,7 @@ def _validate_patch(repo_dir: Path) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def _write_mcp_config(repo_dir: Path, graph_name: str, no_graph: bool) -> None:
-    """Write .claude/mcp.json into the cloned repo directory."""
-    claude_dir = repo_dir / ".claude"
-    claude_dir.mkdir(exist_ok=True)
-
+    """Write .mcp.json into the cloned repo root (Claude Code project-scope format)."""
     if no_graph:
         config = {"mcpServers": {}}
     else:
@@ -145,7 +142,7 @@ def _write_mcp_config(repo_dir: Path, graph_name: str, no_graph: bool) -> None:
             }
         }
 
-    (claude_dir / "mcp.json").write_text(json.dumps(config, indent=2))
+    (repo_dir / ".mcp.json").write_text(json.dumps(config, indent=2))
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python3 -c \"from tools import *; print\\('Tools imported OK'\\)\")",
+      "Bash(python3 -c \"from mcp_server import create_mcp_server\")",
+      "Bash(python3 -m pytest tests/ -v)",
+      "Bash(python3 -m pytest tests/ -q)",
+      "Bash(python3 -c \"from change_engine import GraphDrivenEngine; print\\('change_engine imports OK'\\)\")",
+      "Bash(python -m pytest tests/ -x --tb=short -q)",
+      "Bash(python -m pytest tests/ --tb=short -q)",
+      "Bash(python -m pytest tests/test_change_engine.py::TestParsePlanJson::test_json_object_not_array_returns_empty tests/test_change_engine.py::TestPlanWithValidation::test_not_validated_when_files_missing tests/test_change_engine.py::TestEnsureGraphFresh::test_skips_ingestion_when_fingerprint_matches tests/test_change_engine.py::TestRetryEdits::test_retry_uses_max_tokens_8192 -v --tb=long)",
+      "Bash(python -c \"from mcp_server import TOOL_DEFINITIONS; print\\('MCP import OK,', len\\(TOOL_DEFINITIONS\\), 'tools loaded'\\)\")",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('ingest.py'\\).read\\(\\)\\); ast.parse\\(open\\('embedder.py'\\).read\\(\\)\\); print\\('Both OK'\\)\")",
+      "Bash(python -m pytest tests/test_resolver.py tests/test_parser.py -v)",
+      "Bash(python3 -c ' *)",
+      "Bash(python -m pytest tests/ -v --ignore=tests/test_tools.py)",
+      "Bash(FALKORDB_HOST=localhost GRAPH_NAME=test_ingest_smoke python3 -)",
+      "Bash(python -m pytest tests/ --ignore=tests/test_tools.py -q)",
+      "Bash(python -c \"from watcher import start_watcher, GraphWatcher; print\\('watcher import OK'\\)\")",
+      "Bash(SKIP_JEDI=true SKIP_SUMMARIES=true python -m pytest tests/ -x -q)",
+      "Bash(python -c ' *)",
+      "Bash(redis-cli -h localhost -p 6379 ping)",
+      "Bash(redis-cli -h 172.17.0.1 -p 6379 ping)",
+      "Bash(chmod +x /home/hypersonic/dev/Repo-Insight/scripts/post-commit)",
+      "WebSearch",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('run_swebench_claude.py'\\).read\\(\\)\\); print\\('syntax OK'\\)\")",
+      "WebFetch(domain:api.github.com)",
+      "Bash(curl -s \"https://raw.githubusercontent.com/likhitha281/RepoLens/main/backend/server.js\")"
+    ]
+  }
+}

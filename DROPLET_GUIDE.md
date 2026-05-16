@@ -233,6 +233,33 @@ print('PASS: fingerprints OK')
 ```
 
 ### 5d. Verify Claude Code calls our MCP tools
+
+**First: confirm the MCP config exists and is registered**
+```bash
+[HOST - DROPLET 2]
+# Claude Code reads .mcp.json at project root (NOT .claude/mcp.json)
+cat ~/Repo-Insight/.mcp.json
+# Must show "repo-insight" server entry with mcp_server.py
+
+# Check Claude Code sees it
+claude mcp list
+# Must show repo-insight in the list
+```
+
+**If `claude mcp list` shows nothing**, register it at user scope:
+```bash
+[HOST - DROPLET 2]
+claude mcp add --scope user \
+  --env FALKORDB_HOST=localhost \
+  --env FALKORDB_PORT=6379 \
+  --env GRAPH_NAME=repo_insight \
+  --env SKIP_JEDI=true \
+  repo-insight -- python3 /root/Repo-Insight/mcp_server.py
+
+claude mcp list   # confirm it appears
+```
+
+**MCP tool discovery test** (best indicator — does Claude Code actually invoke tools?)
 ```bash
 [HOST - DROPLET 2]
 export ANTHROPIC_BASE_URL=http://localhost:8000
@@ -243,13 +270,38 @@ export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-sonnet-20241022
 export CLAUDE_MODEL=claude-3-5-sonnet-20241022
 export SKIP_JEDI=true
 
-# Run this from the Repo-Insight directory
-# Claude Code auto-reads .claude/mcp.json from the working directory
-cd Repo-Insight
-claude --print -p "Use the repo-insight MCP tool get_graph_summary() and tell me how many functions are in the graph."
+# Run from the Repo-Insight directory (where .mcp.json lives)
+cd ~/Repo-Insight
 
-# Expected output includes tool call and a number > 100
-# If you see "get_graph_summary" in the output → MCP is working
+# Good test: ask a natural question — model should call get_graph_summary automatically
+claude --model claude-3-5-sonnet-20241022 --print \
+  -p "Call get_graph_summary to get statistics about this codebase and report the number of functions."
+
+# Expected: tool call log line + "functions: NNN" number > 100
+# If you see "Tool result" or "get_graph_summary" in output → MCP is working ✓
+# If you see raw <function=...> XML or "Skill" in output → tool chain broken ✗
+```
+
+**Lightweight sanity check** (bypasses model entirely — confirms MCP server starts):
+```bash
+[HOST - DROPLET 2]
+cd ~/Repo-Insight
+# Start the MCP server manually and send a tools/list request
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | \
+  GRAPH_NAME=repo_insight FALKORDB_HOST=localhost SKIP_JEDI=true \
+  python3 mcp_server.py 2>/dev/null | python3 -c "
+import sys, json
+for line in sys.stdin:
+    line = line.strip()
+    if line.startswith('{'):
+        d = json.loads(line)
+        tools = d.get('result', {}).get('tools', [])
+        print(f'MCP server returned {len(tools)} tools:')
+        for t in tools:
+            print(f'  - {t[\"name\"]}')
+        break
+"
+# Expected: 22+ tools listed (get_graph_summary, search_codebase, etc.)
 ```
 
 ---
