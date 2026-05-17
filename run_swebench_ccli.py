@@ -390,7 +390,7 @@ def _run_instance(
             logger.warning("[%s] ANTHROPIC_BASE_URL not set — Claude Code will call real Anthropic API", instance_id)
 
         proc = subprocess.run(
-            ["claude", "--print", "--dangerously-skip-permissions",
+            ["claude", "--dangerously-skip-permissions",
              "--model", CLAUDE_MODEL, "-p", prompt],
             cwd=str(repo_dir),
             capture_output=True,
