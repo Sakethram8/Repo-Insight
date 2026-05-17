@@ -283,6 +283,36 @@ def _parse_tokens(text: str) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
+# Log helper — called for every instance regardless of outcome
+# ---------------------------------------------------------------------------
+
+def _save_log(
+    instance_id: str,
+    no_graph: bool,
+    t0: float,
+    output_dir: Path,
+    result: dict,
+    stdout: str,
+    stderr: str,
+    note: str = "",
+) -> None:
+    log_dir = output_dir / "agent_logs"
+    log_dir.mkdir(exist_ok=True)
+    log_path = log_dir / f"{instance_id}.log"
+    condition = "BASELINE" if no_graph else "GRAPH"
+    header = f"=== Instance: {instance_id} | Condition: {condition} ==="
+    if note:
+        header += f" | {note}"
+    log_path.write_text(
+        f"{header}\n"
+        f"=== Duration: {round(time.monotonic() - t0, 1)}s ===\n\n"
+        f"--- STDOUT ---\n{stdout or ''}\n\n"
+        f"--- STDERR ---\n{stderr or ''}\n"
+    )
+    result["agent_output_log"] = str(log_path)
+
+
+# ---------------------------------------------------------------------------
 # Per-instance runner
 # ---------------------------------------------------------------------------
 
@@ -371,18 +401,8 @@ def _run_instance(
 
         combined_output = proc.stdout + proc.stderr
         _remove_mcp_config(repo_dir)  # clean up ~/.claude.json entry
-
-        # Save full agent output to per-instance log file
-        log_dir = output_dir / "agent_logs"
-        log_dir.mkdir(exist_ok=True)
-        log_path = log_dir / f"{instance_id}.log"
-        log_path.write_text(
-            f"=== Instance: {instance_id} | Condition: {'BASELINE' if no_graph else 'GRAPH'} ===\n"
-            f"=== Duration: {round(time.monotonic()-t0,1)}s ===\n\n"
-            f"--- STDOUT ---\n{proc.stdout}\n\n"
-            f"--- STDERR ---\n{proc.stderr}\n"
-        )
-        result["agent_output_log"] = str(log_path)
+        _save_log(instance_id, no_graph, t0, output_dir, result,
+                  proc.stdout, proc.stderr)
 
         inp_tok, out_tok = _parse_tokens(combined_output)
         tools_called = _parse_tool_calls(combined_output) if not no_graph else []
@@ -426,10 +446,14 @@ def _run_instance(
         else:
             result["status"] = "empty_diff"
 
-    except subprocess.TimeoutExpired:
+    except subprocess.TimeoutExpired as e:
         result["status"] = "timeout"
         result["error"] = f"Claude Code timed out after {AGENT_TIMEOUT}s"
         result["duration_s"] = round(time.monotonic() - t0, 1)
+        # e.stdout / e.stderr hold whatever was captured before the kill
+        partial_out = (e.stdout or "") + "\n" + (e.stderr or "")
+        _save_log(instance_id, no_graph, t0, output_dir, result,
+                  partial_out, partial_out, note="TIMED OUT — partial output")
     except FileNotFoundError:
         result["status"] = "error"
         result["error"] = "claude CLI not found — run: npm install -g @anthropic-ai/claude-code"
