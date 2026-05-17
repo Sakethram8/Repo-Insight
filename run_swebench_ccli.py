@@ -123,26 +123,64 @@ def _validate_patch(repo_dir: Path) -> tuple[bool, str]:
 # ---------------------------------------------------------------------------
 
 def _write_mcp_config(repo_dir: Path, graph_name: str, no_graph: bool) -> None:
-    """Write .mcp.json into the cloned repo root (Claude Code project-scope format)."""
-    if no_graph:
-        config = {"mcpServers": {}}
-    else:
-        config = {
-            "mcpServers": {
-                "repo-insight": {
-                    "command": str(PYTHON_BIN),
-                    "args": [str(MCP_SERVER_PATH)],
-                    "env": {
-                        "FALKORDB_HOST": FALKORDB_HOST,
-                        "FALKORDB_PORT": FALKORDB_PORT,
-                        "GRAPH_NAME": graph_name,
-                        "SKIP_JEDI": os.environ.get("SKIP_JEDI", "false"),
-                    },
-                }
-            }
-        }
+    """
+    Write MCP config to ~/.claude.json under the repo path (local scope).
 
-    (repo_dir / ".mcp.json").write_text(json.dumps(config, indent=2))
+    Project-scoped .mcp.json requires interactive approval that blocks --print mode.
+    Local-scoped entries in ~/.claude.json are pre-trusted (as if added via `claude mcp add`).
+    GRAPH_NAME is embedded here so parallel workers each get their own isolated graph.
+    Uses a file lock to prevent concurrent writers from corrupting ~/.claude.json.
+    """
+    import fcntl
+    claude_json = Path.home() / ".claude.json"
+    lock_path   = Path("/tmp/.claude_json_bench.lock")
+
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            data = json.loads(claude_json.read_text()) if claude_json.exists() else {}
+            data.setdefault("projects", {})
+
+            project_key = str(repo_dir)
+            if no_graph:
+                data["projects"].pop(project_key, None)
+            else:
+                data["projects"][project_key] = {
+                    "mcpServers": {
+                        "repo-insight": {
+                            "command": str(PYTHON_BIN),
+                            "args": [str(MCP_SERVER_PATH)],
+                            "env": {
+                                "FALKORDB_HOST": FALKORDB_HOST,
+                                "FALKORDB_PORT": FALKORDB_PORT,
+                                "GRAPH_NAME": graph_name,
+                                "SKIP_JEDI": os.environ.get("SKIP_JEDI", "false"),
+                            },
+                        }
+                    }
+                }
+
+            claude_json.write_text(json.dumps(data, indent=2))
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
+
+
+def _remove_mcp_config(repo_dir: Path) -> None:
+    """Clean up the ~/.claude.json entry after the instance finishes."""
+    import fcntl
+    claude_json = Path.home() / ".claude.json"
+    lock_path   = Path("/tmp/.claude_json_bench.lock")
+
+    with open(lock_path, "w") as lf:
+        fcntl.flock(lf, fcntl.LOCK_EX)
+        try:
+            if not claude_json.exists():
+                return
+            data = json.loads(claude_json.read_text())
+            data.get("projects", {}).pop(str(repo_dir), None)
+            claude_json.write_text(json.dumps(data, indent=2))
+        finally:
+            fcntl.flock(lf, fcntl.LOCK_UN)
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +327,7 @@ def _run_instance(
 
     t0 = time.monotonic()
     tmp_root: Optional[Path] = None
+    repo_dir: Optional[Path] = None
     try:
         tmp_root = Path(tempfile.mkdtemp(prefix=f"swe_{instance_id}_"))
         repo_dir = tmp_root / "repo"
@@ -330,6 +369,7 @@ def _run_instance(
         )
 
         combined_output = proc.stdout + proc.stderr
+        _remove_mcp_config(repo_dir)  # clean up ~/.claude.json entry
 
         # Save full agent output to per-instance log file
         log_dir = output_dir / "agent_logs"
@@ -356,6 +396,15 @@ def _run_instance(
         )
 
         result["duration_s"] = round(time.monotonic() - t0, 1)
+
+        # Detect API errors that land in stdout (e.g. context overflow, auth failures)
+        if "API Error:" in proc.stdout or "API Error:" in proc.stderr:
+            result["status"] = "error"
+            for line in (proc.stdout + proc.stderr).splitlines():
+                if "API Error:" in line:
+                    result["error"] = line.strip()[:500]
+                    break
+            return result
 
         if proc.returncode != 0 and not proc.stdout.strip():
             result["status"] = "error"
@@ -390,6 +439,8 @@ def _run_instance(
         result["duration_s"] = round(time.monotonic() - t0, 1)
         logger.error("[%s] Failed: %s", instance_id, e, exc_info=True)
     finally:
+        if repo_dir:
+            _remove_mcp_config(repo_dir)  # ensure cleanup even on error/timeout
         if tmp_root and tmp_root.exists():
             shutil.rmtree(tmp_root, ignore_errors=True)
 

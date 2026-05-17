@@ -75,7 +75,7 @@ HOST                              HOST
   --served-model-name claude-3-5-sonnet-20241022 \
   --port 8000 \
   --host 0.0.0.0 \
-  --max-model-len 65536 \
+  --max-model-len 131072 \
   --gpu-memory-utilization 0.90 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder
@@ -85,6 +85,8 @@ HOST                              HOST
 > - `--served-model-name` — aliases Qwen as `claude-3-5-sonnet-20241022` so Claude Code finds it
 > - `--enable-auto-tool-choice` — required for Claude Code's `tool_choice: "auto"` requests
 > - `--tool-call-parser qwen3_coder` — correct parser for Qwen3-Coder's XML tool call format
+> - `--max-model-len 131072` — **128K is required**: Claude Code's system prompt + 22 MCP tool
+>   definitions already fills ~57K tokens, leaving no room in a 64K window
 > - No `--dtype`, no `--trust-remote-code`, no `--tensor-parallel-size` needed
 > - No `--enable-reasoning` — Qwen3-**Coder** has no thinking mode (unlike Qwen3 base)
 > - vLLM v0.4+ serves `/v1/messages` (Anthropic format) natively — no LiteLLM needed
@@ -235,21 +237,14 @@ print('PASS: fingerprints OK')
 
 ### 5d. Verify Claude Code calls our MCP tools
 
-**First: confirm the MCP config exists and is registered**
+**MCP setup for Droplet 2:**
 ```bash
 [HOST - DROPLET 2]
-# Claude Code reads .mcp.json at project root (NOT .claude/mcp.json)
-cat ~/Repo-Insight/.mcp.json
-# Must show "repo-insight" server entry with mcp_server.py
+# The benchmark writes config to ~/.claude.json per-instance (local scope, no approval needed).
+# For manual tests, you need the user-scoped registration:
+claude mcp list   # check if repo-insight is already there
 
-# Check Claude Code sees it
-claude mcp list
-# Must show repo-insight in the list
-```
-
-**If `claude mcp list` shows nothing**, register it at user scope:
-```bash
-[HOST - DROPLET 2]
+# If not, add it (one-time):
 claude mcp add --scope user \
   --env FALKORDB_HOST=localhost \
   --env FALKORDB_PORT=6379 \
