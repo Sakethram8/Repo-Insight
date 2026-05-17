@@ -68,9 +68,9 @@ GRAPH_NAME    = os.environ.get("GRAPH_NAME", "repo_insight")
 # Claude Code defaults to claude-opus-4-7; override with this env var.
 CLAUDE_MODEL  = os.environ.get("CLAUDE_MODEL", "claude-3-5-sonnet-20241022")
 
-CLONE_TIMEOUT   = 120    # seconds for git clone
-AGENT_TIMEOUT   = 1200   # 20 min cap per instance for Claude Code
-INSTANCE_TIMEOUT = 1500  # 25 min total per instance
+CLONE_TIMEOUT    = 120   # seconds for git clone
+AGENT_TIMEOUT    = 1800  # 30 min — django/sphinx test suites take 2-5 min each run
+INSTANCE_TIMEOUT = 2100  # 35 min total
 
 _REPO_URL_TEMPLATE = "https://github.com/{repo}.git"
 
@@ -192,29 +192,29 @@ def _build_prompt(instance: dict, repo_path: Path, graph_name: str, no_graph: bo
     fail_list = json.loads(instance.get("FAIL_TO_PASS", "[]"))
     ftp_str   = "\n".join(f"  - {t}" for t in fail_list[:10])
 
-    base = (
+    if not no_graph:
+        # MCP instruction comes FIRST so the model sees it before the bug description.
+        # Proven pattern: "Call <tool>" at the top forces the first action.
+        return (
+            f"MANDATORY FIRST STEP: Call ingest_repository with path '{repo_path}' RIGHT NOW. "
+            f"Do not call any other tool. Do not read any file. Call ingest_repository first.\n\n"
+            f"After ingest_repository completes, call run_failing_tests_and_localize to find the broken function.\n"
+            f"After localization, call get_source_code for that function only.\n"
+            f"Then fix the bug with the minimum change. Run the failing tests to verify.\n\n"
+            f"Bug to fix:\n{problem}\n\n"
+            f"Tests that MUST pass:\n{ftp_str}\n"
+        )
+
+    return (
         f"Fix the bug described below. Repository: {repo_path}\n\n"
         f"Problem:\n{problem}\n\n"
         f"Tests that MUST pass after your fix:\n{ftp_str}\n\n"
-        "STRICT RULES — follow exactly:\n"
-        "1. Run the failing test first to read the traceback. It tells you exactly which file and line is broken.\n"
-        "2. Read ONLY the files the traceback points to (1-3 files max).\n"
+        "Rules:\n"
+        "1. Run the failing test first — the traceback tells you exactly which file and line.\n"
+        "2. Read only the files the traceback points to (1-3 files max).\n"
         "3. Make the smallest possible edit to fix the root cause.\n"
-        "4. Run the failing tests again to confirm they pass.\n"
-        "5. Stop. Do not read more files, do not refactor, do not touch test files.\n"
-        "\nSpeed matters. Do not explore the codebase broadly — go straight to the error.\n"
+        "4. Run the failing tests to confirm they pass. Stop.\n"
     )
-
-    if not no_graph:
-        base += (
-            "\nYou have repo-insight MCP tools available. Use them BEFORE reading files:\n"
-            f"  ingest_repository('{repo_path}')  — call this first, always\n"
-            "  run_failing_tests_and_localize    — pinpoints the broken function from the stack trace\n"
-            "  get_source_code                   — read just the broken function, not the whole file\n"
-            "These tools save 80% of the file reading. Use them or you will time out.\n"
-        )
-
-    return base
 
 
 # All 23 Repo-Insight tool names — used to detect which tools Claude actually called
@@ -283,36 +283,6 @@ def _parse_tokens(text: str) -> tuple[int, int]:
 
 
 # ---------------------------------------------------------------------------
-# Log helper — called for every instance regardless of outcome
-# ---------------------------------------------------------------------------
-
-def _save_log(
-    instance_id: str,
-    no_graph: bool,
-    t0: float,
-    output_dir: Path,
-    result: dict,
-    stdout: str,
-    stderr: str,
-    note: str = "",
-) -> None:
-    log_dir = output_dir / "agent_logs"
-    log_dir.mkdir(exist_ok=True)
-    log_path = log_dir / f"{instance_id}.log"
-    condition = "BASELINE" if no_graph else "GRAPH"
-    header = f"=== Instance: {instance_id} | Condition: {condition} ==="
-    if note:
-        header += f" | {note}"
-    log_path.write_text(
-        f"{header}\n"
-        f"=== Duration: {round(time.monotonic() - t0, 1)}s ===\n\n"
-        f"--- STDOUT ---\n{stdout or ''}\n\n"
-        f"--- STDERR ---\n{stderr or ''}\n"
-    )
-    result["agent_output_log"] = str(log_path)
-
-
-# ---------------------------------------------------------------------------
 # Per-instance runner
 # ---------------------------------------------------------------------------
 
@@ -359,6 +329,7 @@ def _run_instance(
     t0 = time.monotonic()
     tmp_root: Optional[Path] = None
     repo_dir: Optional[Path] = None
+    log_path: Optional[Path] = None
     try:
         tmp_root = Path(tempfile.mkdtemp(prefix=f"swe_{instance_id}_"))
         repo_dir = tmp_root / "repo"
@@ -389,20 +360,31 @@ def _run_instance(
         if "ANTHROPIC_BASE_URL" not in env:
             logger.warning("[%s] ANTHROPIC_BASE_URL not set — Claude Code will call real Anthropic API", instance_id)
 
-        proc = subprocess.run(
-            ["claude", "--dangerously-skip-permissions",
-             "--model", CLAUDE_MODEL, "-p", prompt],
-            cwd=str(repo_dir),
-            capture_output=True,
-            text=True,
-            timeout=AGENT_TIMEOUT,
-            env=env,
-        )
+        # Write output directly to log file so it survives timeout kills.
+        # capture_output=True buffers in memory and loses everything on SIGKILL.
+        log_dir = output_dir / "agent_logs"
+        log_dir.mkdir(exist_ok=True)
+        log_path = log_dir / f"{instance_id}.log"
+        condition = "BASELINE" if no_graph else "GRAPH"
+        with open(log_path, "w") as log_file:
+            log_file.write(
+                f"=== Instance: {instance_id} | Condition: {condition} ===\n"
+                f"=== Started: {time.strftime('%H:%M:%S')} ===\n\n"
+            )
+            log_file.flush()
+            proc = subprocess.run(
+                ["claude", "--print", "--dangerously-skip-permissions",
+                 "--model", CLAUDE_MODEL, "-p", prompt],
+                cwd=str(repo_dir),
+                stdout=log_file,
+                stderr=log_file,
+                timeout=AGENT_TIMEOUT,
+                env=env,
+            )
 
-        combined_output = proc.stdout + proc.stderr
-        _remove_mcp_config(repo_dir)  # clean up ~/.claude.json entry
-        _save_log(instance_id, no_graph, t0, output_dir, result,
-                  proc.stdout, proc.stderr)
+        result["agent_output_log"] = str(log_path)
+        combined_output = log_path.read_text()
+        _remove_mcp_config(repo_dir)
 
         inp_tok, out_tok = _parse_tokens(combined_output)
         tools_called = _parse_tool_calls(combined_output) if not no_graph else []
@@ -418,18 +400,18 @@ def _run_instance(
 
         result["duration_s"] = round(time.monotonic() - t0, 1)
 
-        # Detect API errors that land in stdout (e.g. context overflow, auth failures)
-        if "API Error:" in proc.stdout or "API Error:" in proc.stderr:
+        # Detect API errors written to the log file
+        if "API Error:" in combined_output:
             result["status"] = "error"
-            for line in (proc.stdout + proc.stderr).splitlines():
+            for line in combined_output.splitlines():
                 if "API Error:" in line:
                     result["error"] = line.strip()[:500]
                     break
             return result
 
-        if proc.returncode != 0 and not proc.stdout.strip():
+        if proc.returncode != 0 and len(combined_output.strip()) < 50:
             result["status"] = "error"
-            result["error"] = (proc.stderr or "claude exited non-zero")[:500]
+            result["error"] = combined_output.strip()[:500] or "claude exited non-zero"
             return result
 
         patch = _capture_diff(repo_dir)
@@ -446,14 +428,15 @@ def _run_instance(
         else:
             result["status"] = "empty_diff"
 
-    except subprocess.TimeoutExpired as e:
+    except subprocess.TimeoutExpired:
         result["status"] = "timeout"
         result["error"] = f"Claude Code timed out after {AGENT_TIMEOUT}s"
         result["duration_s"] = round(time.monotonic() - t0, 1)
-        # e.stdout / e.stderr hold whatever was captured before the kill
-        partial_out = (e.stdout or "") + "\n" + (e.stderr or "")
-        _save_log(instance_id, no_graph, t0, output_dir, result,
-                  partial_out, partial_out, note="TIMED OUT — partial output")
+        # Log file already has whatever claude wrote before the kill (file-based output)
+        if log_path and log_path.exists():
+            result["agent_output_log"] = str(log_path)
+            with open(log_path, "a") as f:
+                f.write(f"\n\n=== TIMED OUT after {AGENT_TIMEOUT}s ===\n")
     except FileNotFoundError:
         result["status"] = "error"
         result["error"] = "claude CLI not found — run: npm install -g @anthropic-ai/claude-code"
