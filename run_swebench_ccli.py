@@ -193,24 +193,25 @@ def _build_prompt(instance: dict, repo_path: Path, graph_name: str, no_graph: bo
     ftp_str   = "\n".join(f"  - {t}" for t in fail_list[:10])
 
     base = (
-        f"Fix the bug described below in the repository at {repo_path}.\n\n"
-        f"Problem statement:\n{problem}\n\n"
-        f"Failing tests that MUST pass after your fix:\n{ftp_str}\n\n"
-        "Rules:\n"
-        "- Make the minimum change required. Do not refactor unrelated code.\n"
-        "- Do not edit test files.\n"
-        "- Run the failing tests to verify your fix before finishing.\n"
+        f"Fix the bug described below. Repository: {repo_path}\n\n"
+        f"Problem:\n{problem}\n\n"
+        f"Tests that MUST pass after your fix:\n{ftp_str}\n\n"
+        "STRICT RULES — follow exactly:\n"
+        "1. Run the failing test first to read the traceback. It tells you exactly which file and line is broken.\n"
+        "2. Read ONLY the files the traceback points to (1-3 files max).\n"
+        "3. Make the smallest possible edit to fix the root cause.\n"
+        "4. Run the failing tests again to confirm they pass.\n"
+        "5. Stop. Do not read more files, do not refactor, do not touch test files.\n"
+        "\nSpeed matters. Do not explore the codebase broadly — go straight to the error.\n"
     )
 
     if not no_graph:
         base += (
-            "\nYou have access to the repo-insight MCP server with 22 code graph tools.\n"
-            "Recommended workflow:\n"
-            f"1. ingest_repository('{repo_path}')  — build the code graph first\n"
-            "2. run_failing_tests_and_localize — find exact failing function from stack trace\n"
-            "3. get_function_fingerprints — understand affected functions in ~30 tokens each\n"
-            "4. get_source_code — read full source of 1-3 key functions\n"
-            "5. Fix the bug, then run tests to verify\n"
+            "\nYou have repo-insight MCP tools available. Use them BEFORE reading files:\n"
+            f"  ingest_repository('{repo_path}')  — call this first, always\n"
+            "  run_failing_tests_and_localize    — pinpoints the broken function from the stack trace\n"
+            "  get_source_code                   — read just the broken function, not the whole file\n"
+            "These tools save 80% of the file reading. Use them or you will time out.\n"
         )
 
     return base

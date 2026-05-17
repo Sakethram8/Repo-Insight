@@ -75,7 +75,7 @@ HOST                              HOST
   --served-model-name claude-3-5-sonnet-20241022 \
   --port 8000 \
   --host 0.0.0.0 \
-  --max-model-len 131072 \
+  --max-model-len 98304 \
   --gpu-memory-utilization 0.90 \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder
@@ -85,8 +85,9 @@ HOST                              HOST
 > - `--served-model-name` — aliases Qwen as `claude-3-5-sonnet-20241022` so Claude Code finds it
 > - `--enable-auto-tool-choice` — required for Claude Code's `tool_choice: "auto"` requests
 > - `--tool-call-parser qwen3_coder` — correct parser for Qwen3-Coder's XML tool call format
-> - `--max-model-len 131072` — **128K is required**: Claude Code's system prompt + 22 MCP tool
->   definitions already fills ~57K tokens, leaving no room in a 64K window
+> - `--max-model-len 98304` — **96K sweet spot**: 64K was too small (57K system prompt left no
+>   room); 128K was too large (model spent 20 min exploring before acting); 96K leaves ~31K
+>   tokens of conversation — enough for 5-8 tool calls and a fix, not enough to wander
 > - No `--dtype`, no `--trust-remote-code`, no `--tensor-parallel-size` needed
 > - No `--enable-reasoning` — Qwen3-**Coder** has no thinking mode (unlike Qwen3 base)
 > - vLLM v0.4+ serves `/v1/messages` (Anthropic format) natively — no LiteLLM needed
