@@ -1,12 +1,13 @@
 {
   "mcpServers": {
     "repo-insight": {
-      "command": "python",
-      "args": ["mcp_server.py"],
+      "command": "/home/hypersonic/dev/Repo-Insight/venv/bin/python3",
+      "args": ["/home/hypersonic/dev/Repo-Insight/mcp_server.py"],
       "env": {
         "FALKORDB_HOST": "localhost",
         "FALKORDB_PORT": "6379",
-        "GRAPH_NAME": "repo_insight"
+        "GRAPH_NAME": "repo_insight",
+        "SKIP_JEDI": "true"
       }
     }
   }

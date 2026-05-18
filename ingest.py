@@ -761,6 +761,66 @@ def run_ingestion(directory_path: str, *, on_progress=None, graph_name: str | No
 
 
 # ---------------------------------------------------------------------------
+# Multi-repository support (TechEx Feature 3)
+# ---------------------------------------------------------------------------
+
+def ingest_repository(
+    directory_path: str,
+    repo_name: Optional[str] = None,
+    *,
+    on_progress=None,
+    graph_name: str | None = None
+) -> dict:
+    """
+    Ingest a repository with multi-repo support.
+    
+    This is a wrapper around run_ingestion() that adds repo_name to all nodes
+    and enables cross-repository graph analysis.
+    
+    Args:
+        directory_path: Path to the repository root
+        repo_name: Name of the repository (e.g., "django", "react-frontend")
+                  If None, uses the directory name
+        on_progress: Optional progress callback
+        graph_name: Optional graph name (for parallel SWE-bench workers)
+    
+    Returns:
+        Dict with ingestion statistics including repo_name
+    
+    Example:
+        # Ingest Django backend
+        stats1 = ingest_repository("./django", repo_name="django")
+        
+        # Ingest React frontend
+        stats2 = ingest_repository("./react-frontend", repo_name="react-frontend")
+        
+        # Link repositories
+        from multi_repo import link_repositories
+        link_repositories(graph, ["django", "react-frontend"])
+    """
+    # Run standard ingestion
+    stats = run_ingestion(directory_path, on_progress=on_progress, graph_name=graph_name)
+    
+    # Add repo_name to all nodes
+    if repo_name is None:
+        repo_name = Path(directory_path).name
+    
+    try:
+        from multi_repo import add_repo_name_to_nodes
+        graph = get_connection(graph_name)
+        updated = add_repo_name_to_nodes(graph, repo_name)
+        stats["repo_name"] = repo_name
+        stats["nodes_tagged"] = updated
+        logger.info(f"Tagged {updated} nodes with repo_name='{repo_name}'")
+    except ImportError:
+        logger.warning("multi_repo module not available, skipping repo_name tagging")
+    except Exception as e:
+        logger.warning(f"Failed to add repo_name: {e}")
+    
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # Jedi-based call resolution (Layer 3 precision)
 # ---------------------------------------------------------------------------
 

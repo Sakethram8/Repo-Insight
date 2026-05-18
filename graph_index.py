@@ -76,8 +76,9 @@ class GraphIndex:
         new_fingerprints: dict[str, str] = {}
 
         try:
+            # Load both CALLS and CROSS_REPO_CALLS edges for multi-repo support
             for row in graph.query(
-                "MATCH (a:Function)-[:CALLS]->(b:Function) RETURN a.fqn, b.fqn"
+                "MATCH (a:Function)-[:CALLS|CROSS_REPO_CALLS]->(b:Function) RETURN a.fqn, b.fqn"
             ).result_set:
                 a, b = row[0], row[1]
                 new_callees[a].add(b)

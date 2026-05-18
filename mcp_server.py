@@ -450,15 +450,32 @@ TOOL_DEFINITIONS = [
 def _ingest_repository(args: dict, graph) -> dict:
     from ingest import run_ingestion
     repo_path = args.get("repo_path", ".")
+    streamlit_port = os.environ.get("STREAMLIT_PORT", "8501")
+    streamlit_url  = f"http://localhost:{streamlit_port}"
     try:
         report = run_ingestion(str(Path(repo_path).resolve()))
+        fn  = report.get("functions", 0)
+        cls = report.get("classes", 0)
+        edg = report.get("call_edges", 0)
+        fil = report.get("files_parsed", 0)
         return {
             "status": "ingested",
             "repo_path": str(repo_path),
-            "functions": report.get("functions", 0),
-            "classes": report.get("classes", 0),
-            "call_edges": report.get("call_edges", 0),
-            "files_parsed": report.get("files_parsed", 0),
+            "functions": fn,
+            "classes": cls,
+            "call_edges": edg,
+            "files_parsed": fil,
+            "visualization_url": streamlit_url,
+            "next_step": (
+                f"Knowledge graph built: {fn} functions, {cls} classes, "
+                f"{edg} call edges across {fil} files.\n\n"
+                f"Explore the architecture visually → {streamlit_url}\n\n"
+                f"Suggested next commands:\n"
+                f"- get_graph_summary() — high-level stats and hotspot functions\n"
+                f"- get_macro_architecture() — module dependency map\n"
+                f"- semantic_search(query='...') — find relevant functions\n"
+                f"- run_failing_tests_and_localize(...) — pinpoint a bug from a stack trace"
+            ),
         }
     except Exception as e:
         return {"status": "error", "error": str(e)}

@@ -176,4 +176,34 @@ def inject_behavior_label(fingerprint: str, label: str) -> str:
     lines = fingerprint.split("\n")
     sig_line = lines[0]
     rest = [l for l in lines[1:] if not l.startswith("//")]
+
+
+# ---------------------------------------------------------------------------
+# Tier 2 — Gemini-powered behavior label generation
+# ---------------------------------------------------------------------------
+
+def generate_behavior_label_with_gemini(skeleton: str, fqn: str) -> Optional[str]:
+    """
+    Generate a behavior label using Google Gemini Flash.
+    
+    This is a convenience wrapper around gemini_integration.py that handles
+    the import gracefully if Gemini is not available.
+    
+    Args:
+        skeleton: Code skeleton from build_code_skeleton()
+        fqn: Fully qualified name of the function
+    
+    Returns:
+        One-line behavior description, or None if generation fails
+    """
+    try:
+        from gemini_integration import generate_behavior_label_gemini
+        return generate_behavior_label_gemini(skeleton, fqn)
+    except ImportError:
+        # Gemini not available, return None
+        return None
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).error(f"Failed to generate label with Gemini: {e}")
+        return None
     return "\n".join([sig_line, f"// {clean_label}"] + rest)

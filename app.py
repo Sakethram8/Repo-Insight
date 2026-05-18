@@ -7,6 +7,7 @@ Browser-first, chat-driven, with on-demand graph visualization.
 import logging
 import streamlit as st
 from streamlit_agraph import agraph, Node, Edge, Config
+import graphviz
 import falkordb
 import time
 import json
@@ -146,6 +147,16 @@ def get_db_graph():
     return db.select_graph(GRAPH_NAME)
 
 
+def _graph_node_count() -> int:
+    """Return total node count from FalkorDB, 0 if unavailable."""
+    try:
+        g = get_db_graph()
+        rows = g.query("MATCH (n) RETURN count(n)").result_set
+        return int(rows[0][0]) if rows else 0
+    except Exception:
+        return 0
+
+
 def get_edge_color(rel_type):
     colors = {
         "CALLS": "#3b82f6",
@@ -278,6 +289,85 @@ def build_macro_viz(graph, min_weight=1, max_nodes=100):
 
     return nodes, edges
 
+
+_PKG_PALETTE = [
+    "#3b82f6", "#8b5cf6", "#06b6d4", "#10b981",
+    "#f59e0b", "#ef4444", "#ec4899", "#14b8a6",
+    "#6366f1", "#84cc16",
+]
+
+def build_graphviz_macro(graph, max_nodes=30, min_weight=2):
+    """Clean hierarchical Graphviz diagram — no physics clutter."""
+    data = get_macro_architecture(graph)
+
+    node_score = Counter()
+    for e in data.get("modules", []):
+        if e["weight"] >= min_weight:
+            node_score[e["source"]] += e["weight"]
+            node_score[e["target"]] += e["weight"]
+
+    top_nodes = set(n for n, _ in node_score.most_common(max_nodes))
+
+    pkg_color: dict[str, str] = {}
+    for mod in sorted(top_nodes):
+        pkg = mod.split(".")[0]
+        if pkg not in pkg_color:
+            pkg_color[pkg] = _PKG_PALETTE[len(pkg_color) % len(_PKG_PALETTE)]
+
+    dot = graphviz.Digraph(engine="dot")
+    dot.attr(
+        rankdir="LR",
+        bgcolor="#0e1117",
+        fontcolor="white",
+        fontname="Arial",
+        splines="curved",
+        nodesep="0.5",
+        ranksep="1.2",
+    )
+    dot.attr("node",
+        shape="box",
+        style="filled,rounded",
+        fontname="Arial",
+        fontsize="12",
+        fontcolor="white",
+        penwidth="0",
+        margin="0.18,0.1",
+    )
+    dot.attr("edge",
+        color="#334155",
+        arrowsize="0.6",
+        arrowhead="vee",
+    )
+
+    max_score = max(node_score.values()) if node_score else 1
+
+    for pkg in sorted(pkg_color):
+        with dot.subgraph(name=f"cluster_{pkg}") as sg:
+            sg.attr(style="invis")
+            for mod in sorted(top_nodes):
+                if mod.split(".")[0] != pkg:
+                    continue
+                label = mod.split(".")[-1] if "." in mod else mod
+                score = node_score[mod]
+                width = str(round(0.8 + score / max_score * 0.8, 2))
+                sg.node(mod, label=label, fillcolor=pkg_color[pkg],
+                        width=width, tooltip=mod)
+
+    seen: set[tuple] = set()
+    for e in data.get("modules", []):
+        src, tgt = e["source"], e["target"]
+        if src == tgt or src not in top_nodes or tgt not in top_nodes:
+            continue
+        key = (src, tgt)
+        if key in seen:
+            continue
+        seen.add(key)
+        w = min(e["weight"], 20)
+        dot.edge(src, tgt, penwidth=str(round(0.4 + w / 8, 1)))
+
+    return dot
+
+
 def handle_engine_event(event_type: str, message: str):
     import streamlit as st
     # Render a highly visible warning inside the current st.status container
@@ -372,8 +462,23 @@ with st.sidebar:
 
     st.divider()
 
-    # --- Demo Prompts ---
-    st.markdown("### 📖 Try a Demo")
+    # --- Bob Demo Flow ---
+    st.markdown("### 🤖 IBM Bob Demo Flow")
+    st.caption("Type these in Bob after opening this repo:")
+    st.code(
+        "1. ingest_repository — build the graph\n"
+        "2. get_graph_summary — see hotspot functions\n"
+        "3. semantic_search('caching') — find related code\n"
+        "4. get_blast_radius('ingest.run_ingestion') — impact map\n"
+        "5. Ask Bob to add/change something →\n"
+        "   Bob uses graph tools automatically",
+        language="text",
+    )
+
+    st.divider()
+
+    # --- Demo Prompts (Streamlit chat) ---
+    st.markdown("### 💬 Try in Chat")
     DEMO_PROMPTS = [
         "Add a `decorators` field to FunctionDef and update all code that creates or reads it.",
         "Rename `get_connection` to `connect_to_graph` everywhere.",
@@ -413,6 +518,22 @@ with st.sidebar:
 # ---------------------------------------------------------------------------
 # Main area — Tabs: Chat | Graph
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Auto-connect banner — shown when a graph already exists (built by Bob/MCP)
+# ---------------------------------------------------------------------------
+_existing_nodes = _graph_node_count()
+if _existing_nodes > 0 and not st.session_state.graph_ready:
+    st.success(
+        f"**Knowledge graph detected** — {_existing_nodes:,} nodes already indexed "
+        f"(built via Bob or MCP). Jump straight to the **Graph Explorer** tab.",
+        icon="🔗",
+    )
+    st.session_state.graph_ready = True
+    try:
+        st.session_state.graph_index = GraphIndex.build(get_db_graph())
+    except Exception:
+        pass
 
 tab_chat, tab_graph, tab_git, tab_bench = st.tabs([
     "💬 Agent Chat", "🔗 Graph Explorer", "🔀 Git Impact", "📊 Benchmark"
@@ -887,7 +1008,7 @@ with tab_graph:
                     highlightColor="#fbbf24",
                     collapsible=False,
                     physics=True,
-                    hierarchical=False,
+                    hierarchical=True,
                 )
                 agraph(nodes=nodes, edges=edges, config=config)
 
@@ -906,26 +1027,20 @@ with tab_graph:
 
             col_s1, col_s2, col_s3 = st.columns(3)
             with col_s1:
-                min_weight = st.slider("Min edge weight", 1, 50, 3)
+                min_weight = st.slider("Min edge weight", 1, 20, 2)
             with col_s2:
-                max_nodes = st.slider("Max nodes", 10, 200, 80)
+                max_nodes = st.slider("Max modules shown", 10, 60, 30)
             with col_s3:
-                # Semantic zoom — drill into a specific module
                 zoom_input = st.text_input(
                     "Zoom into module",
                     value=st.session_state.zoom_module or "",
                     placeholder="e.g. parser, ingest",
-                    help="Enter a module name to drill into its class architecture",
+                    help="Enter a module name to see its class relationships",
                 )
                 if zoom_input != st.session_state.zoom_module:
                     st.session_state.zoom_module = zoom_input or None
 
             if st.session_state.zoom_module:
-                # Semantic zoom active — show class architecture for the selected module
-                st.markdown(
-                    f"**Zoomed into:** `{st.session_state.zoom_module}` — "
-                    f"[clear zoom](#)",
-                )
                 if st.button("← Back to macro view", key="zoom_back"):
                     st.session_state.zoom_module = None
                     st.rerun()
@@ -944,42 +1059,61 @@ with tab_graph:
                     size = min(max(e["weight"] / 2, 1), 10)
                     zoom_edges.append(Edge(
                         source=e["source"], target=e["target"],
-                        label=label, width=size, color=get_edge_color(e["types"][0] if e["types"] else ""),
+                        label=label, width=size,
+                        color=get_edge_color(e["types"][0] if e["types"] else ""),
                     ))
                 for c in zoom_classes:
                     deg = min(node_degrees_z.get(c, 0), 15)
-                    zoom_nodes.append(Node(id=c, label=c, color="#818cf8", size=18 + deg))
+                    zoom_nodes.append(Node(id=c, label=c.split(".")[-1],
+                                          color="#818cf8", size=18 + deg))
 
                 if zoom_nodes:
-                    st.caption(f"Module `{st.session_state.zoom_module}`: {len(zoom_nodes)} classes, {len(zoom_edges)} edges")
-                    config = Config(width=1200, height=660, directed=True,
-                                    nodeHighlightBehavior=True, highlightColor="#fbbf24",
-                                    collapsible=False, physics=True)
+                    st.caption(f"`{st.session_state.zoom_module}`: {len(zoom_nodes)} classes, {len(zoom_edges)} edges")
+                    config = Config(
+                        width=1200, height=660, directed=True,
+                        nodeHighlightBehavior=True, highlightColor="#fbbf24",
+                        collapsible=False,
+                        physics=True,
+                        stabilization=True,
+                    )
                     agraph(nodes=zoom_nodes, edges=zoom_edges, config=config)
                 else:
-                    st.info(f"No class relationships found in `{st.session_state.zoom_module}`. Try a different module name.")
+                    st.info(f"No class relationships found in `{st.session_state.zoom_module}`.")
 
             else:
-                # Full macro view
-                nodes, edges = build_macro_viz(graph, min_weight, max_nodes)
+                # Full macro view — clean Graphviz hierarchical layout
+                dot = build_graphviz_macro(graph, max_nodes=max_nodes, min_weight=min_weight)
 
-                if nodes:
-                    st.caption(
-                        f"Showing {len(nodes)} modules, {len(edges)} connections — "
-                        f"type a module name above to zoom in"
-                    )
-                    config = Config(
-                        width=1200,
-                        height=700,
-                        directed=True,
-                        nodeHighlightBehavior=True,
-                        highlightColor="#fbbf24",
-                        collapsible=False,
-                        physics=False,
-                    )
-                    agraph(nodes=nodes, edges=edges, config=config)
-                else:
-                    st.info("No edges match the current filter. Lower the min weight.")
+                # Legend: one chip per top-level package
+                data = get_macro_architecture(graph)
+                node_score = Counter()
+                for e in data.get("modules", []):
+                    if e["weight"] >= min_weight:
+                        node_score[e["source"]] += e["weight"]
+                        node_score[e["target"]] += e["weight"]
+                top_nodes = set(n for n, _ in node_score.most_common(max_nodes))
+                pkg_color: dict[str, str] = {}
+                for mod in sorted(top_nodes):
+                    pkg = mod.split(".")[0]
+                    if pkg not in pkg_color:
+                        pkg_color[pkg] = _PKG_PALETTE[len(pkg_color) % len(_PKG_PALETTE)]
+
+                if pkg_color:
+                    legend_cols = st.columns(min(len(pkg_color), 8))
+                    for i, (pkg, color) in enumerate(pkg_color.items()):
+                        legend_cols[i % len(legend_cols)].markdown(
+                            f'<span style="background:{color};border-radius:4px;'
+                            f'padding:2px 8px;color:white;font-size:12px">{pkg}</span>',
+                            unsafe_allow_html=True,
+                        )
+                    st.markdown("")
+
+                st.caption(
+                    f"Top {len(top_nodes)} modules by connectivity · "
+                    f"edge weight ≥ {min_weight} · zoom into a module using the field above"
+                )
+                st.graphviz_chart(dot, use_container_width=True)
+
         except Exception as e:
             st.error(f"Could not load graph: {e}")
 
