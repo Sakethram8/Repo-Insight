@@ -1,0 +1,13 @@
+{
+  "deadbeef": {
+    "purpose": "Sum a list of prices, apply tax, and return the grand total",
+    "inputs": "prices",
+    "outputs": "",
+    "side_effects": "",
+    "key_calls": [],
+    "tags": [],
+    "model": "null",
+    "source_hash": "deadbeef",
+    "schema_version": 2
+  }
+}
